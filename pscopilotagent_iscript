@@ -1,0 +1,27 @@
+# Add your Direct line secret from copilot studio
+Constant &DL_SECRET = "";
+
+
+Function IScript_HRCopilotConfig()
+   Local string &sEmplId, &sFullName;
+   
+   &sEmplId = %EmployeeId;
+   If None(&sEmplId) Then
+      &sEmplId = %OperatorId;
+   End-If;
+   
+   Local SQL &sql = CreateSQL("SELECT NAME FROM PS_PERSONAL_DATA WHERE EMPLID = :1", &sEmplId);
+   If &sql.Fetch(&sFullName) Then
+   Else
+      &sFullName = &sEmplId;
+   End-If;
+   &sql.Close();
+   
+   %Response.SetContentType("application/json");
+   %Response.Write("{");
+   %Response.Write("""emplid"":""" | &sEmplId | """,");
+   %Response.Write("""fullname"":""" | &sFullName | """,");
+   %Response.Write("""dlSecret"":""" | &DL_SECRET | """,");
+   %Response.Write("}");
+End-Function;
+
