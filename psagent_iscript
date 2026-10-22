@@ -1,0 +1,41 @@
+/* PeopleSoft Agent — iScript for psagent.js
+   Record: WEBLIB_PSAGENT   Field: ISCRIPT1   Event: FieldFormula
+   Grant the WEBLIB to the users' permission lists (Web Libraries).
+
+   Returns the agent service URL and a token that proves who the user is.
+   Token = OPRID.YYYYMMDD.HashSHA256(secret|OPRID|YYYYMMDD), valid for the day.
+   The secret never leaves the app server. Set the same value as
+   PSAGENT_SHARED_SECRET on the agent service. HashSHA256 needs PeopleTools 8.54+. */
+
+Constant &AGENT_URL = "https://psagent.example.com";
+Constant &AGENT_SECRET = "";
+
+Function JsonEsc(&s As string) Returns string
+   Local string &r = Substitute(&s, "\", "\\");
+   &r = Substitute(&r, """", "\""");
+   &r = Substitute(&r, Char(10), " ");
+   &r = Substitute(&r, Char(13), " ");
+   &r = Substitute(&r, Char(9), " ");
+   Return &r;
+End-Function;
+
+Function IScript_PSAgentConfig()
+   Local string &oprid = %OperatorId;
+   Local string &name, &day, &sig;
+
+   SQLExec("SELECT OPRDEFNDESC FROM PSOPRDEFN WHERE OPRID = :1", &oprid, &name);
+   If None(&name) Then
+      &name = &oprid;
+   End-If;
+
+   &day = DateTimeToLocalizedString(%Date, "yyyyMMdd");
+   &sig = HashSHA256(&AGENT_SECRET | "|" | &oprid | "|" | &day);
+
+   %Response.SetContentType("application/json");
+   %Response.Write("{");
+   %Response.Write("""oprid"":""" | JsonEsc(&oprid) | """,");
+   %Response.Write("""fullname"":""" | JsonEsc(&name) | """,");
+   %Response.Write("""agentUrl"":""" | JsonEsc(&AGENT_URL) | """,");
+   %Response.Write("""token"":""" | JsonEsc(&oprid | "." | &day | "." | &sig) | """");
+   %Response.Write("}");
+End-Function;
