@@ -10,7 +10,8 @@
 
    Teaching a new task: click "Record" in the chat header (shown to
    users in PSAGENT_TEACHERS) or say "let me teach you ...". Name the
-   task, then go to the page as usual and do it once, including Save.
+   task, then go to the page as usual and do it once, to the end (Save, or
+   Run and OK for a process).
    A red bar follows you across pages; Finish, review, save. Done.
 
    Console helpers:
@@ -21,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-10-23.3';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-10-24.1';   /* shown as PSAgent.version and in the console: check after uploading */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
@@ -221,6 +222,41 @@
     return false;
   }
 
+  /* Pop-up pages PeopleSoft opens over the page, e.g. the Process Scheduler Request after Run:
+     an iframe in #pt_modals of the top window (or of the page itself) */
+  function modalFrames(frame) {
+    var out = [];
+    [document, frame && frame.contentDocument].forEach(function (d) {
+      try {
+        if (!d) return;
+        [].forEach.call(d.querySelectorAll('#pt_modals iframe,iframe[id^="ptModFrame"]'), function (f) {
+          if (out.indexOf(f) < 0 && visible(f)) out.push(f);
+        });
+      } catch (e) {}
+    });
+    return out;
+  }
+  function modalDocs(frame) {
+    var out = [];
+    modalFrames(frame).forEach(function (f) { try { if (f.contentDocument && f.contentDocument.body) out.push(f.contentDocument); } catch (e) {} });
+    return out;
+  }
+  function modalBusy(frame) {
+    return modalFrames(frame).some(function (f) {
+      try {
+        trackRequests(f.contentWindow);
+        var d = f.contentDocument;
+        return !d || d.readyState !== 'complete' || isProcessing(d) || requestsBusy(f.contentWindow);
+      } catch (e) { return false; }
+    });
+  }
+  /* Where a step works: the pop-up for steps recorded there, otherwise the page */
+  function stepDocs(frame, popup) { return popup ? modalDocs(frame) : [frame.contentDocument]; }
+  function locate(docs, find) {
+    for (var i = 0; i < docs.length; i++) { var el = docs[i] && find(docs[i]); if (el) return el; }
+    return null;
+  }
+
   /* Resolves once the page is loaded, no PS processing indicator is shown and the
      DOM has been quiet for settleMs. Handles both AJAX updates and full reloads. */
   /* Count the page's in-flight server requests (PeopleSoft AJAX round trips). */
@@ -266,7 +302,7 @@
         }
         var navigating = leaving && leaving.started && !leaving.done;
         var busy = navigating || !d || d.readyState !== 'complete' || d.URL === 'about:blank' || isProcessing(d)
-          || requestsBusy(frame.contentWindow);
+          || requestsBusy(frame.contentWindow) || modalBusy(frame);
         if (!busy && Date.now() - quietSince >= RUN.settleMs) { if (obs) obs.disconnect(); return resolve(d); }
         if (Date.now() - start > timeout) { if (obs) obs.disconnect(); return reject(new Error('PeopleSoft did not finish processing in time')); }
         setTimeout(poll, RUN.pollMs);
@@ -280,23 +316,98 @@
     function onLeave() { leaving.started = true; }
     try { win.addEventListener('beforeunload', onLeave); } catch (e) {}
     trackRequests(win);
+    modalFrames(frame).forEach(function (f) { try { trackRequests(f.contentWindow); } catch (e) {} });
     fn();
     return sleep(RUN.afterActionMs)
       .then(function () { return waitIdle(frame, RUN.stepTimeout, leaving); })
       .then(function (doc) { try { win.removeEventListener('beforeunload', onLeave); } catch (e) {} return doc; });
   }
 
-  function waitForField(frame, spec, row) {
+  /* Poll until find() returns something; a PeopleSoft message means it refused the last action */
+  function waitFor(frame, find, notFound) {
     var start = Date.now();
     return (function check() {
-      var doc = frame.contentDocument;
-      var el = doc && findField(doc, spec, row);
+      var el = find();
       if (el) return Promise.resolve(el);
-      var msg = doc && psMessage(doc);   /* PeopleSoft refused the last action: report its message, don't wait */
+      var msg = psMessage(frame.contentDocument);
       if (msg) return Promise.reject(new Error(msg));
-      if (Date.now() - start > RUN.stepTimeout) return Promise.reject(new Error('Could not find "' + fieldName(spec) + '" on the page'));
+      if (Date.now() - start > RUN.stepTimeout) return Promise.reject(new Error(notFound));
       return sleep(RUN.pollMs * 2).then(check);
     })();
+  }
+
+  function waitForField(frame, spec, row, popup) {
+    return waitFor(frame, function () { return locate(stepDocs(frame, popup), function (d) { return findField(d, spec, row); }); },
+      'Could not find "' + fieldName(spec) + '" on the ' + (popup ? 'pop-up' : 'page'));
+  }
+
+  /* ---- The search page every classic component opens with ---- */
+
+  /* Search framework controls (8.5x+), or an older search page without the Save toolbar */
+  function isSearchPage(doc) {
+    if (!doc || !doc.body) return false;
+    var ctl = doc.querySelectorAll('#PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE,#PTS_CFG_CL_WRK_PTS_ADD_BTN,#PTS_CFG_CL_WRK_PTS_SRCH_BTN');
+    if ([].some.call(ctl, visible)) return true;
+    var save = doc.getElementById('#ICSave');
+    return /\bPSSRCHPAGE\b/.test(doc.body.className) && !(save && visible(save)) && !doc.querySelector('[id^="PSTAB"],[id^="ICTAB"]');
+  }
+
+  /* Rows of the search results grid (also shown under "already exists") */
+  function resultRows(doc) {
+    return [].filter.call(doc.querySelectorAll('tr[id^="trPTS_CFG_CL_STD_RSL"],a[id^="SEARCH_RESULT"]'), visible);
+  }
+  function resultRow(doc, value) {
+    var want = norm(value), rows = resultRows(doc);
+    for (var i = 0; i < rows.length; i++) {
+      var cells = rows[i].tagName === 'TR' ? rows[i].cells : [rows[i]];
+      for (var j = 0; j < cells.length; j++) if (norm(cells[j].textContent) === want) return rows[i];
+    }
+    return null;
+  }
+  function rowCells(row) {
+    return [].map.call(row.tagName === 'TR' ? row.cells : [row], function (c) { return c.textContent.replace(/\s+/g, ' ').trim(); })
+      .filter(Boolean);
+  }
+
+  /* Like a person: type the keys, press Add or Search, then deal with what PeopleSoft says */
+  function openRecord(frame, step, action) {
+    var query = {}, k, keys = step.keys || [], i = 0, mode = step.mode || 'find';
+    for (k in (step.query || {})) query[k] = step.query[k];
+    query.Action = mode === 'find' ? 'U' : 'A';
+    function typeKeys() {
+      if (i >= keys.length) return Promise.resolve();
+      var key = keys[i++];
+      return waitForField(frame, key.field).then(function (el) { return enterValue(frame, el, key.field, null, key.value); }).then(typeKeys);
+    }
+    return loadUrl(frame, componentUrl(action.component, query)).then(function () {
+      if (!isSearchPage(frame.contentDocument)) return null;            /* no search page for this component */
+      return typeKeys().then(function () {
+        var doc = frame.contentDocument, add = mode !== 'find';
+        var btn = findButton(doc, add ? { id: 'PTS_CFG_CL_WRK_PTS_ADD_BTN', text: 'Add' } : { id: 'PTS_CFG_CL_WRK_PTS_SRCH_BTN', text: 'Search' })
+          || findButton(doc, { id: '#ICSearch' });
+        if (!btn || !visible(btn)) throw new Error('Could not find the ' + (add ? 'Add' : 'Search') + ' button on the search page');
+        return act(frame, function () { btn.click(); });
+      }).then(function (doc) {
+        if (!isSearchPage(doc)) return checkOpened(doc, step);          /* opened (the only match, or the new record) */
+        var msg = psMessage(doc), want = step.pick || (keys[0] && keys[0].value);
+        var exists = !!msg && /already exists/i.test(msg);
+        if (mode === 'add' || (mode === 'add_or_open' && !exists)) throw new Error(msg || 'PeopleSoft stayed on the search page');
+        var row = want != null && resultRow(doc, want);
+        if (!row) throw new Error(msg || 'No search result is "' + want + '"');
+        return act(frame, function () { row.click(); }).then(function (d) {
+          if (isSearchPage(d)) throw new Error(psMessage(d) || 'The search result "' + want + '" did not open');
+        });
+      });
+    });
+  }
+
+  /* "begins with" search can open a different single match: make sure the record shows its keys */
+  function checkOpened(doc, step) {
+    if (step.mode !== 'find') return;
+    var text = norm(doc.body.innerText);
+    (step.keys || []).forEach(function (k) {
+      if (k.value && text.indexOf(norm(k.value)) < 0) throw new Error('PeopleSoft opened a record without "' + k.value + '"; it may not exist');
+    });
   }
 
   function componentUrl(comp, query) {
@@ -331,11 +442,14 @@
     if (step.say) return step.say;
     switch (step['do']) {
       case 'set': return 'Set ' + fieldName(step.field);
-      case 'click': return 'Click ' + (step.button.text || step.button.id);
+      case 'click': return step.result ? 'Open ' + step.result[0] : 'Click ' + (step.button.text || step.button.id);
       case 'tab': return 'Open the ' + step.label + ' tab';
       case 'grid': return 'Fill ' + fieldName(step.field) + ' rows';
       case 'wait': return 'Wait for ' + fieldName(step.field);
+      case 'open': return ({ add: 'Add ', find: 'Open ', add_or_open: 'Add or open ' }[step.mode] || 'Open ')
+        + ((step.keys || []).map(function (k) { return k.value; }).join(' ') || 'the page');
       case 'expect_saved': return 'Check the save result';
+      case 'expect_process': return 'Check that the process was submitted';
       default: return step['do'];
     }
   }
@@ -344,18 +458,26 @@
     navigate: function (frame, step, action) {
       return loadUrl(frame, componentUrl(action.component, step.query));
     },
+    open: openRecord,
     wait: function (frame, step) {
-      return waitForField(frame, step.field);
+      return waitForField(frame, step.field, null, step.popup);
     },
     set: function (frame, step) {
-      return waitForField(frame, step.field).then(function (el) {
-        return enterValue(frame, el, step.field, null, step.value);
+      return waitForField(frame, step.field, null, step.popup).then(function (el) {
+        return enterValue(frame, el, step.field, null, step.value, step.popup);
       });
     },
     click: function (frame, step) {
-      var btn = findButton(frame.contentDocument, step.button);
-      if (!btn) return Promise.reject(new Error('Could not find the "' + (step.button.text || step.button.id) + '" button'));
-      return act(frame, function () { btn.click(); });
+      var name = step.button.text || step.button.id;
+      return waitFor(frame, function () { return locate(stepDocs(frame, step.popup), function (d) { return findButton(d, step.button); }); },
+        'Could not find the "' + name + '" ' + (step.popup ? 'button on the pop-up' : 'button'))
+        .then(function (btn) { return act(frame, function () { btn.click(); }); });
+    },
+    expect_process: function (frame) {
+      return waitFor(frame, function () {
+        var doc = frame.contentDocument, m = doc && doc.body && (doc.body.innerText || '').match(/Process Instance\s*:?\s*(\d+)/i);
+        return m && +m[1] > 0 ? 'Submitted: process instance ' + m[1] : null;
+      }, 'PeopleSoft did not show a process instance number. Check Process Monitor.');
     },
     tab: function (frame, step) {
       var doc = frame.contentDocument, want = norm(step.label), links = doc.querySelectorAll('a'), i;
@@ -403,12 +525,12 @@
 
   /* Like a person: move into the field, let PeopleSoft process the previous field's
      change (it does that on focus and may redraw this field), then type. */
-  function enterValue(frame, el, spec, row, value) {
+  function enterValue(frame, el, spec, row, value, popup) {
     return act(frame, function () { try { el.focus(); } catch (e) {} })
       .then(function (doc) {
         var msg = psMessage(doc);
         if (msg) throw new Error(msg);
-        var cur = findField(doc, spec, row) || el;
+        var cur = locate(stepDocs(frame, popup), function (d) { return findField(d, spec, row); }) || el;
         return act(frame, function () { setValue(cur, value, fieldName(spec)); });
       });
   }
@@ -423,7 +545,7 @@
 
   /* action = {run_id, title, component, steps}; secrets = {password: '...'}; ws = workspace */
   function runAction(action, secrets, ws) {
-    var steps = action.steps || [], i = 0, frame = ws.frame, saved = false;
+    var steps = action.steps || [], i = 0, frame = ws.frame, done = null;
     dismissModal();   /* a message box left over from earlier would be mistaken for this run's */
     function fail(message, raw) {
       dismissModal();
@@ -431,7 +553,7 @@
     }
     function next() {
       if (ws.stopped) return Promise.resolve({ status: 'stopped', message: 'Stopped by the user', failed_step: describe(steps[i] || {}) });
-      if (i >= steps.length) return Promise.resolve({ status: 'success', message: saved ? 'Saved' : 'Completed (no save step)' });
+      if (i >= steps.length) return Promise.resolve({ status: 'success', message: done || 'Completed (no save step)' });
       var raw = steps[i], step;
       ws.progress(i + 1, steps.length, describe(raw));
       try {
@@ -442,10 +564,10 @@
       if (!handler) return Promise.resolve(fail('Unknown step ' + step['do'], raw));
       var run;
       try { run = handler(frame, step, action); } catch (e) { run = Promise.reject(e); }
-      return run.then(function () {
-        if (step['do'] === 'expect_saved') saved = true;
+      return run.then(function (out) {
+        if (/^expect_/.test(step['do'])) done = out;
         /* Any PS message after a step means a human would stop and read it */
-        if (step['do'] !== 'navigate' && step['do'] !== 'expect_saved') {
+        if (!/^(navigate|open|expect_)/.test(step['do'])) {
           var msg = psMessage(frame.contentDocument);
           if (msg) return fail(msg, raw);
         }
@@ -577,13 +699,14 @@
 
   var REC_KEY = 'psagent.rec';
   /* Homepages, NavBar and portal pages are navigation only: nothing to record there */
-  var FRAMEWORK_MENU = /^(NUI_FRAMEWORK|PT_FLDASHBOARD|PTPP_PORTAL|PORTAL_ADMIN)$/i;
+  var FRAMEWORK_MENU = /^(NUI_FRAMEWORK|PT_FLDASHBOARD|PTPP_PORTAL)$/i;   /* not PORTAL_ADMIN: Portal Security Sync etc. are real pages */
 
   function recLoad() { try { return JSON.parse(sessionStorage.getItem(REC_KEY)); } catch (e) { return null; } }
   function recSave(rec) {
     try { if (rec) sessionStorage.setItem(REC_KEY, JSON.stringify(rec)); else sessionStorage.removeItem(REC_KEY); } catch (e) {}
   }
   function isSet(st) { return st['do'] === 'set'; }
+  function isAction(st) { return /^(set|click|tab)$/.test(st['do']); }   /* not message / outcome notes */
   function isFrameworkPage(comp) { return !!comp && FRAMEWORK_MENU.test(comp.menu); }
 
   /* {component, query} of a PeopleSoft component URL; portal and internal parameters dropped */
@@ -613,8 +736,10 @@
     return { win: window, doc: document, frame: null };
   }
 
-  /* Record what the person does on doc into rec.steps; changed() runs after each step */
-  function attachRecorder(doc, rec, changed) {
+  /* Record what the person does on doc into rec.steps; changed() runs after each step.
+     Every step says where it happened (search page, page, pop-up): recorder.py builds the task from that. */
+  function attachRecorder(doc, rec, changed, popup) {
+    function phase() { return popup ? 'popup' : isSearchPage(doc) ? 'search' : 'page'; }
     if (doc._psaRec) return;
     var snap = {};
     function ignored(el) {
@@ -634,11 +759,11 @@
       if (!visible(el) || el.disabled || el.readOnly) return;
       var field = { id: el.id, label: labelOf(doc, el) };
       if (/\$\d+$/.test(el.id)) { var col = columnOf(el); if (col) field.column = col; }
-      var step = { 'do': 'set', field: field, kind: kindOf(el), value: valueOf(el) };
+      var step = { 'do': 'set', phase: phase(), field: field, kind: kindOf(el), value: valueOf(el) };
       var last = rec.steps[rec.steps.length - 1], prev = null, i;
       for (i = rec.steps.length - 1; i >= 0 && !prev; i--) if (isSet(rec.steps[i]) && rec.steps[i].field.id === el.id) prev = rec.steps[i];
       if (prev && prev !== last && prev.value === step.value) return;   /* same value again: nothing new */
-      if (last && last['do'] === 'set' && last.field.id === el.id) rec.steps[rec.steps.length - 1] = step;
+      if (last && last['do'] === 'set' && last.field.id === el.id && last.phase === step.phase) rec.steps[rec.steps.length - 1] = step;
       else rec.steps.push(step);
       if (step.kind !== 'password') snap[el.id] = step.value;
       changed();
@@ -657,23 +782,44 @@
     }, true);
     doc.addEventListener('click', function (e) {
       if (rec.stopped) return;
+      var ph = phase();
+      var row = ph === 'search' && e.target.closest && e.target.closest('tr[id^="trPTS_CFG_CL_STD_RSL"],a[id^="SEARCH_RESULT"]');
+      if (row) {                                     /* a row in the search results opens that record */
+        diff();
+        rec.steps.push({ 'do': 'click', phase: ph, result: rowCells(row) });
+        changed();
+        return;
+      }
       var el = e.target.closest && e.target.closest('a,button,input[type="button"],input[type="submit"]');
       if (!el || ignored(el) || /\$(new|delete|prompt)\$|\$prompt$/i.test(el.id)) return;   /* grid +/- and lookups: replayed by grid steps */
       diff();
       var text = (el.tagName === 'INPUT' ? el.value : el.textContent).replace(/\s+/g, ' ').trim();
-      /* The search page's mode switch becomes the task's start mode */
-      if (!rec.steps.some(isSet) && /^(add a new value|find an existing value)$/i.test(text)) {
-        rec.query = rec.query || {};
-        rec.query.Action = /^add/i.test(text) ? 'A' : 'U';
-        changed();
-        return;
-      }
-      if (/^(ICTAB|PSTAB)/.test(el.id) || /tab/i.test(el.parentElement && el.parentElement.className)) rec.steps.push({ 'do': 'tab', label: text });
-      else if (el.id || text) rec.steps.push({ 'do': 'click', button: { id: el.id || undefined, text: text || undefined } });
+      if (/^(ICTAB|PSTAB)/.test(el.id) || /tab/i.test(el.parentElement && el.parentElement.className)) rec.steps.push({ 'do': 'tab', phase: ph, label: text });
+      else if (el.id || text) rec.steps.push({ 'do': 'click', phase: ph, button: { id: el.id || undefined, text: text || undefined } });
+      else return;
       changed();
       /* Re-baseline once PeopleSoft has redrawn the page, so values it fills in itself are not recorded */
       setTimeout(function () { try { if (!rec.stopped) snapshot(); } catch (e2) {} }, 2500);
     }, true);
+  }
+
+  /* What PeopleSoft shows while the person works: messages, and the result of the task
+     (Saved, or a process instance after Run). Recorded as notes between the steps. */
+  var observed = { doc: null, msg: null, saved: false, instance: null };
+  function observe(rec, doc) {
+    if (!doc || !doc.body) return false;
+    var msg = psMessage(doc) || null, savedEl = doc.querySelector('#SAVED_win0');
+    var saved = !!savedEl && visible(savedEl);
+    var m = (doc.body.innerText || '').match(/Process Instance\s*:?\s*(\d+)/i), instance = m && +m[1] > 0 ? m[1] : null;
+    var fresh = observed.doc !== doc, added = false;
+    if (!fresh && rec.steps.some(isAction)) {
+      var phase = isSearchPage(doc) ? 'search' : 'page';
+      if (msg && msg !== observed.msg) { rec.steps.push({ 'do': 'message', phase: phase, text: msg.slice(0, 300) }); added = true; }
+      if (saved && !observed.saved) { rec.steps.push({ 'do': 'outcome', phase: phase, kind: 'saved' }); added = true; }
+      if (instance && instance !== observed.instance) { rec.steps.push({ 'do': 'outcome', phase: phase, kind: 'process', detail: instance }); added = true; }
+    }
+    observed = { doc: doc, msg: msg, saved: saved, instance: instance };
+    return added;
   }
 
   /* ============================================================
@@ -756,7 +902,9 @@
       + '#psa-recbar-status{opacity:.95;}'
       + '#psa-recbar button{flex:0 0 auto;height:auto!important;margin:0!important;padding:4px 10px!important;border:none;border-radius:6px;cursor:pointer;font:600 12px Segoe UI,sans-serif;background:#fff!important;color:#b42318!important;}'
       + '#psa-recbar button.psa-rec-cancel{background:rgba(255,255,255,.2)!important;color:#fff!important;}'
-      + '#psa-panel *:focus,#psa-ws *:focus,#psa-recbar *:focus{outline:3px solid #003865;outline-offset:2px;}';
+      + '#psa-panel *:focus,#psa-ws *:focus,#psa-recbar *:focus{outline:3px solid #003865;outline-offset:2px;}'
+      /* PeopleSoft pop-ups and message boxes (z-index 9999) must show above the agent's workspace */
+      + '#pt_modals [id^="ptMod_"],#pt_modals [id^="ptModTable_"]{z-index:2147483646!important;}';
     var st = document.createElement('style');
     st.id = 'psa-styles';
     st.textContent = css;
@@ -952,7 +1100,7 @@
         + '<label>Start in<select data-k="mode"><option value="A">Add a New Value</option><option value="U">Find an Existing Value</option>'
         + '<option value="">The page as it opens</option></select></label>'
         + '<small data-k="hint">After Start, go to the page the way you normally do (NavBar, menu, search) and do the task once, '
-        + 'including Save. A red bar at the top shows what is recorded; click Finish recording there.</small>'
+        + 'to the end: Save, or Run and OK for a process. A red bar at the top shows what is recorded; click Finish recording there.</small>'
         + '<div class="psa-actions"><button type="button" class="psa-ok">Start recording</button><button type="button" class="psa-no">Cancel</button></div>');
       var ok = c.querySelector('.psa-ok'), hint = c.querySelector('[data-k="hint"]'), hintText = hint.textContent;
       var mode = c.querySelector('[data-k="mode"]');
@@ -987,7 +1135,7 @@
       recSave(rec);
       addMsg('bot', 'Recording **' + rec.title + '**. '
         + (rec.component ? 'Opening the page.' : 'Go to the page for this task the way you normally do.')
-        + ' Do the task once by hand, including Save, then click **Finish recording** in the red bar at the top.');
+        + ' Do the task once by hand, to the end (Save, or Run and OK for a process), then click **Finish recording** in the red bar at the top.');
       close();
       resumeRecording();
       if (rec.component) location.href = componentUrl(rec.component, rec.query).replace('/psc/', '/psp/');
@@ -1022,11 +1170,15 @@
 
     function updateRecBar() {
       if (!recBar || !recording) return;
-      var r = recording, last = r.steps[r.steps.length - 1];
-      recBar.querySelector('#psa-recbar-status').textContent =
-        !r.component ? 'Go to the page for this task (NavBar or menu) and do it once, including Save.'
+      var r = recording, acts = r.steps.filter(isAction), last = acts[acts.length - 1];
+      var done = r.steps.filter(function (st) { return st['do'] === 'outcome'; }).pop();
+      var text = !r.component ? 'Go to the page for this task (NavBar or menu) and do it once, including Save or Run.'
         : r.offPage ? 'You left ' + r.component.component + '. A task covers one page: go back, or finish.'
-        : r.steps.length + ' steps on ' + r.component.component + (last ? ' · last: ' + describe(last) : ' · waiting for your first entry');
+        : acts.length + ' steps on ' + r.component.component
+          + (done ? ' · ' + (done.kind === 'saved' ? 'Saved' : 'process ' + done.detail + ' submitted') + ': click Finish recording'
+            : last ? ' · last: ' + describe(last) : ' · waiting for your first entry');
+      var st = recBar.querySelector('#psa-recbar-status');
+      if (st.textContent !== text) st.textContent = text;
     }
 
     /* Follow the person: find the transaction page and attach to each new document */
@@ -1041,13 +1193,23 @@
       try { info = t.doc && t.doc.readyState !== 'loading' && parseComponentUrl(t.win.location.href); } catch (e) {}
       if (info && !isFrameworkPage(info.component)) {
         var same = !!r.component && r.component.menu === info.component.menu && r.component.component === info.component.component;
-        if (!same && r.component && r.steps.some(isSet)) {
+        if (!same && r.component && r.steps.some(isAction)) {
           if (!r.offPage) { r.offPage = true; recordingChanged(); }
         } else {
           if (!same) { r.component = info.component; r.query = info.query; r.steps = []; }
           r.offPage = false;
           if (!t.doc._psaRec) { attachRecorder(t.doc, r, recordingChanged); recordingChanged(); }
         }
+      }
+      if (r.component && !r.offPage) {                 /* pop-ups over the page: Process Scheduler Request */
+        modalFrames(t.frame).forEach(function (f) {
+          if (!f._psaRecHook) { f._psaRecHook = true; f.addEventListener('load', function () { setTimeout(recordingTick, 0); }); }
+          try {
+            var d = f.contentDocument;
+            if (d && d.body && d.readyState !== 'loading' && d.URL !== 'about:blank' && !d._psaRec) attachRecorder(d, r, recordingChanged, true);
+          } catch (e) {}
+        });
+        if (info && t.doc && t.doc._psaRec && observe(r, t.doc)) recSave(r);
       }
       updateRecBar();
     }
@@ -1062,12 +1224,13 @@
 
     function finishRecording() {
       var r = recording;
-      try { var d = workTarget().doc; if (d._psaRec) d._psaRec.diff(); } catch (e) {}
+      var t = workTarget();
+      [t.doc].concat(modalDocs(t.frame)).forEach(function (d) { try { if (d && d._psaRec) d._psaRec.diff(); } catch (e) {} });
       stopRecording();
       open();
-      if (!r || !r.component || !r.steps.some(isSet)) {
-        addMsg('bot', 'Nothing was entered on a transaction page, so there is nothing to learn. Click **Record** and try again: '
-          + 'go to the page and type the values there.', false);
+      if (!r || !r.component || !r.steps.some(isAction)) {
+        addMsg('bot', 'Nothing was entered or clicked on a transaction page, so there is nothing to learn. Click **Record** and try again: '
+          + 'go to the page and do the task there.', false);
         return;
       }
       var rec = { title: r.title, component: r.component, query: r.query || {}, steps: r.steps };
@@ -1087,15 +1250,27 @@
           : '<select data-key="' + esc(f.key) + '">' + Object.keys(MODE_LABELS).map(function (m) {
             return '<option value="' + m + '"' + (m === f.mode ? ' selected' : '') + '>' + MODE_LABELS[m] + '</option>';
           }).join('') + '</select>';
-        return '<tr><td>' + esc(f.label) + (f.kind === 'list' ? ' (list)' : '') + '<small>'
+        return '<tr><td>' + esc(f.label) + (f.kind === 'list' ? ' (list)' : '') + (f.search_key ? ' <small>(search key)</small>' : '') + '<small>'
           + (f.mode === 'secret' ? 'secret' : 'recorded: ' + esc(shown || '(blank)')) + '</small></td><td>' + choice + '</td></tr>';
       }).join('');
-      var stepList = rec.steps.map(function (st) { return '<li>' + esc(describe(st)) + '</li>'; }).join('');
+      var stepList = rec.steps.filter(isAction).map(function (st) {
+        return '<li>' + esc(describe(st)) + ({ search: ' <small>(search page)</small>', popup: ' <small>(pop-up)</small>' }[st.phase] || '') + '</li>';
+      }).join('');
+      var OPEN = { add: 'Add a new one (stop if it already exists)', add_or_open: 'Add a new one, or open it if it already exists',
+        find: 'Open an existing one' };
+      var opens = draft.open_mode ? '<label>Each time, the record is<select data-k="open_mode">' + Object.keys(OPEN).map(function (m) {
+        return '<option value="' + m + '"' + (m === draft.open_mode ? ' selected' : '') + '>' + OPEN[m] + '</option>';
+      }).join('') + '</select></label>' : '';
+      var result = '<small>' + (draft.outcome === 'saved' ? 'At the end it checks that PeopleSoft shows <b>Saved</b>.'
+        : draft.outcome === 'process' ? 'At the end it checks that PeopleSoft shows a <b>process instance</b> number.'
+        : 'No Save or process run was recorded: the task ends after the last step.') + '</small>'
+        + (draft.notes || []).map(function (n) { return '<small>' + esc(n) + '</small>'; }).join('');
       var c = card('<h4>Review the recorded task</h4>'
         + '<label>Task name<input data-k="title" value="' + esc(draft.title) + '"></label>'
         + '<label>What it does<input data-k="summary" value="' + esc(draft.summary) + '"></label>'
-        + '<table>' + rows + '</table>'
-        + '<details><summary>' + rec.steps.length + ' recorded steps</summary><ol>' + stepList + '</ol></details>'
+        + opens
+        + '<table>' + rows + '</table>' + result
+        + '<details><summary>' + rec.steps.filter(isAction).length + ' recorded steps</summary><ol>' + stepList + '</ol></details>'
         + (draft.exists ? '<label class="psa-check"><input type="checkbox" data-k="overwrite"> Replace the existing task <code>' + esc(draft.task_id) + '</code></label>' : '')
         + '<small>Task ID: ' + esc(draft.task_id) + (draft.suggested_by === 'claude' ? ' · suggestions by Claude' : '') + '</small>'
         + '<div class="psa-actions"><button type="button" class="psa-ok">Save task</button><button type="button" class="psa-no">Discard</button></div>');
@@ -1108,6 +1283,7 @@
         var edited = JSON.parse(JSON.stringify(draft));
         edited.title = c.querySelector('[data-k="title"]').value.trim();
         edited.summary = c.querySelector('[data-k="summary"]').value.trim();
+        if (c.querySelector('[data-k="open_mode"]')) edited.open_mode = c.querySelector('[data-k="open_mode"]').value;
         c.querySelectorAll('select[data-key]').forEach(function (sel) {
           edited.fields.forEach(function (f) { if (f.key === sel.getAttribute('data-key')) f.mode = sel.value; });
         });

@@ -13,7 +13,8 @@ from pathlib import Path
 import yaml
 
 _TEMPLATE = re.compile(r"\{\{\s*([a-z0-9_:]+)\s*\}\}")
-_STEP_TYPES = {"navigate", "set", "click", "wait", "tab", "grid", "expect_saved"}
+_STEP_TYPES = {"navigate", "open", "set", "click", "wait", "tab", "grid", "expect_saved", "expect_process"}
+_OPEN_MODES = {"add", "find", "add_or_open"}
 
 
 class TaskError(ValueError):
@@ -191,6 +192,8 @@ def parse_task(data, source="<task>"):
     for i, step in enumerate(task.playbook):
         if step.get("do") not in _STEP_TYPES:
             raise TaskError(f"{source}: step {i + 1} has unknown action {step.get('do')!r}")
+        if step["do"] == "open" and step.get("mode") not in _OPEN_MODES:
+            raise TaskError(f"{source}: step {i + 1} open mode must be one of {sorted(_OPEN_MODES)}")
         for cond in _when(step.get("when")):
             if cond not in fields:
                 raise TaskError(f"{source}: step {i + 1} 'when' refers to unknown field {cond!r}")

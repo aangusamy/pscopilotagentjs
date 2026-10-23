@@ -106,18 +106,21 @@ Do the transaction once by hand and the agent can do it from then on:
    type *"let me teach you how to create a requisition"*.
 2. Name the task. The page is optional: leave it empty and click **Start recording**.
 3. A red bar appears at the top. **Go to the page the way you normally do** (NavBar,
-   menu, search) and do the task once by hand, including Save. The bar follows you
-   across page loads and counts the steps; click **Finish recording** in it.
+   menu, search) and do the task once by hand, to the end: **Save**, or **Run** and
+   **OK** for a process. The bar follows you across page loads and counts the
+   steps. When it shows *Saved* or *process … submitted*, click **Finish recording**.
    * Every value you type, pick or tick is recorded. That includes values a
      lookup fills in.
    * Password fields are recorded as "a password goes here", never the value.
-   * Switching the search page to "Add a New Value" becomes the task's start mode.
    * The NavBar, header and message boxes are not part of the task.
    * To make a list (roles, requisition lines), fill **at least two rows**.
    * A task covers one page (component). If you move to another one with values
-     already entered, the bar says so; go back or finish.
-4. On the review card, Claude suggests how to treat each recorded value. Change
-   any of them, then click **Save task**:
+     already entered, the bar says so; go back or finish. What you do after Saved
+     or the process instance (e.g. opening Process Monitor) is left out.
+4. On the review card, check how the record is opened each time (add a new one;
+   add it, or open it if it already exists; open an existing one) and how each
+   recorded value is treated. Claude suggests the values' modes; change any of
+   them, then click **Save task**:
    * **Ask every time**: for IDs, names, amounts and dates.
    * **Ask, can be blank**: for values that are only sometimes needed.
    * **Ask, default = recorded**: for values that are usually the same (business
@@ -126,6 +129,23 @@ Do the transaction once by hand and the agent can do it from then on:
      (e.g. ID Type = Employee).
 5. The task is saved as `tasks/<task_id>.yaml` and is live immediately, including
    in open conversations. Ask for it in your own words, like any other task.
+
+### How a recording becomes a task
+
+The recorder doesn't know any particular page. Every classic component works the
+same way, and each recorded step notes where it happened:
+
+| Where | What it becomes |
+|---|---|
+| **Search page**: key values, Add / Search, a result row | One `open` step: the keys and a mode. *add* when you pressed Add, *find* when you searched or picked a row, *add_or_open* when you added and then opened the existing row, and for every process run (a run control is reused) |
+| **Page**: values, tabs, grid rows, buttons | `set`, `tab`, `grid` and `click` steps |
+| **Pop-up** over the page (e.g. Process Scheduler Request) | The same steps, marked `popup: true` |
+| **What PeopleSoft showed**: Saved, or a process instance number | `expect_saved` / `expect_process` at the end. If you finish on an error message instead, the review card warns you |
+
+When the agent runs an `open` step it does what a person does on the search page:
+it types the keys, presses Add or Search, opens the only match or the matching
+result row, and, in *add_or_open* mode, opens the existing record when PeopleSoft
+says it already exists.
 
 When you leave an optional value blank, the agent skips the steps that only
 existed for it. If a whole tab section only holds optional values, it is skipped
@@ -148,17 +168,21 @@ Step types:
 
 | `do` | Fields | What it does |
 |---|---|---|
-| `navigate` | `query` | Opens the task's `component` in the workspace (`{Action: A}` = Add mode) |
+| `open` | `mode`, `keys`, `pick`?, `query`? | Opens the component through its search page: types `keys` (`field` + `value`), presses Add (`mode: add`, `add_or_open`) or Search (`find`), then opens the result whose key is `pick` (default: the first key). `add_or_open` opens the existing record when PeopleSoft says it already exists |
+| `navigate` | `query` | Opens the task's `component` directly (`{Action: A}` = Add mode); for pages without a search page |
 | `set` | `field`, `value` | Types into a text box, picks a dropdown option (value or visible text) or ticks a checkbox, then waits for PeopleSoft |
-| `click` | `button` | Clicks a button/link (`#ICSearch`, `#ICSave`, …) and waits for PeopleSoft |
+| `click` | `button` | Clicks a button/link (`#ICSave`, the Run button, …) and waits for PeopleSoft |
 | `tab` | `label` | Opens a page tab by its visible name |
 | `grid` | `field`, `values` | Fills one grid row per value, pressing the row's **+** button to add rows |
 | `wait` | `field` | Waits until a field appears |
 | `expect_saved` | | Succeeds only if PeopleSoft shows **Saved** and no message |
+| `expect_process` | | Succeeds when the page shows a **Process Instance** number (after Run, then OK) |
 
 Fields are found by `id` first, then by `label` (the `<label for>` text), then by
-grid `column` header. Any step can have `when: <field>` or `when: [a, b]` (skipped
-unless one of them has a value) and `say:` (progress text). Use `{{secret:name}}` for `sensitive` fields.
+grid `column` header. `popup: true` on a `set`, `click` or `wait` step means the
+field is on a pop-up page PeopleSoft opens over the page (the Process Scheduler
+Request). Any step can have `when: <field>` or `when: [a, b]` (skipped unless one
+of them has a value) and `say:` (progress text). Use `{{secret:name}}` for `sensitive` fields.
 `load_tasks` checks every placeholder and `when` against the field list, so a
 typo fails at startup.
 
@@ -170,16 +194,19 @@ of asking for them. That is the natural next step.
 ## Tests
 
 ```bash
-cd agent-service && python3 -m unittest discover -s tests -t tests       # 44 unit tests, scripted LLM
-cd .. && node tests/runner/run_browser_tests.mjs                          # 6 browser tests (Playwright)
+cd agent-service && python3 -m unittest discover -s tests -t tests       # 58 unit tests, scripted LLM
+cd .. && node tests/runner/run_browser_tests.mjs                          # 7 browser tests (Playwright)
 ```
 
 The browser tests run the real widget and the real service (with a scripted
-LLM) against `tests/runner/mock_usermaint.html`. That file is a small imitation
-of the User Profiles component, not real PeopleSoft HTML. It proves the runner
-mechanics: AJAX waits, a full reload on Add, label/column fallbacks, grid rows,
-message-box detection, and that the password never reaches the service. One
-test records a user creation by hand, saves it as a task, and has the agent
-replay it for a different user. It does
+LLM) against two small imitations of PeopleSoft pages in `tests/runner/`, not
+real PeopleSoft HTML: `mock_usermaint.html` (User Profiles) and
+`mock_runctl.html` (Sync Portal Security, a run control page with the Process
+Scheduler Request pop-up). They prove the runner mechanics: AJAX waits, a full
+reload on Add, label/column fallbacks, grid rows, message-box detection, the
+search page (already exists, result rows), pop-ups, and that the password never
+reaches the service. Two tests record a task by hand (a user creation, a
+process run), save it, and have the agent run it again. The unit tests for the
+recorder use event sequences recorded on a real PeopleTools 8.5x system. They do
 not prove that the field IDs match your release. Run `PSAgent.inspect()` once on
 the real page for that.

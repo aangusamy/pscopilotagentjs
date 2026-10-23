@@ -1,9 +1,29 @@
-"""Turn a recorded transaction (a human doing the task once in the workspace)
-into a reusable task template.
+"""Turn a recording (a person doing a task once in PeopleSoft) into a reusable task.
 
-  recording ──candidates()──▶ values the human typed
-            ──draft()───────▶ suggested name/mode per value (Claude, or rules)
-            ──build()───────▶ task dict (same shape as tasks/*.yaml), validated
+The widget records what happened and where, without interpreting it. Every
+event carries the phase it happened in:
+
+  search  the component's search page: key values, Add / Search, a result row
+  page    the transaction page itself
+  popup   a page PeopleSoft opens over it (Process Scheduler Request, ...)
+
+plus what PeopleSoft showed in between: `message` (its text) and `outcome`
+(`saved`, or `process` when a process instance number appeared).
+
+Every classic component follows that pattern, so one compiler covers all of
+them; nothing here knows a particular page:
+
+  search events -> one `open` step: mode (add / find / add_or_open) + key values
+  page events   -> set / tab / grid / click steps
+  popup events  -> the same steps, marked `popup: true`
+  outcome       -> expect_saved / expect_process right after the action that
+                   caused it; what the person did afterwards (looked at Process
+                   Monitor, went back to search) is not part of the task
+
+  recording ──plan()───────▶ that structure
+            ──candidates()─▶ the values the person entered
+            ──draft()──────▶ suggested name/mode per value (Claude, or rules)
+            ──build()──────▶ task dict (same shape as tasks/*.yaml), validated
 
 Modes for each recorded value:
   required  ask every time
@@ -16,6 +36,7 @@ Modes for each recorded value:
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import date
 
 import yaml
@@ -26,10 +47,16 @@ from .tasks import parse_task
 log = logging.getLogger("psagent")
 
 MODES = ("required", "optional", "default", "fixed", "secret")
+OPEN_MODES = ("add", "find", "add_or_open")
+PHASES = ("search", "page", "popup")
+EVENTS = ("set", "click", "tab", "message", "outcome")
+OUTCOMES = ("saved", "process")
 _GRID_ID = re.compile(r"^(.+)\$(\d+)$")
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 TASK_ID = re.compile(r"^[a-z][a-z0-9_]{2,59}$")
 MAX_STEPS = 300
+# Search framework and toolbar controls on the search page: not key values
+_SEARCH_CONTROL = re.compile(r"^(PTS_|PT_|#IC|ICTAB|NEWWIN$)|\$op$")
 
 
 class RecordingError(ValueError):
@@ -41,6 +68,10 @@ def snake(text, fallback="field"):
     if not s or not s[0].isalpha():
         s = f"{fallback}_{s}" if s else fallback
     return s[:40].rstrip("_")
+
+
+def norm(t):
+    return re.sub(r"\s+", " ", str(t or "")).strip().lower()
 
 
 def _str(v, limit=500):
@@ -58,33 +89,131 @@ def validate(rec):
     if not isinstance(steps, list) or not steps or len(steps) > MAX_STEPS:
         raise RecordingError(f"recording needs 1-{MAX_STEPS} steps")
     for st in steps:
-        if not isinstance(st, dict) or st.get("do") not in ("set", "click", "tab"):
-            raise RecordingError("recorded steps must be set, click or tab")
+        if not isinstance(st, dict) or st.get("do") not in EVENTS:
+            raise RecordingError("recorded steps must be set, click, tab, message or outcome")
+        if st.get("phase", "page") not in PHASES:
+            raise RecordingError(f"unknown phase {st.get('phase')!r}")
         if st["do"] == "set" and not (st.get("field") or {}).get("id"):
             raise RecordingError("recorded set steps need a field id")
-    if not any(st["do"] == "set" for st in steps):
-        raise RecordingError("nothing was typed during the recording")
+        if st["do"] == "outcome" and st.get("kind") not in OUTCOMES:
+            raise RecordingError(f"unknown outcome {st.get('kind')!r}")
+    if not any(st["do"] in ("set", "click") for st in steps):
+        raise RecordingError("nothing was entered or clicked during the recording")
+
+
+# ----- plan: the recording as search page / page / pop-up / outcome -----------
+
+@dataclass
+class Plan:
+    mode: str | None                              # how the record is opened; None: no search page
+    keys: list = field(default_factory=list)      # set events on the search page, last value per field
+    pick: str | None = None                       # result row clicked, when it is not a key value
+    steps: list = field(default_factory=list)     # page and pop-up events
+    outcome: str | None = None                    # saved / process
+    notes: list = field(default_factory=list)     # what was left out, for the review card
+
+
+def plan(rec):
+    validate(rec)
+    action = (rec.get("query") or {}).get("Action")
+    mode, toggle, keys, result = None, None, {}, None
+    steps, outcome, dropped, on_page, last_msg = [], None, 0, False, None
+    for e in rec["steps"]:
+        phase, kind = e.get("phase", "page"), e["do"]
+        if kind == "message":
+            if outcome is None and not dropped:
+                last_msg = _str(e.get("text"), 300)   # PeopleSoft's answer to the last action
+            continue
+        if kind == "outcome":
+            # OK on the Process Scheduler Request also saves the run control: a process instance
+            # seen right after "Saved" (nothing done in between) is the real result
+            if steps and (outcome is None or (outcome == "saved" and e["kind"] == "process" and not dropped)):
+                outcome = e["kind"]
+            continue
+        if outcome is not None or (phase == "search" and on_page):
+            dropped += 1          # after the result, or back on the search page: not this task
+            continue
+        last_msg = None
+        if phase == "search":
+            if kind == "set" and not _SEARCH_CONTROL.search(e["field"]["id"]):
+                keys.pop(e["field"]["id"], None)
+                keys[e["field"]["id"]] = e
+            elif kind == "click" and e.get("result"):
+                result = [_str(c, 100) for c in e["result"] if _str(c).strip()]
+                mode = "add_or_open" if mode == "add" else "find"   # opened an existing row
+            elif kind == "click":
+                text = norm((e.get("button") or {}).get("text"))
+                if text == "add":
+                    mode = "add"
+                elif text == "search":
+                    mode = "find"
+                elif text in ("add a new value", "find an existing value"):
+                    toggle = "add" if text.startswith("add") else "find"   # then Enter instead of a button
+            continue
+        on_page = True
+        steps.append(e)
+
+    p = Plan(mode=None, steps=_dedupe(steps, keys), outcome=outcome)
+    if keys or mode or result:
+        p.mode = mode or toggle or ("add" if action == "A" else "find")
+        p.keys = list(keys.values())
+        if p.mode == "add" and outcome == "process":
+            # A process's run control is reused every run; open it when it is already there
+            p.mode = "add_or_open"
+        values = {norm(k.get("value")) for k in p.keys}
+        if result and not values & {norm(c) for c in result}:
+            p.pick = result[0]
+    if outcome is None and last_msg:
+        p.notes.append(f'The recording ended with PeopleSoft saying "{last_msg}", and nothing was saved or '
+                       "submitted. Record it again and finish only after Saved or a process instance appears.")
+    if p.outcome is None and p.steps:
+        last = p.steps[-1]
+        b = last.get("button") or {}
+        if last["do"] == "click" and not last.get("popup") and (b.get("id") == "#ICSave" or norm(b.get("text")) == "save"):
+            p.outcome = "saved"
+    if dropped:
+        p.notes.append(f"{dropped} step{'s' if dropped > 1 else ''} after the task's result (e.g. opening Process "
+                       f"Monitor, or returning to search) {'are' if dropped > 1 else 'is'} left out.")
+    return p
+
+
+def _dedupe(steps, keys):
+    """Drop sets that change nothing: the same value again, or a search key PeopleSoft copies onto the page."""
+    entered = {k["field"]["id"]: _str(k.get("value")) for k in keys.values()}
+    out = []
+    for st in steps:
+        if st["do"] == "set":
+            fid, raw = st["field"]["id"], _str(st.get("value"))
+            if entered.get(fid) == raw:
+                continue
+            entered[fid] = raw
+        out.append(st)
+    return out
 
 
 def _secret_label(label):
     return re.sub(r"^(confirm|re-?enter|repeat|verify|new)\s+", "", label.strip(), flags=re.I) or "Password"
 
 
-def candidates(rec):
-    """Values the human entered, in order. Grids with 2+ recorded rows become one list value."""
-    steps = rec["steps"]
+def _sets(p):
+    return p.keys + [st for st in p.steps if st["do"] == "set"]
+
+
+def candidates(rec, p=None):
+    """Values the person entered, in order. Grids with 2+ recorded rows become one list value."""
+    p = p or plan(rec)
+    sets = _sets(p)
+    key_ids = {k["field"]["id"] for k in p.keys}
     rows = {}
-    for st in steps:
-        if st["do"] == "set" and st.get("kind") != "password":
+    for st in sets:
+        if st.get("kind") != "password":
             m = _GRID_ID.match(st["field"]["id"])
             if m:
                 rows.setdefault(m.group(1), set()).add(int(m.group(2)))
     grids = {base for base, r in rows.items() if len(r) >= 2}
 
     out, by_key = [], {}
-    for st in steps:
-        if st["do"] != "set":
-            continue
+    for st in sets:
         f = st["field"]
         kind = st.get("kind") or "text"
         label = _str(f.get("label") or f.get("column") or f["id"], 80).strip()
@@ -96,7 +225,8 @@ def candidates(rec):
             key = m.group(1) if m and m.group(1) in grids else f["id"]
         c = by_key.get(key)
         if c is None:
-            c = {"key": key, "label": label, "kind": "secret" if kind == "password" else kind, "value": ""}
+            c = {"key": key, "label": label, "kind": "secret" if kind == "password" else kind, "value": "",
+                 "search_key": f["id"] in key_ids, "popup": st.get("phase") == "popup"}
             if key in grids:
                 c.update(kind="list", label=_str(f.get("column") or f.get("label") or key, 80), value=[], _rows={})
             by_key[key] = c
@@ -115,16 +245,20 @@ def candidates(rec):
 
 DRAFT_SYSTEM = """\
 You turn a recorded PeopleSoft transaction into a reusable task template. A \
-person did the task once by hand; you get the component and every value they \
-entered, in order. Decide, for each value, how the agent should treat it next time:
+person did the task once by hand; you get the component, how the record was \
+opened, every value they entered (search keys, page fields, pop-up fields) and \
+the result PeopleSoft showed. Decide, for each value, how the agent should treat \
+it next time:
 
 - required: identifies or describes the specific thing being done (IDs, names, \
 descriptions, amounts, dates, quantities, people, vendors, items). Ask every time.
 - optional: often blank or situational; only filled sometimes.
 - default: usually the same, but someone may need to change it (business unit, \
-currency, symbolic ID, location). The recorded value becomes the default.
+currency, symbolic ID, location, a run control ID that is reused). The recorded \
+value becomes the default.
 - fixed: part of the procedure itself, always the same (a type code that makes \
-the following fields appear, a checkbox the process always ticks).
+the following fields appear, a checkbox the process always ticks, the server \
+and output options on the Process Scheduler Request pop-up).
 
 Give each value a short snake_case name (e.g. user_id, vendor_id, invoice_date), \
 keep the label readable, and add a one-line hint when the format matters. Also \
@@ -162,9 +296,13 @@ def _draft_schema(keys):
     }
 
 
-def _rule_mode(c):
+def _rule_mode(c, open_mode=None):
     if c["kind"] == "secret":
         return "secret"
+    if c.get("search_key"):
+        return "required" if open_mode == "add" else "default"
+    if c.get("popup"):
+        return "fixed"
     if c["kind"] == "list":
         return "optional"
     if c["kind"] in ("select", "checkbox"):
@@ -173,9 +311,9 @@ def _rule_mode(c):
 
 
 def draft(rec, llm=None):
-    """Suggested template: names, labels and modes for each recorded value."""
-    validate(rec)
-    cands = candidates(rec)
+    """Suggested template: names, labels and modes for each recorded value, and how it opens."""
+    p = plan(rec)
+    cands = candidates(rec, p)
     comp = rec["component"]
     title = _str(rec.get("title"), 80).strip() or f"{comp['component']} task"
     d = {
@@ -183,9 +321,13 @@ def draft(rec, llm=None):
         "title": title,
         "summary": f"Recorded on {comp['menu']}.{comp['component']}.",
         "examples": [title.lower()],
+        "open_mode": p.mode,
+        "outcome": p.outcome,
+        "notes": p.notes,
         "fields": [
             {"key": c["key"], "name": snake(c["label"]) if c["kind"] != "secret" else c["key"].split(":", 1)[1],
-             "label": c["label"], "kind": c["kind"], "value": c["value"], "mode": _rule_mode(c), "hint": ""}
+             "label": c["label"], "kind": c["kind"], "value": c["value"], "mode": _rule_mode(c, p.mode), "hint": "",
+             "search_key": c["search_key"]}
             for c in cands
         ],
         "suggested_by": "rules",
@@ -196,9 +338,13 @@ def draft(rec, llm=None):
     prompt = json.dumps({
         "title_given_by_user": rec.get("title") or "",
         "component": f"{comp['menu']}.{comp['component']}.{comp.get('market') or 'GBL'}",
-        "mode": "add" if (rec.get("query") or {}).get("Action") == "A" else "update/other",
-        "steps": [_step_text(st) for st in rec["steps"]],
-        "values": [{"key": c["key"], "label": c["label"], "kind": c["kind"], "recorded_value": c["value"]} for c in plain],
+        "opened_by": {"add": "adding a new record", "find": "finding an existing record",
+                      "add_or_open": "adding the record, or opening it when it exists"}.get(p.mode, "opening the page"),
+        "result": {"saved": "saved", "process": "a process was submitted"}.get(p.outcome, "unknown"),
+        "steps": [_step_text(st) for st in p.keys + p.steps],
+        "values": [{"key": c["key"], "label": c["label"], "kind": c["kind"], "recorded_value": c["value"],
+                    "where": "search page key" if c["search_key"] else "pop-up" if c["popup"] else "page"}
+                   for c in plain],
     }, indent=1)
     try:
         out = llm.structured(DRAFT_SYSTEM, prompt, _draft_schema([c["key"] for c in plain]))
@@ -221,13 +367,14 @@ def draft(rec, llm=None):
 
 
 def _step_text(st):
+    where = {"search": " on the search page", "popup": " on the pop-up"}.get(st.get("phase"), "")
     if st["do"] == "set":
         f = st["field"]
-        return f"set {f.get('label') or f.get('column') or f['id']}"
+        return f"set {f.get('label') or f.get('column') or f['id']}{where}"
     if st["do"] == "tab":
         return f"open tab {st.get('label')}"
     b = st.get("button") or {}
-    return f"click {b.get('text') or b.get('id')}"
+    return f"click {b.get('text') or b.get('id')}{where}"
 
 
 # ----- build: reviewed draft -> task -------------------------------------------
@@ -237,10 +384,19 @@ def _upper(values):
     return bool(vals) and all(v == v.upper() and re.search(r"[A-Z]", v) for v in vals)
 
 
+def _spec(f):
+    spec = {"id": _str(f["id"], 100)}
+    if f.get("label"):
+        spec["label"] = _str(f["label"], 80)
+    if f.get("column"):
+        spec["column"] = _str(f["column"], 80)
+    return spec
+
+
 def build(rec, reviewed, author):
     """Final task dict from the recording plus the user's reviewed draft."""
-    validate(rec)
-    cands = {c["key"]: c for c in candidates(rec)}
+    p = plan(rec)
+    cands = {c["key"]: c for c in candidates(rec, p)}
     choice = {f.get("key"): f for f in reviewed.get("fields") or [] if isinstance(f, dict)}
     task_id = _str(reviewed.get("task_id"), 80)
     if not TASK_ID.fullmatch(task_id):
@@ -248,11 +404,16 @@ def build(rec, reviewed, author):
     title = _str(reviewed.get("title"), 80).strip()
     if not title:
         raise RecordingError("the task needs a title")
+    open_mode = p.mode
+    if p.mode and reviewed.get("open_mode"):
+        if reviewed["open_mode"] not in OPEN_MODES:
+            raise RecordingError(f"invalid open mode {reviewed['open_mode']!r}")
+        open_mode = reviewed["open_mode"]
 
     fields, names = {}, {}   # name -> spec ; candidate key -> name (None when fixed)
     for key, c in cands.items():
         ch = choice.get(key) or {}
-        mode = "secret" if c["kind"] == "secret" else ch.get("mode", _rule_mode(c))
+        mode = "secret" if c["kind"] == "secret" else ch.get("mode", _rule_mode(c, open_mode))
         if mode not in MODES or mode == "secret" and c["kind"] != "secret":
             raise RecordingError(f"invalid mode {mode!r} for {c['label']}")
         if mode == "fixed":
@@ -268,7 +429,7 @@ def build(rec, reviewed, author):
         if mode == "secret":
             spec.update(required=True, sensitive=True)
         else:
-            if mode in ("required", "default"):
+            if mode in ("required", "default") or c["search_key"]:   # a record can't be opened without its key
                 spec["required"] = True
             if c["kind"] == "list":
                 spec["type"] = "list"
@@ -282,29 +443,42 @@ def build(rec, reviewed, author):
         fields[name] = spec
         names[key] = name
 
+    def value_of(c):
+        name = names[c["key"]]
+        if c["kind"] == "secret":
+            return f"{{{{secret:{name}}}}}"
+        return f"{{{{{name}}}}}" if name else c["value"]
+
     comp = {k: _str(rec["component"].get(k)).upper() for k in ("menu", "component")}
     comp["market"] = _str(rec["component"].get("market") or "GBL").upper()
     query = {str(k)[:30]: _str(v, 100) for k, v in (rec.get("query") or {}).items()}
-    playbook = [{"do": "navigate", "query": query, "say": f"Opening {title}"}]
+    if open_mode:
+        query.pop("Action", None)
+        first = {"do": "open", "mode": open_mode,
+                 "keys": [{"field": _spec(k["field"]), "value": value_of(cands[k["field"]["id"]])} for k in p.keys]}
+        if p.pick:
+            first["pick"] = _str(p.pick, 100)
+        if query:
+            first["query"] = query
+    else:
+        first = {"do": "navigate", "query": query}
+    first["say"] = f"Opening {title}"
+    playbook = [first]
+
     seen_grids = set()
-    entered = {}  # field id -> value already entered earlier in the recording
-    for st in rec["steps"]:
+    for st in p.steps:
+        popup = {"popup": True} if st.get("popup") or st.get("phase") == "popup" else {}
         if st["do"] == "tab":
             playbook.append({"do": "tab", "label": _str(st.get("label"), 80)})
         elif st["do"] == "click":
             b = st.get("button") or {}
             btn = {k: _str(b[k], 80) for k in ("id", "text") if b.get(k)}
             if btn:
-                playbook.append({"do": "click", "button": btn})
+                playbook.append({"do": "click", "button": btn, **popup})
         else:
             f = st["field"]
-            raw = _str(st.get("value"))
-            if entered.get(f["id"]) == raw:
-                # The same value again is not a new action (PeopleSoft re-sets e.g. the search
-                # key after Add, where the field no longer exists); replaying it would fail.
-                continue
-            entered[f["id"]] = raw
             c = cands[_key_of(st, cands)]
+            name = names[c["key"]]
             if c["kind"] == "list":
                 if c["key"] in seen_grids:
                     continue
@@ -312,27 +486,13 @@ def build(rec, reviewed, author):
                 spec = {"id": c["key"]}
                 if f.get("column") or f.get("label"):
                     spec["column"] = _str(f.get("column") or f.get("label"), 80)
-                name = names[c["key"]]
                 playbook.append({"do": "grid", "field": spec, "values": f"{{{{{name}}}}}" if name else list(c["value"]),
                                  "_var": name})
                 continue
-            spec = {"id": _str(f["id"], 100)}
-            if f.get("label"):
-                spec["label"] = _str(f["label"], 80)
-            if f.get("column"):
-                spec["column"] = _str(f["column"], 80)
-            name = names[c["key"]]
-            if c["kind"] == "secret":
-                value = f"{{{{secret:{name}}}}}"
-            elif name:
-                value = f"{{{{{name}}}}}"
-            else:
-                value = c["value"]
-            playbook.append({"do": "set", "field": spec, "value": value,
+            playbook.append({"do": "set", "field": _spec(f), "value": value_of(c), **popup,
                              "_var": None if c["kind"] == "secret" else name, "_fixed": not name})
-    last_click = next((s for s in reversed(playbook) if s["do"] == "click"), None)
-    if last_click and (last_click["button"].get("id") == "#ICSave" or norm(last_click["button"].get("text")) == "save"):
-        playbook.append({"do": "expect_saved"})
+    if p.outcome:
+        playbook.append({"do": "expect_" + p.outcome})
     _add_conditions(playbook, fields)
 
     task = {
@@ -347,10 +507,6 @@ def build(rec, reviewed, author):
     }
     parse_task(task, source=f"recording {task_id}")
     return task
-
-
-def norm(t):
-    return re.sub(r"\s+", " ", str(t or "")).strip().lower()
 
 
 def _key_of(st, cands):
@@ -371,7 +527,8 @@ def _add_conditions(playbook, fields):
     optional = {n for n, f in fields.items() if not f.get("required")}
     sections, cur = [], []
     for st in playbook:
-        if st["do"] == "tab" or st["do"] == "expect_saved" or (st["do"] == "click" and st["button"].get("id") == "#ICSave"):
+        # A tab section is the tab and the values entered on it; a click (Save, Run, ...) ends it
+        if st["do"] in ("tab", "click", "expect_saved", "expect_process") or st.get("popup") and not (cur and cur[-1].get("popup")):
             if cur:
                 sections.append(cur)
             cur = []

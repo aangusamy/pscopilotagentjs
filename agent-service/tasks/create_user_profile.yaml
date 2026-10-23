@@ -1,140 +1,131 @@
-# ------------------------------------------------------------------
-# Create User Profile
-# PeopleTools > Security > User Profiles > User Profiles  (Add a New Value)
-#
-# Each task = the fields the agent must collect + the playbook the
-# browser widget replays, i.e. exactly what a human does on the screen.
-#
-# Field IDs verified on a PeopleTools 8.5x HCM instance (2026-10-22).
-# Every field also has a `label` (and grid fields a `column`) fallback,
-# so the runner still finds it if an ID differs on your release. Check
-# with PSAgent.inspect() and adjust here; no JS change needed.
-# ------------------------------------------------------------------
+# Recorded with PSAgent teach mode by PS on 2026-10-23.
+# Edit freely: same format as the hand-written tasks (see README).
 id: create_user_profile
-title: Create User Profile
-summary: Add a new PeopleSoft user ID with password, symbolic ID, optional employee link, permission lists and roles.
+title: Create user profile
+summary: Adds a new PeopleSoft user profile with permission lists, an ID type, a description and an initial role.
 examples:
-  - create user profile named velu
-  - add a new user VELU linked to employee KU0042 with the EMPLOYEE role
-
+- Create a user profile for JSMITH with description John Smith
+- Add new user ZZTEST01 with role PeopleSoft User
 component:
   menu: MAINTAIN_SECURITY
   component: USERMAINT
   market: GBL
-  # node: HRMS            # optional, defaults to the node in the current URL
-
+recorded:
+  by: PS
+  'on': '2026-10-23'
 fields:
   user_id:
     label: User ID
     required: true
     upper: true
-    max_length: 30
-    pattern: '^[A-Z0-9_]+$'
-    hint: Letters, numbers and underscore only, max 30 characters. Usually the person's name or network ID.
-  description:
-    label: Description
-    required: true
-    max_length: 30
-    hint: Usually the person's full name, e.g. "Velu Arumugam".
+    hint: New user ID, uppercase, up to 30 characters
   symbolic_id:
     label: Symbolic ID
     required: true
-    upper: true
     default: SYSADM1
-    hint: Database access profile. Almost always SYSADM1.
+    hint: Database access profile symbolic ID
   password:
     label: Password
     required: true
-    sensitive: true        # typed by the user on the confirm card, never sent to the agent service
-  emplid:
-    label: Employee ID (EMPLID)
-    upper: true
-    max_length: 11
-    hint: Links the user to an employee on the ID tab (ID Type = Employee).
+    sensitive: true
   navigator_homepage:
-    label: Navigator Homepage permission list
+    label: Navigator Homepage
+    required: true
+    default: PTPT1000
     upper: true
-  process_profile:
-    label: Process Profile permission list
-    upper: true
+    hint: Permission list code
   primary_permission_list:
-    label: Primary permission list
+    label: Primary Permission List
+    required: true
+    default: PTPT1000
     upper: true
+    hint: Permission list code
+  process_profile:
+    label: Process Profile
+    required: true
+    default: PTPT1000
+    upper: true
+    hint: Permission list code
   row_security:
-    label: Row Security permission list
+    label: Row Security
+    required: true
+    default: PTPT1000
     upper: true
-  roles:
-    label: Roles
-    type: list
-    hint: Comma separated role names exactly as defined in PeopleSoft (case matters), e.g. "Employee, PeopleSoft User". Use the user's spelling; PeopleSoft rejects unknown names.
-
+    hint: Permission list code
+  description:
+    label: Description
+    required: true
+    hint: Usually the user's full name
+  role_name:
+    label: Role Name
+    required: true
+    default: PeopleSoft User
+    hint: Exact role name, e.g. PeopleSoft User
 playbook:
-  # --- Add a New Value search page ---
-  - do: navigate
-    query: {Action: A}
-    say: Opening User Profiles (Add a New Value)
-  - do: set
-    field: {id: PSOPRDEFN_SRCH_OPRID, label: User ID}
-    value: "{{user_id}}"
-  - do: click
-    button: {id: PTS_CFG_CL_WRK_PTS_ADD_BTN, text: Add}
-    say: Adding user {{user_id}}
-  - do: wait
-    field: {id: PSOPRDEFN_SYMBOLICID, label: Symbolic ID}
-
-  # --- General tab ---
-  - do: set
-    field: {id: PSOPRDEFN_SYMBOLICID, label: Symbolic ID}
-    value: "{{symbolic_id}}"
-  - do: set
-    field: {id: PSUSRPRFL_WRK_PTPSWDCLEARTXTINPT, label: New Password}
-    value: "{{secret:password}}"
-  - do: set
-    field: {id: PSUSRPRFL_WRK_PTPSWDCLEARTXTCONF, label: Confirm Password}
-    value: "{{secret:password}}"
-  - do: set
-    when: navigator_homepage
-    field: {id: PSOPRDEFN_DEFAULTNAVHP, label: Navigator Homepage}
-    value: "{{navigator_homepage}}"
-  - do: set
-    when: process_profile
-    field: {id: PSOPRDEFN_PRCSPRFLCLS, label: Process Profile}
-    value: "{{process_profile}}"
-  - do: set
-    when: primary_permission_list
-    field: {id: PSOPRDEFN_OPRCLASS, label: Primary}
-    value: "{{primary_permission_list}}"
-  - do: set
-    when: row_security
-    field: {id: PSOPRDEFN_ROWSECCLASS, label: Row Security}
-    value: "{{row_security}}"
-
-  # --- ID tab: employee link + description (Description is only editable here) ---
-  - do: tab
-    label: ID
-  - do: set
-    when: emplid
-    field: {id: PSOPRALIAS_OPRALIASTYPE$0, label: ID Type}
-    value: Employee            # matched against option value or visible text
-  - do: set
-    when: emplid
-    field: {id: PSOPRALIAS_WRK_ATTRVALUE$0, column: Attribute Value}
-    value: "{{emplid}}"
-  - do: set
-    field: {id: PSOPRDEFN_DVW_OPRDEFNDESC$0, label: Description}
-    value: "{{description}}"
-
-  # --- Roles tab ---
-  - do: tab
-    when: roles
-    label: Roles
-  - do: grid
-    when: roles
-    field: {id: PSROLEUSER_VW_ROLENAME, column: Role Name}
-    values: "{{roles}}"
-
-  # --- Save ---
-  - do: click
-    button: {id: "#ICSave", text: Save}
-    say: Saving
-  - do: expect_saved
+- do: open
+  mode: add
+  keys:
+  - field:
+      id: PSOPRDEFN_SRCH_OPRID
+      label: User ID
+    value: '{{user_id}}'
+  say: Opening Create user profile
+- do: set
+  field:
+    id: PSOPRDEFN_SYMBOLICID
+    label: Symbolic ID
+  value: '{{symbolic_id}}'
+- do: set
+  field:
+    id: PSUSRPRFL_WRK_PTPSWDCLEARTXTINPT
+    label: New Password
+  value: '{{secret:password}}'
+- do: set
+  field:
+    id: PSUSRPRFL_WRK_PTPSWDCLEARTXTCONF
+    label: Confirm Password
+  value: '{{secret:password}}'
+- do: set
+  field:
+    id: PSOPRDEFN_DEFAULTNAVHP
+    label: Navigator Homepage
+  value: '{{navigator_homepage}}'
+- do: set
+  field:
+    id: PSOPRDEFN_OPRCLASS
+    label: Primary
+  value: '{{primary_permission_list}}'
+- do: set
+  field:
+    id: PSOPRDEFN_PRCSPRFLCLS
+    label: Process Profile
+  value: '{{process_profile}}'
+- do: set
+  field:
+    id: PSOPRDEFN_ROWSECCLASS
+    label: Row Security
+  value: '{{row_security}}'
+- do: tab
+  label: ID
+- do: set
+  field:
+    id: PSOPRALIAS_OPRALIASTYPE$0
+    label: ID Type
+  value: None
+- do: set
+  field:
+    id: PSOPRDEFN_DVW_OPRDEFNDESC$0
+    label: Description
+  value: '{{description}}'
+- do: tab
+  label: Roles
+- do: set
+  field:
+    id: PSROLEUSER_VW_ROLENAME$0
+    column: Role Name
+  value: '{{role_name}}'
+- do: click
+  button:
+    id: '#ICSave'
+    text: Save
+- do: expect_saved

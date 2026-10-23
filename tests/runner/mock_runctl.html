@@ -1,0 +1,139 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Portal Security Sync</title>
+<!--
+  TEST FIXTURE ONLY: a small imitation of a classic PeopleTools run control
+  page (PORTAL_ADMIN.PORTAL_SEC_SYNC, Sync Portal Security), used to exercise
+  psagent.js on process runs. Structure and IDs follow the real page checked
+  on 2026-10-24: the search page opens in Find mode; adding a run control that
+  exists shows "already exists" with the existing one as a result row below
+  (tr#trPTS_CFG_CL_STD_RSL$0_row1 with an onclick, no link); a search with one
+  match opens it directly; Run opens the Process Scheduler Request as an
+  iframe#ptModFrame_0 in #pt_modals of the TOP window; its OK is #ICSave, like
+  the page's Save; afterwards the page shows "Process Instance:<n>". Run
+  controls live in sessionStorage so a later run in the same tab finds them.
+  It is not real PeopleSoft HTML.
+-->
+<style>
+  body { font-family: Arial, sans-serif; font-size: 12px; margin: 12px; }
+  #WAIT_win0 { position: fixed; top: 4px; right: 4px; background: #ffc; padding: 4px 8px; display: none; }
+</style>
+</head>
+<body class="PSSRCHPAGE">
+<div id="WAIT_win0">Processing...</div>
+<form name="win0" id="win0" onsubmit="return false"><div id="page"></div></form>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var KEY = 'mock.runctls';
+  function runctls() { try { return JSON.parse(sessionStorage.getItem(KEY)) || ['PSS']; } catch (e) { return ['PSS']; } }
+  function el(id) { return document.getElementById(id); }
+  function top() { try { if (window.top.document.body) return window.top; } catch (e) {} return window; }
+  function roundTrip(fn) {
+    el('WAIT_win0').style.display = 'block';
+    setTimeout(function () { el('WAIT_win0').style.display = 'none'; fn(); }, 300);
+  }
+  var p = el('page');
+
+  /* ---- Process Scheduler Request pop-up ---- */
+  if (q.get('Page') === 'PRCSRQSTDLG') {
+    p.innerHTML = '<h3>Process Scheduler Request</h3>'
+      + '<label for="PRCSRQSTDLG_WRK_SERVERNAME">Server Name:</label> <select id="PRCSRQSTDLG_WRK_SERVERNAME">'
+      + ['', 'PSNT', 'PSUNX'].map(function (o) { return '<option value="' + o + '">' + o + '</option>'; }).join('') + '</select>'
+      + '<table><tr><th>Select</th><th>Description</th></tr><tr><td><input type="checkbox" id="PRCSRQSTDLG_WRK_SELECT_FLAG$0"></td>'
+      + '<td>Portal Security Sync</td></tr></table>'
+      + '<input type="button" id="#ICSave" value="OK"> <input type="button" id="#ICCancel" value="Cancel">';
+    el('#ICSave').onclick = function () {
+      var opts = { SERVER: el('PRCSRQSTDLG_WRK_SERVERNAME').value, SELECTED: el('PRCSRQSTDLG_WRK_SELECT_FLAG$0').checked };
+      roundTrip(function () { top().__mockRunCtl.__mockSubmit(opts); });
+    };
+    el('#ICCancel').onclick = function () { top().__mockRunCtl.__mockClose(); };
+    return;
+  }
+
+  var addMode = q.get('Action') === 'A', msg = '', results = [];
+  var runctl = q.get('RUN_CNTL_ID') || '';
+  var data = { PORTAL: 'EMPLOYEE', instance: '' };
+  window.__mockRun = null;
+
+  window.submitAction_win0 = function (form, name) {
+    if (name === 'PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE') return roundTrip(function () { addMode = !addMode; msg = ''; results = []; render(); });
+    var id = (el('PRCSRUNCNTL_RUN_CNTL_ID') || {}).value;
+    id = String(id || '').trim().toUpperCase();
+    if (name === 'PTS_CFG_CL_WRK_PTS_ADD_BTN') {
+      return roundTrip(function () {
+        if (runctls().indexOf(id) >= 0) {
+          msg = "The value you tried to add already exists. Select it below if you'd like to update it, or specify a new value in the fields above.";
+          results = [id];
+          return render();
+        }
+        sessionStorage.setItem(KEY, JSON.stringify(runctls().concat([id])));
+        location.href = location.pathname + '?Action=A&RUN_CNTL_ID=' + encodeURIComponent(id);
+      });
+    }
+    if (name === 'PTS_CFG_CL_WRK_PTS_SRCH_BTN') {
+      return roundTrip(function () {
+        results = runctls().filter(function (r) { return r.indexOf(id) === 0; });
+        msg = results.length ? '' : 'No matching values were found.';
+        if (results.length === 1) return open(results[0]);
+        render();
+      });
+    }
+    if (name === 'PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB') {
+      return roundTrip(function () {
+        var t = top(), host = t.document.getElementById('pt_modals');
+        if (!host) { host = t.document.createElement('div'); host.id = 'pt_modals'; t.document.body.appendChild(host); }
+        t.__mockRunCtl = window;
+        host.innerHTML = '<div id="ptMod_0" style="z-index:9999"><div id="ptModTable_0" style="position:fixed;top:15%;left:20%;width:420px;height:220px;background:#fff;border:2px solid #036">'
+          + '<span id="ptModTitle_0">Process Scheduler Request</span>'
+          + '<iframe id="ptModFrame_0" name="ptModFrame_0" style="width:100%;height:190px;border:0" src="' + location.pathname + '?ICType=Panel&Page=PRCSRQSTDLG"></iframe></div></div>';
+      });
+    }
+  };
+  window.__mockClose = function () { var h = top().document.getElementById('pt_modals'); if (h) h.innerHTML = ''; };
+  window.__mockSubmit = function (opts) {
+    __mockClose();
+    roundTrip(function () {
+      var n = +(sessionStorage.getItem('mock.instance') || 1000) + 1;
+      sessionStorage.setItem('mock.instance', String(n));
+      window.__mockRun = { RUN_CNTL_ID: runctl, PORTAL: data.PORTAL, SERVER: opts.SERVER, SELECTED: opts.SELECTED };
+      data.instance = String(n);
+      render();
+    });
+  };
+  window.chg = function (input) { data.PORTAL = input.value; roundTrip(function () {}); };
+
+  function open(id) { location.href = location.pathname + '?RUN_CNTL_ID=' + encodeURIComponent(id); }
+  window.__mockOpen = open;
+
+  function button(id, label) {
+    return '<input type="button" id="' + id + '" name="' + id + '" value="' + label + '" onclick="submitAction_win0(this.form,this.name)">';
+  }
+
+  function render() {
+    if (!runctl) {
+      var toggle = '<a id="PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE" href="javascript:submitAction_win0(document.win0,\'PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE\')">'
+        + (addMode ? 'Find an Existing Value' : 'Add a New Value') + '</a>';
+      p.innerHTML = '<h2>Portal Security Sync</h2><h3>' + (addMode ? 'Add a New Value' : 'Find an Existing Value') + '</h3>' + toggle + '<br>'
+        + (msg ? '<span id="PTS_CRITTEXT_DISP">' + msg + '</span><br>' : '')
+        + '<label for="PRCSRUNCNTL_RUN_CNTL_ID">Run Control ID' + (addMode ? '' : ' begins with') + ':</label> <input type="text" id="PRCSRUNCNTL_RUN_CNTL_ID"> '
+        + (addMode ? button('PTS_CFG_CL_WRK_PTS_ADD_BTN', 'Add') : button('PTS_CFG_CL_WRK_PTS_SRCH_BTN', 'Search'))
+        + (results.length ? '<table id="tdgbrPTS_CFG_CL_STD_RSL$0"><tr><th>Run Control ID</th><th>Language Code</th></tr>' + results.map(function (r, i) {
+          return '<tr id="trPTS_CFG_CL_STD_RSL$0_row' + (i + 1) + '" onclick="__mockOpen(\'' + r + '\')"><td><span>' + r + '</span></td><td>English</td></tr>';
+        }).join('') + '</table>' : '');
+      return;
+    }
+    p.innerHTML = '<h2>Portal Security Sync</h2><div>Run Control ID: <b>' + runctl + '</b></div>'
+      + button('PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB', 'Run')
+      + ' <a id="PRCSRQSTDLG_WRK_LOADPRCSMONITORPB" href="#">Process Monitor</a>'
+      + '<div>Process Instance:<span id="PRCSRQSTDLG_WRK_PRCSINSTANCE">' + data.instance + '</span></div>'
+      + '<label for="PORTAL_CSS_RUN_PORTAL_NAME">Portal Name:</label> <input type="text" id="PORTAL_CSS_RUN_PORTAL_NAME" value="' + data.PORTAL + '" onchange="chg(this)">'
+      + '<br>' + button('#ICSave', 'Save');
+  }
+  render();
+})();
+</script>
+</body>
+</html>

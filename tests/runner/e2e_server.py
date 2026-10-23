@@ -47,6 +47,17 @@ DRAFT = {
     ]],
 }
 
+# Suggestions for the process run recorded in the browser test (Sync Portal Security)
+DRAFT_PROCESS = {
+    "task_id": "sync_portal_security", "title": "Sync Portal Security", "summary": "Runs the portal security sync.",
+    "examples": ["sync portal security"],
+    "fields": [{"key": k, "name": n, "label": label, "mode": m, "hint": ""} for k, n, label, m in [
+        ("PRCSRUNCNTL_RUN_CNTL_ID", "run_control_id", "Run Control ID", "default"),
+        ("PRCSRQSTDLG_WRK_SERVERNAME", "server_name", "Server Name", "fixed"),
+        ("PRCSRQSTDLG_WRK_SELECT_FLAG$0", "select", "Select", "fixed"),
+    ]],
+}
+
 USER = {"user_id": "VELU", "description": "Velu Arumugam", "emplid": "KU0042",
         "roles": "EMPLOYEE, PeopleSoft User", "primary_permission_list": "HCCPEMPLOYEE"}
 
@@ -64,7 +75,11 @@ llm = FakeLLM(
              tool("request_confirmation", {}, id="c2")),
     response(text("Please confirm.")),
     response(text("Done. User **ANITA** was created with the recorded task.")),
-    drafts=[DRAFT],
+    # after the process test saved sync_portal_security:
+    response(tool("start_task", {"task_id": "sync_portal_security"}), tool("request_confirmation", {}, id="c3")),
+    response(text("Please confirm.")),
+    response(text("Done. The portal security sync was submitted.")),
+    drafts=[DRAFT, DRAFT_PROCESS],
 )
 app = create_app(Agent(llm, TASKS), secret="", allowed_origins=[], dev_oprid="TESTER",
                  teachers={"*"}, tasks_dir=str(TASKS_DIR))
@@ -123,6 +138,8 @@ def component(request):
         return HTMLResponse(HOST)
     if name.startswith("MAINTAIN_SECURITY.USERMAINT."):
         return FileResponse(HERE / "mock_usermaint.html")
+    if name.startswith("PORTAL_ADMIN.PORTAL_SEC_SYNC."):
+        return FileResponse(HERE / "mock_runctl.html")
     return Response("not found", status_code=404)
 
 

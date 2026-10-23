@@ -136,7 +136,7 @@ test('record in the real UI across page loads -> review -> save -> agent does it
   await f.locator('[id="#ICSave"]').click();
   await f.locator('#SAVED_win0').waitFor();
   assert.equal((await saved(page, '#ptifrmtgtframe')).OPRID, 'KUMAR');
-  assert.match(await bar.innerText(), /13 steps on USERMAINT/);
+  assert.match(await bar.innerText(), /14 steps on USERMAINT · Saved/);   // PeopleSoft's Saved was seen
   await page.click('#psa-recbar-finish');
   assert.equal(await bar.count(), 0);
 
@@ -144,7 +144,7 @@ test('record in the real UI across page loads -> review -> save -> agent does it
   const review = page.locator('.psa-card', { hasText: 'Review the recorded task' });
   await review.waitFor();
   const rtext = await review.innerText();
-  for (const s of ['User ID', 'recorded: KUMAR', 'Roles (list)', 'recorded: EMPLOYEE, Manager', 'Password', '13 recorded steps'])
+  for (const s of ['User ID', 'recorded: KUMAR', 'Roles (list)', 'recorded: EMPLOYEE, Manager', 'Password', '14 recorded steps', 'shows Saved'])
     assert.ok(rtext.includes(s), s);
   assert.equal(await review.locator('select[data-key="OPRALIASTYPE_X"]').inputValue(), 'fixed');
   await review.locator('select[data-key="ATTRVAL_X$0"]').selectOption('optional');
@@ -155,7 +155,8 @@ test('record in the real UI across page loads -> review -> save -> agent does it
   assert.match(yml, /^# Recorded with PSAgent teach mode by TESTER/);
   assert.match(yml, /when: emplid/);                     // ID tab only runs when an EMPLID is given
   assert.match(yml, /value: Employee/);                  // fixed value kept
-  assert.match(yml, /Action: A/);                        // the Find -> Add switch became the start mode
+  assert.match(yml, /do: open\n  mode: add\n/);            // search page: Add with the typed key
+  assert.match(yml, /do: expect_saved/);
   assert.ok(!yml.includes('PT_NAVBAR') && !yml.includes('Portal'), 'portal header or parameters leaked into the task');
   assert.ok(!yml.includes('Rec0rdPw'), 'recorded password leaked into the task');
 
@@ -174,6 +175,65 @@ test('record in the real UI across page loads -> review -> save -> agent does it
   });
   const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).join('\n');
   assert.ok(!bodies.includes('Rec0rdPw') && !bodies.includes('An1ta'), 'password reached the agent service');
+});
+
+test('record a process run (search page, Run, Process Scheduler pop-up) -> the agent reruns it', async page => {
+  await page.click('#psa-fab');
+  await page.locator('#psa-rec').waitFor();
+  await page.click('#psa-rec');
+  const rc = page.locator('.psa-card').last();
+  await rc.locator('[data-k="title"]').fill('Sync portal security');
+  await rc.locator('.psa-ok').click();
+  const bar = page.locator('#psa-recbar');
+  await page.goto(`${BASE}/psp/ps/EMPLOYEE/HRMS/c/PORTAL_ADMIN.PORTAL_SEC_SYNC.GBL`);
+  await page.waitForFunction(() => /steps on PORTAL_SEC_SYNC/.test(document.querySelector('#psa-recbar').textContent));
+  const f = page.frameLocator('#ptifrmtgtframe');
+  await f.locator('#PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE').click();            // Find -> Add a New Value
+  await f.locator('#PTS_CFG_CL_WRK_PTS_ADD_BTN').waitFor();
+  await f.locator('#PRCSRUNCNTL_RUN_CNTL_ID').fill('SYNC_AGENT');
+  await f.locator('#PTS_CFG_CL_WRK_PTS_ADD_BTN').click();
+  await f.locator('#PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB').click();         // Run
+  await page.waitForFunction(() => {                                     // a person takes a moment to read the pop-up
+    const fr = document.getElementById('ptModFrame_0');
+    return fr && fr.contentDocument && fr.contentDocument._psaRec;
+  });
+  const dlg = page.frameLocator('#ptModFrame_0');
+  await dlg.locator('#PRCSRQSTDLG_WRK_SERVERNAME').selectOption('PSUNX');
+  await dlg.locator('[id="PRCSRQSTDLG_WRK_SELECT_FLAG$0"]').check();
+  await dlg.locator('[id="#ICSave"]').click();                           // OK
+  await f.locator('#PRCSRQSTDLG_WRK_PRCSINSTANCE', { hasText: '1001' }).waitFor();
+  await page.waitForFunction(() => /process 1001 submitted/.test(document.querySelector('#psa-recbar').textContent));
+  await f.locator('#PRCSRQSTDLG_WRK_LOADPRCSMONITORPB').click();         // looking at Process Monitor: not the task
+  await page.click('#psa-recbar-finish');
+
+  const review = page.locator('.psa-card', { hasText: 'Review the recorded task' });
+  await review.waitFor();
+  assert.equal(await review.locator('[data-k="open_mode"]').inputValue(), 'add_or_open');   // run controls are reused
+  const rtext = await review.innerText();
+  for (const s of ['Run Control ID', 'search key', 'recorded: SYNC_AGENT', 'process instance', '1 step after the task'])
+    assert.ok(rtext.includes(s), s);
+  await review.locator('.psa-ok').click();
+  await page.locator('.psa-bot', { hasText: 'Saved Sync Portal Security' }).waitFor();
+
+  const yml = await (await fetch(`${BASE}/__test/task_file?id=sync_portal_security`)).text();
+  assert.match(yml, /do: open\n  mode: add_or_open\n  keys:\n  - field:\n      id: PRCSRUNCNTL_RUN_CNTL_ID/);
+  assert.match(yml, /popup: true/);
+  assert.match(yml, /- do: expect_process\n/);
+  assert.ok(!yml.includes('expect_saved') && !yml.includes('Process Monitor') && !yml.includes('PTS_CFG_CL'), yml);
+
+  // The run control exists now: the agent adds it, PeopleSoft says "already exists", it opens that one
+  await page.fill('#psa-input', 'sync portal security');
+  await page.press('#psa-input', 'Enter');
+  const card = page.locator('.psa-card', { hasText: 'please review' });
+  await card.waitFor();
+  assert.ok((await card.innerText()).includes('SYNC_AGENT'));
+  await card.locator('.psa-ok').click();
+  await page.locator('.psa-bot', { hasText: 'portal security sync was submitted' }).waitFor({ timeout: 60000 });
+  const run = await page.frameLocator('#psa-ws-frame').locator('body').evaluate(() => window.__mockRun);
+  assert.deepEqual(run, { RUN_CNTL_ID: 'SYNC_AGENT', PORTAL: 'EMPLOYEE', SERVER: 'PSUNX', SELECTED: true });
+  const result = JSON.parse((await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b).pop());
+  assert.equal(result.status, 'success');
+  assert.equal(result.message, 'Submitted: process instance 1002');
 });
 
 let failed = 0;

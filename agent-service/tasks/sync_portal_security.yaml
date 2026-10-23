@@ -1,0 +1,47 @@
+# Recorded with PSAgent teach mode by PS on 2026-10-23.
+# Edit freely: same format as the hand-written tasks (see README).
+id: sync_portal_security
+title: Sync portal security
+summary: Runs the Portal Security Synchronization process through Process Scheduler using a run control ID.
+examples:
+- Run the portal security sync
+- Sync portal security using run control AGSLFT4OT
+component:
+  menu: PORTAL_ADMIN
+  component: PORTAL_SEC_SYNC
+  market: GBL
+recorded:
+  by: PS
+  'on': '2026-10-23'
+fields:
+  run_control_id:
+    label: Run Control ID
+    required: true
+    default: AGSLFT4OT
+    upper: true
+    hint: Reusable run control ID; it is created if it does not already exist.
+playbook:
+- do: open
+  mode: add_or_open
+  keys:
+  - field:
+      id: PRCSRUNCNTL_RUN_CNTL_ID
+      label: Run Control ID
+    value: '{{run_control_id}}'
+  say: Opening Sync portal security
+- do: click
+  button:
+    id: PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB
+    text: Run
+- do: set
+  field:
+    id: PRCSRQSTDLG_WRK_SERVERNAME
+    label: Server Name
+  value: PRCS8622
+  popup: true
+- do: click
+  button:
+    id: '#ICSave'
+    text: OK
+  popup: true
+- do: expect_process

@@ -79,7 +79,8 @@ class CandidatesTest(unittest.TestCase):
 
     def test_validation(self):
         for bad in [None, {}, {**RECORDING, "steps": []},
-                    {**RECORDING, "steps": [{"do": "click", "button": {"id": "#ICSave"}}]},
+                    {**RECORDING, "steps": [{"do": "outcome", "kind": "saved"}]},
+                    {**RECORDING, "steps": [{"do": "set", "phase": "elsewhere", "field": {"id": "X"}}]},
                     {**RECORDING, "steps": [{"do": "rm -rf"}]},
                     {**RECORDING, "component": {"menu": "x y", "component": "C"}}]:
             with self.assertRaises(recorder.RecordingError):
@@ -205,6 +206,130 @@ class BuildTest(unittest.TestCase):
         for d in cases:
             with self.assertRaises(recorder.RecordingError):
                 recorder.build(RECORDING, d, "T")
+
+
+def ev(do, phase, **kw):
+    return {"do": do, "phase": phase, **kw}
+
+
+def click(phase, id, text):
+    return ev("click", phase, button={"id": id, "text": text})
+
+
+def put(phase, id, value, label="", kind="text"):
+    return ev("set", phase, field={"id": id, "label": label}, kind=kind, value=value)
+
+
+# Recorded on a real PeopleTools 8.5x system (2026-10-24): Sync Portal Security, added a new
+# run control, Run, server on the pop-up, OK (which also saves), then a look at Process Monitor.
+PROCESS = {
+    "title": "Sync portal security",
+    "component": {"menu": "PORTAL_ADMIN", "component": "PORTAL_SEC_SYNC", "market": "GBL"},
+    "query": {},
+    "steps": [
+        click("search", "PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE", "Add a New Value"),
+        put("search", "PRCSRUNCNTL_RUN_CNTL_ID", "AGSLFT4OT", "Run Control ID"),
+        click("search", "PTS_CFG_CL_WRK_PTS_ADD_BTN", "Add"),
+        click("page", "PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB", "Run"),
+        put("popup", "PRCSRQSTDLG_WRK_SERVERNAME", "PRCS8622", "Server Name", kind="select"),
+        click("popup", "#ICSave", "OK"),
+        ev("outcome", "page", kind="saved"),
+        ev("outcome", "page", kind="process", detail="557046"),
+        click("page", "PRCSRQSTDLG_WRK_LOADPRCSMONITORPB", "Process Monitor"),
+    ],
+}
+
+# Same system: create a user from the search page in Add mode, Save, Saved seen.
+USER = {
+    "title": "Create user profile",
+    "component": {"menu": "MAINTAIN_SECURITY", "component": "USERMAINT", "market": "GBL"},
+    "query": {},
+    "steps": [
+        click("search", "PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE", "Add a New Value"),
+        put("search", "PSOPRDEFN_SRCH_OPRID", "ZZRG3EVK", "User ID"),
+        click("search", "PTS_CFG_CL_WRK_PTS_ADD_BTN", "Add"),
+        put("page", "PSOPRDEFN_SRCH_OPRID", "ZZRG3EVK", "User ID"),      # PeopleSoft copies the key onto the page
+        put("page", "PSOPRDEFN_SYMBOLICID", "SYSADM1", "Symbolic ID", kind="select"),
+        put("page", "PSUSRPRFL_WRK_PTPSWDCLEARTXTINPT", "", "New Password", kind="password"),
+        ev("tab", "page", label="ID"),
+        put("page", "PSOPRDEFN_DVW_OPRDEFNDESC$0", "Recorded Two", "Description"),
+        click("page", "#ICSave", "Save"),
+        ev("outcome", "page", kind="saved"),
+    ],
+}
+
+
+class PlanTest(unittest.TestCase):
+    """The recording is read as search page / page / pop-up / outcome; nothing knows a specific page."""
+
+    def test_process_run(self):
+        p = recorder.plan(PROCESS)
+        self.assertEqual(p.mode, "add_or_open")                       # a run control is reused every run
+        self.assertEqual([k["field"]["id"] for k in p.keys], ["PRCSRUNCNTL_RUN_CNTL_ID"])
+        self.assertEqual(p.outcome, "process")                        # the process number wins over the Saved before it
+        self.assertEqual([st.get("button", st.get("field", {})).get("id") for st in p.steps],
+                         ["PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB", "PRCSRQSTDLG_WRK_SERVERNAME", "#ICSave"])
+        self.assertEqual(len(p.notes), 1)                             # Process Monitor left out
+        task = parse_task(recorder.build(PROCESS, recorder.draft(PROCESS), "T"))
+        steps = task.render({})
+        self.assertEqual(steps[0], {"do": "open", "mode": "add_or_open", "say": "Opening Sync portal security",
+                                    "keys": [{"field": {"id": "PRCSRUNCNTL_RUN_CNTL_ID", "label": "Run Control ID"},
+                                              "value": "AGSLFT4OT"}]})
+        self.assertEqual([(st["do"], st.get("popup", False)) for st in steps[1:]],
+                         [("click", False), ("set", True), ("click", True), ("expect_process", False)])
+        self.assertEqual(task.fields["run_control_id"].default, "AGSLFT4OT")   # rules: key reused -> default
+        self.assertNotIn("server_name", task.fields)                  # pop-up options are part of the procedure
+
+    def test_user_add(self):
+        p = recorder.plan(USER)
+        self.assertEqual(p.mode, "add")
+        self.assertEqual(p.outcome, "saved")
+        ids = [st["field"]["id"] for st in p.steps if st["do"] == "set"]
+        self.assertNotIn("PSOPRDEFN_SRCH_OPRID", ids)                 # the copied key is not a step
+        task = parse_task(recorder.build(USER, recorder.draft(USER), "T"))
+        self.assertEqual(task.missing({}), ["user_id", "description"])  # the key is asked for every time
+        self.assertEqual(task.render({"user_id": "X", "description": "Y"})[-1], {"do": "expect_saved"})
+
+    def test_find_and_pick_a_result(self):
+        rec = copy.deepcopy(USER)
+        rec["steps"][:3] = [click("search", "PTS_CFG_CL_WRK_PTS_SRCH_BTN", "Search"),
+                            ev("click", "search", result=["ZZOLD", "Old User"])]
+        p = recorder.plan(rec)
+        self.assertEqual((p.mode, p.keys, p.pick), ("find", [], "ZZOLD"))
+        first = recorder.build(rec, recorder.draft(rec), "T")["playbook"][0]
+        self.assertEqual((first["mode"], first["keys"], first["pick"]), ("find", [], "ZZOLD"))
+
+    def test_already_exists_then_open_it(self):
+        rec = copy.deepcopy(PROCESS)
+        rec["steps"][3:3] = [ev("message", "search", text="The value you tried to add already exists."),
+                             ev("click", "search", result=["AGSLFT4OT", "English"])]
+        p = recorder.plan(rec)
+        self.assertEqual((p.mode, p.pick), ("add_or_open", None))     # the row is the typed key: no separate pick
+
+    def test_enter_instead_of_a_button(self):
+        rec = copy.deepcopy(USER)
+        del rec["steps"][2]                                          # pressed Enter in the key field
+        self.assertEqual(recorder.plan(rec).mode, "add")             # from the Add a New Value switch
+
+    def test_recording_that_ended_on_an_error_says_so(self):
+        rec = copy.deepcopy(USER)
+        rec["steps"][-1] = ev("message", "page", text="At least one ID type required. (48,50)")
+        p = recorder.plan(rec)
+        self.assertTrue(any("At least one ID type required" in n for n in p.notes))
+
+    def test_no_search_page(self):
+        rec = {**USER, "query": {"Action": "U"}, "steps": [s for s in USER["steps"] if s["phase"] != "search"]}
+        first = recorder.build(rec, recorder.draft(rec), "T")["playbook"][0]
+        self.assertEqual(first, {"do": "navigate", "query": {"Action": "U"}, "say": "Opening Create user profile"})
+
+    def test_reviewer_can_change_how_it_opens(self):
+        d = recorder.draft(USER)
+        self.assertEqual(d["open_mode"], "add")
+        d["open_mode"] = "add_or_open"
+        self.assertEqual(recorder.build(USER, d, "T")["playbook"][0]["mode"], "add_or_open")
+        d["open_mode"] = "delete"
+        with self.assertRaises(recorder.RecordingError):
+            recorder.build(USER, d, "T")
 
 
 SECRET = "k"
