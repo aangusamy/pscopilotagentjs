@@ -23,8 +23,18 @@ class AuthTest(unittest.TestCase):
         self.assertEqual(auth.verify(auth.make_token(SECRET, "VELU"), SECRET), "VELU")
 
     def test_known_digest(self):
-        # printf "s3cret|PS|20261022" | openssl dgst -sha256 -binary | base64  (= PeopleCode HashSHA256)
-        self.assertEqual(auth.sign(SECRET, "PS", "20261022"), "jXkjQlKRymNCGipEiNbctUj84t1nBcQzrZJptXCRgsg=")
+        # PeopleCode HashSHA256 hashes UTF-16LE. Reference value from .NET:
+        # [Convert]::ToBase64String(SHA256.ComputeHash([Text.Encoding]::Unicode.GetBytes("s3cret|PS|20261022")))
+        self.assertEqual(auth.sign(SECRET, "PS", "20261022"), "XnnS5ixwWlHXLZlp6S8w4YsttbP5XQXpSmzdjyI0ZQQ=")
+
+    def test_peoplesoft_token_shape(self):
+        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        sig = auth.sign(SECRET, "PS", day)
+        self.assertEqual(auth.verify(f"PS.{day}.{{9}}{sig}", SECRET), "PS")   # as the iScript returns it
+        self.assertEqual(auth.verify(f"PS.{day}.{sig}", SECRET), "PS")        # prefix optional
+        with self.assertRaises(auth.AuthError):                                # the old UTF-8 form is not accepted
+            utf8 = __import__("base64").b64encode(__import__("hashlib").sha256(f"{SECRET}|PS|{day}".encode()).digest()).decode()
+            auth.verify(f"PS.{day}.{{9}}{utf8}", SECRET)
 
     def test_rejections(self):
         good = auth.make_token(SECRET, "PS")
