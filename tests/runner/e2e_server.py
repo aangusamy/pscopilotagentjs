@@ -28,7 +28,7 @@ from psagent.server import create_app  # noqa: E402
 from psagent.tasks import load_tasks  # noqa: E402
 
 TASKS_DIR = Path(tempfile.mkdtemp(prefix="psagent-tasks-"))
-shutil.copytree(ROOT / "agent-service" / "tasks", TASKS_DIR, dirs_exist_ok=True)
+shutil.copytree(ROOT / "agent-service" / "tests" / "fixtures" / "tasks", TASKS_DIR, dirs_exist_ok=True)
 TASKS = load_tasks(TASKS_DIR)
 HERE = Path(__file__).resolve().parent
 

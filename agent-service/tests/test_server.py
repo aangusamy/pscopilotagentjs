@@ -13,7 +13,7 @@ from psagent.tasks import load_tasks
 
 from fakes import FakeLLM, response, text, tool
 
-TASKS = load_tasks(Path(__file__).resolve().parent.parent / "tasks")
+TASKS = load_tasks(Path(__file__).resolve().parent / "fixtures" / "tasks")
 SECRET = "s3cret"
 ORIGIN = "https://ps.example.com"
 

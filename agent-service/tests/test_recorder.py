@@ -15,7 +15,7 @@ from psagent.tasks import load_tasks, parse_task
 
 from fakes import FakeLLM, response, text, tool
 
-TASKS_DIR = Path(__file__).resolve().parent.parent / "tasks"
+TASKS_DIR = Path(__file__).resolve().parent / "fixtures" / "tasks"
 
 
 def s(id, value, label="", kind="text", column=None):
@@ -175,6 +175,13 @@ class BuildTest(unittest.TestCase):
         with_emp = [st["field"]["id"] for st in task.render({"user_id": "A", "description": "A", "emplid": "KU1"})
                     if st["do"] == "set"]
         self.assertEqual(with_emp[-3:], ["OPRALIASTYPE_X", "ATTRVAL_X$0", "PSOPRDEFN_DVW_OPRDEFNDESC$0"])
+
+    def test_repeated_same_value_is_dropped(self):
+        rec = copy.deepcopy(RECORDING)
+        rec["steps"].insert(2, s("PSOPRDEFN_SRCH_OPRID", "KUMAR", "User ID"))   # re-set after the Add click
+        steps = parse_task(recorder.build(rec, reviewed(), "T")).render({"user_id": "A", "description": "A"})
+        ids = [st["field"]["id"] for st in steps if st["do"] == "set"]
+        self.assertEqual(ids.count("PSOPRDEFN_SRCH_OPRID"), 1)
 
     def test_yaml_header(self):
         self.assertTrue(recorder.to_yaml(self.task_dict).startswith("# Recorded with PSAgent teach mode by TEACHER"))

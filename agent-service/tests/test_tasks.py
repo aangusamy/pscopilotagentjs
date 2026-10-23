@@ -3,7 +3,7 @@ from pathlib import Path
 
 from psagent.tasks import TaskError, load_tasks, parse_task
 
-TASKS_DIR = Path(__file__).resolve().parent.parent / "tasks"
+TASKS_DIR = Path(__file__).resolve().parent / "fixtures" / "tasks"
 
 
 def minimal(**overrides):

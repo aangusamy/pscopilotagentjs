@@ -140,7 +140,10 @@
           + '<label for="PSOPRDEFN_SRCH_OPRID">User ID begins with:</label> <input type="text" id="PSOPRDEFN_SRCH_OPRID">';
       return;
     }
-    var h = '<h2>User Profiles</h2>' + tabs() + '<div>User ID: <b>' + data.OPRID + '</b></div>';
+    /* Like PeopleSoft: the search key is still on the page (hidden) and set by script after Add */
+    var h = '<h2>User Profiles</h2>' + tabs() + '<div>User ID: <b>' + data.OPRID + '</b></div>'
+      + '<input type="text" id="PSOPRDEFN_SRCH_OPRID" style="display:none">';
+    setTimeout(function () { var k = el('PSOPRDEFN_SRCH_OPRID'); if (k) k.value = data.OPRID; }, 300);
     if (tab === 'General') {
       h += '<label for="PSOPRDEFN_SYMBOLICID">Symbolic ID:</label> <select id="PSOPRDEFN_SYMBOLICID" onchange="chg(this,\'SYMBOLICID\')">'
         + ['', 'SYSADM1', 'SYSADM2'].map(function (o) { return '<option value="' + o + '"' + (data.SYMBOLICID === o ? ' selected' : '') + '>' + o + '</option>'; }).join('')

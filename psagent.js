@@ -21,11 +21,11 @@
 
 (function () {
 
-  var VERSION = '2026-10-23.2';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-10-23.3';   /* shown as PSAgent.version and in the console: check after uploading */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
-  var CONFIG_ISCRIPT = 's/WEBLIB_AI_ISCRI.AI_ISCRIPT.FieldFormula.IScript_PSAgentConfig';
+  var CONFIG_ISCRIPT = 's/WEBLIB_PSAGENT.ISCRIPT1.FieldFormula.IScript_PSAgentConfig';
   function configIscriptUrl() {
     var m = location.pathname.match(/\/ps[cp]\/([^\/]+)\/([^\/]+)\/([^\/]+)\//);
     var site = m ? m[1].replace(/_newwin$/i, '').replace(/_\d+$/, '') : 'ps';
@@ -629,10 +629,15 @@
       });
     }
     function setStep(el) {
+      /* Only what a person can do: visible, editable fields. PeopleSoft also sets fields itself,
+         e.g. the search key again after Add; those are not steps (replaying them fails). */
+      if (!visible(el) || el.disabled || el.readOnly) return;
       var field = { id: el.id, label: labelOf(doc, el) };
       if (/\$\d+$/.test(el.id)) { var col = columnOf(el); if (col) field.column = col; }
       var step = { 'do': 'set', field: field, kind: kindOf(el), value: valueOf(el) };
-      var last = rec.steps[rec.steps.length - 1];
+      var last = rec.steps[rec.steps.length - 1], prev = null, i;
+      for (i = rec.steps.length - 1; i >= 0 && !prev; i--) if (isSet(rec.steps[i]) && rec.steps[i].field.id === el.id) prev = rec.steps[i];
+      if (prev && prev !== last && prev.value === step.value) return;   /* same value again: nothing new */
       if (last && last['do'] === 'set' && last.field.id === el.id) rec.steps[rec.steps.length - 1] = step;
       else rec.steps.push(step);
       if (step.kind !== 'password') snap[el.id] = step.value;

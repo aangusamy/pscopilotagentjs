@@ -287,6 +287,7 @@ def build(rec, reviewed, author):
     query = {str(k)[:30]: _str(v, 100) for k, v in (rec.get("query") or {}).items()}
     playbook = [{"do": "navigate", "query": query, "say": f"Opening {title}"}]
     seen_grids = set()
+    entered = {}  # field id -> value already entered earlier in the recording
     for st in rec["steps"]:
         if st["do"] == "tab":
             playbook.append({"do": "tab", "label": _str(st.get("label"), 80)})
@@ -297,6 +298,12 @@ def build(rec, reviewed, author):
                 playbook.append({"do": "click", "button": btn})
         else:
             f = st["field"]
+            raw = _str(st.get("value"))
+            if entered.get(f["id"]) == raw:
+                # The same value again is not a new action (PeopleSoft re-sets e.g. the search
+                # key after Add, where the field no longer exists); replaying it would fail.
+                continue
+            entered[f["id"]] = raw
             c = cands[_key_of(st, cands)]
             if c["kind"] == "list":
                 if c["key"] in seen_grids:
