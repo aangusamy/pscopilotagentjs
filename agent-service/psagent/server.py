@@ -223,6 +223,8 @@ def app_from_env():
     tasks_dir = os.environ.get("PSAGENT_TASKS_DIR", str(Path(__file__).resolve().parent.parent / "tasks"))
     origins = [o.strip() for o in os.environ.get("PSAGENT_ALLOWED_ORIGINS", "").split(",") if o.strip()]
     teachers = {t.strip() for t in os.environ.get("PSAGENT_TEACHERS", "").split(",") if t.strip()}
+    log.info("Allowed browser origins (PSAGENT_ALLOWED_ORIGINS): %s", origins or "none: only same-origin calls (reverse proxy) will work")
+    log.info("Teachers (PSAGENT_TEACHERS): %s", sorted(teachers) or "none: recording is off")
     llm = ClaudeLLM(
         model=os.environ.get("PSAGENT_MODEL", "claude-opus-5-5"),
         effort=os.environ.get("PSAGENT_EFFORT", "low"),
