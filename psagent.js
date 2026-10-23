@@ -22,7 +22,7 @@
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
-  var CONFIG_ISCRIPT = 's/WEBLIB_PSAGENT.ISCRIPT1.FieldFormula.IScript_PSAgentConfig';
+  var CONFIG_ISCRIPT = 's/WEBLIB_AI_ISCRI.AI_ISCRIPT.FieldFormula.IScript_PSAgentConfig';
   function configIscriptUrl() {
     var m = location.pathname.match(/\/ps[cp]\/([^\/]+)\/([^\/]+)\/([^\/]+)\//);
     var site = m ? m[1].replace(/_newwin$/i, '').replace(/_\d+$/, '') : 'ps';
@@ -638,12 +638,12 @@
     if (document.getElementById('psa-fab')) return;
 
     var css = '#psa-fab{position:fixed;bottom:24px;right:24px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#003865,#0078d4);border:none;cursor:pointer;box-shadow:0 4px 16px rgba(0,56,101,.45);z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:0;}'
-      + '#psa-panel{position:fixed;bottom:92px;right:24px;width:380px;height:580px;max-height:calc(100vh - 110px);border-radius:16px;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.22);border:1px solid #d0dce8;display:none;flex-direction:column;background:#fff;z-index:2147483645;font-family:Segoe UI,sans-serif;font-size:13px;color:#222;}'
+      + '#psa-panel{position:fixed;bottom:92px;right:24px;width:380px;height:580px!important;max-height:calc(100vh - 110px);border-radius:16px;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.22);border:1px solid #d0dce8;display:none;flex-direction:column;background:#fff;z-index:2147483645;font-family:Segoe UI,sans-serif;font-size:13px;color:#222;}'
       + '#psa-panel.psa-open{display:flex;}'
-      + '#psa-hdr{background:linear-gradient(135deg,#003865,#0078d4);color:#fff;padding:12px 14px;display:flex;align-items:center;gap:8px;}'
+      + '#psa-hdr{flex:0 0 auto!important;background:linear-gradient(135deg,#003865,#0078d4);color:#fff;padding:12px 14px;display:flex;align-items:center;gap:8px;}'
       + '#psa-hdr h3{margin:0;font-size:13px;font-weight:600;flex:1;}'
       + '#psa-hdr button{background:rgba(255,255,255,.2);border:none;color:#fff;border-radius:6px;cursor:pointer;padding:4px 8px;font-size:12px;}'
-      + '#psa-log{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px;background:#fafbfc;}'
+      + '#psa-log{flex:1 1 auto!important;min-height:0!important;height:auto!important;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px;background:#fafbfc;}'
       + '.psa-msg{max-width:85%;padding:8px 11px;border-radius:12px;line-height:1.45;word-wrap:break-word;}'
       + '.psa-bot{background:#f0f4f8;border:1px solid #d0dce8;align-self:flex-start;}'
       + '.psa-user{background:#003865;color:#fff;align-self:flex-end;}'
@@ -668,9 +668,10 @@
       + '.psa-card ol{margin:4px 0;padding-left:20px;max-height:140px;overflow-y:auto;}'
       + '.psa-card .psa-check{display:flex;gap:6px;align-items:center;}'
       + '.psa-card .psa-check input{width:auto;}'
-      + '#psa-form{display:flex;gap:6px;padding:8px;border-top:1px solid #e0e0e0;background:#f8f9fa;}'
-      + '#psa-input{flex:1;resize:none;height:38px;padding:8px;border:1px solid #ccc;border-radius:8px;font:inherit;}'
-      + '#psa-send{background:#0078d4;color:#fff;border:none;border-radius:8px;padding:0 14px;cursor:pointer;}'
+      /* PeopleSoft styles every form/textarea/button: pin the chat's layout with !important */
+      + '#psa-form{display:flex!important;flex:0 0 auto!important;height:auto!important;min-height:0!important;max-height:none!important;margin:0!important;gap:6px;padding:8px;border-top:1px solid #e0e0e0;background:#f8f9fa;align-items:stretch;}'
+      + '#psa-input{flex:1 1 auto!important;resize:none;height:40px!important;min-height:40px!important;max-height:40px!important;margin:0!important;padding:8px!important;border:1px solid #ccc;border-radius:8px;font:13px Segoe UI,sans-serif!important;box-sizing:border-box!important;}'
+      + '#psa-send{flex:0 0 auto!important;height:40px!important;min-height:0!important;margin:0!important;background:#0078d4!important;color:#fff!important;border:none;border-radius:8px;padding:0 14px!important;cursor:pointer;}'
       + '#psa-ws{position:fixed;top:16px;left:16px;right:420px;bottom:16px;display:none;flex-direction:column;background:#fff;border:2px solid #0078d4;border-radius:12px;overflow:hidden;z-index:2147483644;box-shadow:0 8px 40px rgba(0,0,0,.25);font-family:Segoe UI,sans-serif;font-size:13px;}'
       + '#psa-ws-hdr{display:flex;align-items:center;gap:10px;padding:8px 12px;background:#003865;color:#fff;}'
       + '#psa-ws-status{flex:1;opacity:.9;}'
@@ -709,6 +710,7 @@
     var input = panel.querySelector('#psa-input');
     var state = loadState();
     var busy = false;
+    var ready = false;   /* config loaded from the iScript */
 
     function loadState() {
       try { return JSON.parse(sessionStorage.getItem(STORE_KEY)) || { sessionId: null, history: [] }; }
@@ -960,14 +962,22 @@
     function open() {
       panel.classList.add('psa-open');
       fab.setAttribute('aria-expanded', 'true');
-      if (!logEl.childNodes.length) {
+      if (!ready) {                       /* first open, or the last attempt failed: (re)connect */
+        logEl.innerHTML = '';
         ensureConfig().then(function () {
+          ready = true;
           apiGet('/api/me').then(function (me) {
             if (me.can_teach) panel.querySelector('#psa-rec').style.display = '';
-          }, function () {});
+          }, function (e) {
+            addMsg('bot', 'I cannot reach the agent service at ' + (cfg.agentUrl || '(no URL)') + ': ' + e.message
+              + '. Check that it is running and that this PeopleSoft address is in PSAGENT_ALLOWED_ORIGINS.', false);
+          });
           if (state.history.length) state.history.forEach(function (h) { addMsg(h.who, h.text, false); });
           else greet();
-        }, function () { addMsg('bot', 'Sorry, the agent is not available right now.', false); });
+        }, function (e) {
+          console.warn('[PSAgent] config failed:', e);
+          addMsg('bot', 'Sorry, the agent is not available right now: ' + e.message + '.', false);
+        });
       }
       setTimeout(function () { input.focus(); }, 100);
     }
@@ -1009,7 +1019,15 @@
       return (configPromise = Promise.resolve(cfg));
     }
     configPromise = fetch(configIscriptUrl(), { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
-      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (r) {
+        if (!r.ok) throw new Error('iScript returned HTTP ' + r.status);
+        return r.text().then(function (t) {
+          try { return JSON.parse(t); } catch (e) {
+            if (/Authorization Error/i.test(t)) throw new Error('you have no access to WEBLIB_PSAGENT (grant IScript_PSAgentConfig in a permission list)');
+            throw new Error('the iScript did not return JSON (check WEBLIB_PSAGENT.ISCRIPT1 FieldFormula)');
+          }
+        });
+      })
       .then(function (c) {
         cfg.agentUrl = c.agentUrl; cfg.token = c.token; cfg.oprid = c.oprid; cfg.fullname = c.fullname;
         return cfg;
