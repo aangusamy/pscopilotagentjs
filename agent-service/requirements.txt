@@ -1,4 +1,4 @@
-anthropic
+anthropic>=2.1
 starlette
 uvicorn
 pyyaml

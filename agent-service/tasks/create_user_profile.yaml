@@ -66,7 +66,7 @@ fields:
   roles:
     label: Roles
     type: list
-    hint: Comma separated role names, exact case, e.g. "EMPLOYEE, PeopleSoft User".
+    hint: Comma separated role names exactly as defined in PeopleSoft (case matters), e.g. "Employee, PeopleSoft User". Use the user's spelling; PeopleSoft rejects unknown names.
 
 playbook:
   # --- Add a New Value search page ---

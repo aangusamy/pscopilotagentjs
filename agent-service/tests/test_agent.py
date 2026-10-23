@@ -154,7 +154,27 @@ class AgentFlowTest(unittest.TestCase):
         agent.chat(s, "password is hunter2")
         self.assertNotIn("password", s.values)
         out = json.loads(llm.calls[-1][-1]["content"][1]["content"])
-        self.assertEqual(out["rejected"], [{"name": "password", "error": "not a field of this task"}])
+        [rej] = out["rejected"]
+        self.assertEqual((rej["name"], rej["error"]), ("password", "not a field of this task"))
+        self.assertIn("user_id", rej["valid_names"])
+        self.assertNotIn("password", rej["valid_names"])
+
+    def test_working_notes_between_tool_calls_are_hidden(self):
+        llm = FakeLLM(
+            response(text("Field name should be user_id."),
+                     tool("start_task", {"task_id": "create_user_profile"})),
+            response(text("What description should I use?")),
+        )
+        agent, s = Agent(llm, TASKS), Session(id="s", oprid="PS")
+        self.assertEqual(agent.chat(s, "create user velu").messages, ["What description should I use?"])
+
+    def test_last_note_shown_when_final_answer_is_empty(self):
+        llm = FakeLLM(
+            response(text("Please review the card."), tool("start_task", {"task_id": "create_user_profile"})),
+            response(),
+        )
+        agent, s = Agent(llm, TASKS), Session(id="s", oprid="PS")
+        self.assertEqual(agent.chat(s, "go").messages, ["Please review the card."])
 
     def test_tools_are_strict_and_fixed(self):
         agent = Agent(FakeLLM(), TASKS)

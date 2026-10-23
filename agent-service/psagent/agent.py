@@ -136,8 +136,8 @@ def _signature(task):
 def _catalog(tasks):
     lines = []
     for t in tasks.values():
-        req = ", ".join(f.label for f in t.fields.values() if f.required)
-        opt = ", ".join(f.label for f in t.fields.values() if not f.required)
+        req = ", ".join(f"{f.label} ({n})" for n, f in t.fields.items() if f.required)
+        opt = ", ".join(f"{f.label} ({n})" for n, f in t.fields.items() if not f.required)
         lines.append(f"- {t.id}: {t.title}. {t.summary}\n  Required: {req}\n  Optional: {opt or 'none'}")
     return "\n".join(lines)
 
@@ -254,6 +254,7 @@ class Agent:
     def _turn(self, s, user_content):
         reply = Reply()
         tasks, previous = self.tasks, None  # previous: s.known before an unanswered announcement
+        narration = ""
         s.messages.append({"role": "user", "content": user_content})
         if s.system is None:
             s.system = SYSTEM_PROMPT.format(catalog=_catalog(tasks))
@@ -277,11 +278,14 @@ class Agent:
             s.messages.append({"role": "assistant", "content": resp.content})
             previous = None
             text = "\n\n".join(b.text for b in resp.content if b.type == "text" and b.text.strip())
-            if text:
-                reply.messages.append(text)
             calls = [b for b in resp.content if b.type == "tool_use"]
             if resp.stop_reason != "tool_use" or not calls:
+                # Only the final answer is shown; text between tool calls is the model's working
+                # notes ("Field name should be user_id."). Fall back to the last note if needed.
+                if text or narration:
+                    reply.messages.append(text or narration)
                 return reply
+            narration = text or narration
             results = []
             for call in calls:
                 out, is_error = self._run_tool(s, call.name, call.input, reply)
@@ -333,7 +337,8 @@ class Agent:
             for item in args.get("fields") or []:
                 f = task.fields.get(item.get("name"))
                 if f is None or f.sensitive:
-                    rejected.append({"name": item.get("name"), "error": "not a field of this task"})
+                    rejected.append({"name": item.get("name"), "error": "not a field of this task",
+                                     "valid_names": [n for n, x in task.fields.items() if not x.sensitive]})
                     continue
                 value, err = f.normalize(item.get("value", ""))
                 if err:
