@@ -20,6 +20,8 @@
 
 (function () {
 
+  var VERSION = '2026-10-23.1';   /* shown as PSAgent.version and in the console: check after uploading */
+
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
   var CONFIG_ISCRIPT = 's/WEBLIB_AI_ISCRI.AI_ISCRIPT.FieldFormula.IScript_PSAgentConfig';
@@ -1056,6 +1058,7 @@
   function apiGet(path) { return api(path, undefined); }
 
   window.PSAgent = {
+    version: VERSION,
     inspect: inspect,
     teach: teach,
     record: record,
@@ -1066,7 +1069,7 @@
     /* Branding loads this file on every page, including the PeopleSoft content frame
        and the agent's own workspace frame: only the top window gets the widget. */
     try { if (window.top !== window && window.top.document) return; } catch (e) { /* cross-origin parent: show it */ }
-    if (document.body) initWidget();
+    if (document.body) { initWidget(); try { console.info('[PSAgent] widget ' + VERSION); } catch (e) {} }
     else setTimeout(start, 250);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
