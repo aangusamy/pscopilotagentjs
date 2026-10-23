@@ -63,17 +63,36 @@ Anthropic's recommended fallback model.
 
 ## PeopleSoft setup
 
-1. **iScript**: create record `WEBLIB_PSAGENT`, add the code in
-   `../psagent_iscript` to `ISCRIPT1.FieldFormula`, set `&AGENT_URL` and
-   `&AGENT_SECRET`, and grant the WEBLIB in the users' permission lists. It
-   returns a day-scoped token `OPRID.YYYYMMDD.HashSHA256(secret|OPRID|YYYYMMDD)`.
-   The secret never reaches the browser. HashSHA256 needs PeopleTools 8.54+.
-2. **Widget**: paste `../psagent.js` at the bottom of `PTNUI_MENU_JS`. Update
-   `CONFIG_ISCRIPT_URL` if your site, portal or node differ.
-3. **Network**: the browser calls the service directly, so it must be HTTPS and
-   listed in `PSAGENT_ALLOWED_ORIGINS`. The cleanest setup is to reverse-proxy it
-   under the PeopleSoft host (e.g. `/psagent/`), so there's no CORS at all.
+Three pieces: the agent service runs on a server, an iScript tells the browser
+where it is and who the user is, and the widget script is loaded on every page.
+The widget needs no App Designer changes to delivered objects.
 
+1. **Agent service.** Run it on a server PeopleSoft users can reach over HTTPS.
+   Best is to reverse-proxy it under the PeopleSoft host, e.g.
+   `https://ps.example.com/psagent/` → `http://agent-host:8080/`. Then there's
+   no CORS and no extra certificate. Otherwise give it its own HTTPS name and
+   list the PeopleSoft origin in `PSAGENT_ALLOWED_ORIGINS`.
+2. **iScript** (App Designer). Create a derived record `WEBLIB_PSAGENT` with
+   field `ISCRIPT1` and paste `../psagent_iscript` into its FieldFormula. Set
+   `&AGENT_URL` (e.g. `/psagent`) and `&AGENT_SECRET`, the same value as
+   `PSAGENT_SHARED_SECRET`. It returns a day-scoped token
+   `OPRID.YYYYMMDD.HashSHA256(secret|OPRID|YYYYMMDD)`, and the secret never
+   reaches the browser.
+3. **Security.** Open PeopleTools > Security > Permission Lists, go to the Web
+   Libraries tab, add `WEBLIB_PSAGENT` and give `IScript_PSAgentConfig` Full
+   Access. Do this in the permission lists of the users who should see the
+   agent (e.g. one assigned through a "PS Agent User" role). Users without it
+   get no widget. Recording is further limited to `PSAGENT_TEACHERS`.
+4. **Widget** (no App Designer). Open PeopleTools > Portal > Branding > Branding
+   Objects, JavaScript tab, and upload `../psagent.js` as `PSAGENT_JS`. Then
+   open PeopleTools > Portal > Branding > Branding System Options and add
+   `PSAGENT_JS` under *Additional JavaScript Objects*. Sign out and back in. It
+   loads on Fluid and Classic pages. It only shows in the top window, never
+   inside the content frame or its own workspace.
+   *Alternative:* paste it at the bottom of `PTNUI_MENU_JS`, as the Copilot
+   widget does. That only covers Fluid pages and modifies a delivered object.
+
+The widget derives the iScript URL from the page (`/psc/<site>/<portal>/<node>/s/…`).
 The agent works in a frame on the same origin
 (`/psc/<site>/<portal>/<node>/c/MENU.COMPONENT.GBL`). If your web server sends
 `X-Frame-Options: DENY` for `/psc/`, allow `SAMEORIGIN`.

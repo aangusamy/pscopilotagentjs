@@ -20,8 +20,14 @@
 
 (function () {
 
-  /* iScript URL — update WEBLIB name to match your App Designer record */
-  var CONFIG_ISCRIPT_URL = '/psc/ps/EMPLOYEE/HRMS/s/WEBLIB_PSAGENT.ISCRIPT1.FieldFormula.IScript_PSAgentConfig';
+  /* iScript that returns the agent URL + token. Site, portal and node come from the
+     current page URL; change the WEBLIB part if you named the record differently. */
+  var CONFIG_ISCRIPT = 's/WEBLIB_PSAGENT.ISCRIPT1.FieldFormula.IScript_PSAgentConfig';
+  function configIscriptUrl() {
+    var m = location.pathname.match(/\/ps[cp]\/([^\/]+)\/([^\/]+)\/([^\/]+)\//);
+    var site = m ? m[1].replace(/_newwin$/i, '').replace(/_\d+$/, '') : 'ps';
+    return '/psc/' + site + '/' + (m ? m[2] : 'EMPLOYEE') + '/' + (m ? m[3] : 'HRMS') + '/' + CONFIG_ISCRIPT;
+  }
 
   var RUN = { stepTimeout: 30000, settleMs: 400, pollMs: 150, afterActionMs: 300 };
 
@@ -1002,7 +1008,7 @@
       for (var k in window.PSAGENT_CONFIG) cfg[k] = window.PSAGENT_CONFIG[k];
       return (configPromise = Promise.resolve(cfg));
     }
-    configPromise = fetch(CONFIG_ISCRIPT_URL, { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
+    configPromise = fetch(configIscriptUrl(), { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function (c) {
         cfg.agentUrl = c.agentUrl; cfg.token = c.token; cfg.oprid = c.oprid; cfg.fullname = c.fullname;
@@ -1039,6 +1045,9 @@
   };
 
   function start() {
+    /* Branding loads this file on every page, including the PeopleSoft content frame
+       and the agent's own workspace frame: only the top window gets the widget. */
+    try { if (window.top !== window && window.top.document) return; } catch (e) { /* cross-origin parent: show it */ }
     if (document.body) initWidget();
     else setTimeout(start, 250);
   }
