@@ -114,6 +114,7 @@ Do the transaction once by hand and the agent can do it from then on:
    * Password fields are recorded as "a password goes here", never the value.
    * The NavBar, header and message boxes are not part of the task.
    * To make a list (roles, requisition lines), fill **at least two rows**.
+   * A change you undo (tick, then untick) leaves no step.
    * A task covers one page (component). If you move to another one with values
      already entered, the bar says so; go back or finish. What you do after Saved
      or the process instance (e.g. opening Process Monitor) is left out.
@@ -140,7 +141,8 @@ same way, and each recorded step notes where it happened:
 | **Search page**: key values, Add / Search, a result row | One `open` step: the keys and a mode. *add* when you pressed Add, *find* when you searched or picked a row, *add_or_open* when you added and then opened the existing row, and for every process run (a run control is reused) |
 | **Page**: values, tabs, grid rows, buttons | `set`, `tab`, `grid` and `click` steps |
 | **Pop-up** over the page (e.g. Process Scheduler Request) | The same steps, marked `popup: true` |
-| **What PeopleSoft showed**: Saved, or a process instance number | `expect_saved` / `expect_process` at the end. If you finish on an error message instead, the review card warns you |
+| **What PeopleSoft showed**: Saved, or the process request accepted | `expect_saved` / `expect_process` at the end. The **last** result counts (Run saves the run control before the pop-up opens), and a process run outranks Saved. If you finish on an error message instead, the review card warns you |
+| **Grids** | A grid you added rows to (with **+**) becomes one list value. In a fixed grid, such as the pop-up's Process List, each row is found by the text it shows; text that is one of your values (the program name) follows that value, so another program ticks its own row |
 
 When the agent runs an `open` step it does what a person does on the search page:
 it types the keys, presses Add or Search, opens the only match or the matching
@@ -176,7 +178,7 @@ Step types:
 | `grid` | `field`, `values` | Fills one grid row per value, pressing the row's **+** button to add rows |
 | `wait` | `field` | Waits until a field appears |
 | `expect_saved` | | Succeeds only if PeopleSoft shows **Saved** and no message |
-| `expect_process` | | Succeeds when the page shows a **Process Instance** number (after Run, then OK) |
+| `expect_process` | | After Run, then OK: succeeds when the page shows a **Process Instance** number or, on pages that show none (e.g. AE requests), when the Process Scheduler Request closed without a message |
 
 Fields are found by `id` first, then by `label` (the `<label for>` text), then by
 grid `column` header. `popup: true` on a `set`, `click` or `wait` step means the
@@ -194,8 +196,8 @@ of asking for them. That is the natural next step.
 ## Tests
 
 ```bash
-cd agent-service && python3 -m unittest discover -s tests -t tests       # 58 unit tests, scripted LLM
-cd .. && node tests/runner/run_browser_tests.mjs                          # 7 browser tests (Playwright)
+cd agent-service && python3 -m unittest discover -s tests -t tests       # 60 unit tests, scripted LLM
+cd .. && node tests/runner/run_browser_tests.mjs                          # 8 browser tests (Playwright)
 ```
 
 The browser tests run the real widget and the real service (with a scripted

@@ -116,22 +116,30 @@ class Plan:
 def plan(rec):
     validate(rec)
     action = (rec.get("query") or {}).get("Action")
+    events = rec["steps"]
+    # The task's result is the LAST one PeopleSoft showed: Run saves the run control before the
+    # pop-up opens, OK saves it again and then shows the process instance. Among the results
+    # after the final action, a process instance wins over Saved. What follows is not the task.
+    acts = [i for i, e in enumerate(events) if e["do"] in ("set", "click", "tab")]
+    outs = [i for i, e in enumerate(events) if e["do"] == "outcome" and acts and acts[0] < i]
+    outcome, end = None, len(events)
+    if outs:
+        cause = max(a for a in acts if a < outs[-1])
+        kinds = [events[i]["kind"] for i in outs if i > cause]
+        outcome = "process" if "process" in kinds else kinds[-1]
+        end = outs[-1] + 1
+    dropped = sum(1 for a in acts if a >= end)
     mode, toggle, keys, result = None, None, {}, None
-    steps, outcome, dropped, on_page, last_msg = [], None, 0, False, None
-    for e in rec["steps"]:
+    steps, on_page, last_msg = [], False, None
+    for e in events[:end]:
         phase, kind = e.get("phase", "page"), e["do"]
         if kind == "message":
-            if outcome is None and not dropped:
-                last_msg = _str(e.get("text"), 300)   # PeopleSoft's answer to the last action
+            last_msg = _str(e.get("text"), 300)   # PeopleSoft's answer to the last action
             continue
         if kind == "outcome":
-            # OK on the Process Scheduler Request also saves the run control: a process instance
-            # seen right after "Saved" (nothing done in between) is the real result
-            if steps and (outcome is None or (outcome == "saved" and e["kind"] == "process" and not dropped)):
-                outcome = e["kind"]
             continue
-        if outcome is not None or (phase == "search" and on_page):
-            dropped += 1          # after the result, or back on the search page: not this task
+        if phase == "search" and on_page:
+            dropped += 1          # back on the search page: another record, not this task
             continue
         last_msg = None
         if phase == "search":
@@ -210,7 +218,13 @@ def candidates(rec, p=None):
             m = _GRID_ID.match(st["field"]["id"])
             if m:
                 rows.setdefault(m.group(1), set()).add(int(m.group(2)))
-    grids = {base for base, r in rows.items() if len(r) >= 2}
+    # A list is rows the person added (the grid has a "+" button). Rows of a fixed grid (the
+    # Process List on the Process Scheduler Request) stay separate values. Recordings from
+    # before the widget noted this: any grid with 2+ rows.
+    noted = any("addable" in st["field"] for st in sets)
+    addable = {_GRID_ID.match(st["field"]["id"]).group(1) for st in sets
+               if st["field"].get("addable") and _GRID_ID.match(st["field"]["id"])}
+    grids = {base for base, r in rows.items() if len(r) >= 2 and (base in addable or not noted)}
 
     out, by_key = [], {}
     for st in sets:
@@ -384,13 +398,23 @@ def _upper(values):
     return bool(vals) and all(v == v.upper() and re.search(r"[A-Z]", v) for v in vals)
 
 
-def _spec(f):
+def _spec(f, asked=None):
     spec = {"id": _str(f["id"], 100)}
     if f.get("label"):
         spec["label"] = _str(f["label"], 80)
     if f.get("column"):
         spec["column"] = _str(f["column"], 80)
+    if f.get("row") and asked is not None and not f.get("addable"):
+        spec["row"] = _row(f["row"], asked)
     return spec
+
+
+def _row(texts, asked):
+    """Identify a fixed grid row by what it shows. Text that is one of the task's asked values
+    becomes that value ("the row showing {{program_name}}"), so another value picks another row."""
+    texts = [_str(t, 60) for t in texts if _str(t).strip()][:4]
+    tied = [asked[norm(t)] for t in texts if norm(t) in asked]
+    return tied or texts
 
 
 def build(rec, reviewed, author):
@@ -443,6 +467,9 @@ def build(rec, reviewed, author):
         fields[name] = spec
         names[key] = name
 
+    asked = {norm(c["value"]): f"{{{{{names[k]}}}}}" for k, c in cands.items()
+             if names.get(k) and c["kind"] not in ("secret", "list") and _str(c["value"]).strip()}
+
     def value_of(c):
         name = names[c["key"]]
         if c["kind"] == "secret":
@@ -489,7 +516,7 @@ def build(rec, reviewed, author):
                 playbook.append({"do": "grid", "field": spec, "values": f"{{{{{name}}}}}" if name else list(c["value"]),
                                  "_var": name})
                 continue
-            playbook.append({"do": "set", "field": _spec(f), "value": value_of(c), **popup,
+            playbook.append({"do": "set", "field": _spec(f, asked), "value": value_of(c), **popup,
                              "_var": None if c["kind"] == "secret" else name, "_fixed": not name})
     if p.outcome:
         playbook.append({"do": "expect_" + p.outcome})

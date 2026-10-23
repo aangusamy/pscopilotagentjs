@@ -22,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-10-24.1';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-10-24.3';   /* shown as PSAgent.version and in the console: check after uploading */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
@@ -115,8 +115,33 @@
     return null;
   }
 
+  /* Text a grid row shows outside its input fields, e.g. ["Simple AE test program", "AEMINITEST"] */
+  function rowTexts(tr) {
+    var out = [];
+    for (var c = tr && tr.firstElementChild; c && out.length < 4; c = c.nextElementSibling) {
+      if (c.querySelector('input:not([type="hidden"]),select,textarea')) continue;
+      var t = (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim();
+      if (t && t.length <= 60) out.push(t);
+    }
+    return out;
+  }
+
+  /* A fixed grid (e.g. the Process List on the Process Scheduler Request) by the row's text:
+     the row showing "AEMINITEST", wherever it is in the list */
+  function byRowText(doc, spec) {
+    var base = spec.id.replace(/\$\d+$/, ''), want = spec.row.map(norm);
+    for (var k = 0; k < 500; k++) {
+      var el = doc.getElementById(base + '$' + k);
+      if (!el) { if (k > 0) break; continue; }
+      var text = norm(closest(el, 'TR') ? closest(el, 'TR').innerText : '');
+      if (isInput(el) && want.every(function (w) { return text.indexOf(w) >= 0; })) return el;
+    }
+    return null;
+  }
+
   function findField(doc, spec, row) {
     var el = null;
+    if (spec.row && spec.row.length && spec.id && row == null) return byRowText(doc, spec);
     if (spec.id) {
       el = row == null ? doc.getElementById(spec.id)
         : doc.getElementById(spec.id + '$' + row) || (row === 0 ? doc.getElementById(spec.id) : null);
@@ -127,7 +152,7 @@
     return el;
   }
 
-  function fieldName(spec) { return spec.label || spec.column || spec.id; }
+  function fieldName(spec) { return (spec.label || spec.column || spec.id) + (spec.row && spec.row.length ? ' (' + spec.row.join(' · ') + ')' : ''); }
 
   function findButton(doc, spec) {
     var el = spec.id ? doc.getElementById(spec.id) : null;
@@ -250,6 +275,15 @@
       } catch (e) { return false; }
     });
   }
+  /* Every process is submitted through the Process Scheduler Request pop-up (PRCSRQSTDLG) */
+  function prcsDialogOpen(frame) {
+    return modalDocs(frame).some(function (d) { return !!d.querySelector('[id^="PRCSRQSTDLG_WRK_"]'); });
+  }
+  function processInstance(doc) {
+    var m = doc && doc.body && (doc.body.innerText || '').match(/Process Instance\s*:?\s*(\d+)/i);
+    return m && +m[1] > 0 ? m[1] : null;
+  }
+
   /* Where a step works: the pop-up for steps recorded there, otherwise the page */
   function stepDocs(frame, popup) { return popup ? modalDocs(frame) : [frame.contentDocument]; }
   function locate(docs, find) {
@@ -474,10 +508,15 @@
         .then(function (btn) { return act(frame, function () { btn.click(); }); });
     },
     expect_process: function (frame) {
+      /* Standard run control pages show the new process instance; others (e.g. AE requests) don't.
+         Either way PeopleSoft accepted the request when its pop-up closed without a message. */
+      var start = Date.now();
       return waitFor(frame, function () {
-        var doc = frame.contentDocument, m = doc && doc.body && (doc.body.innerText || '').match(/Process Instance\s*:?\s*(\d+)/i);
-        return m && +m[1] > 0 ? 'Submitted: process instance ' + m[1] : null;
-      }, 'PeopleSoft did not show a process instance number. Check Process Monitor.');
+        var n = processInstance(frame.contentDocument);
+        if (n) return 'Submitted: process instance ' + n;
+        if (Date.now() - start > 4000 && !prcsDialogOpen(frame)) return 'Submitted to the Process Scheduler (this page shows no process instance number; see Process Monitor)';
+        return null;
+      }, prcsDialogOpen(frame) ? 'The Process Scheduler Request did not close after OK' : 'PeopleSoft did not confirm the process request. Check Process Monitor.');
     },
     tab: function (frame, step) {
       var doc = frame.contentDocument, want = norm(step.label), links = doc.querySelectorAll('a'), i;
@@ -741,7 +780,7 @@
   function attachRecorder(doc, rec, changed, popup) {
     function phase() { return popup ? 'popup' : isSearchPage(doc) ? 'search' : 'page'; }
     if (doc._psaRec) return;
-    var snap = {};
+    var snap = {}, orig = {};   /* orig: value before the person first changed the field */
     function ignored(el) {
       /* the agent's own UI, PeopleSoft's header/NavBar and message boxes are not part of the task */
       return /^PT_/.test(el.id || '')
@@ -758,13 +797,21 @@
          e.g. the search key again after Add; those are not steps (replaying them fails). */
       if (!visible(el) || el.disabled || el.readOnly) return;
       var field = { id: el.id, label: labelOf(doc, el) };
-      if (/\$\d+$/.test(el.id)) { var col = columnOf(el); if (col) field.column = col; }
+      if (/\$\d+$/.test(el.id)) {                  /* grid cell: its column, the row's text, and whether rows can be added */
+        var col = columnOf(el), tr = closest(el, 'TR');
+        if (col) field.column = col;
+        field.row = rowTexts(tr);
+        field.addable = !!(tr && tr.querySelector('[id*="$new$"]'));
+      }
       var step = { 'do': 'set', phase: phase(), field: field, kind: kindOf(el), value: valueOf(el) };
       var last = rec.steps[rec.steps.length - 1], prev = null, i;
       for (i = rec.steps.length - 1; i >= 0 && !prev; i--) if (isSet(rec.steps[i]) && rec.steps[i].field.id === el.id) prev = rec.steps[i];
       if (prev && prev !== last && prev.value === step.value) return;   /* same value again: nothing new */
-      if (last && last['do'] === 'set' && last.field.id === el.id && last.phase === step.phase) rec.steps[rec.steps.length - 1] = step;
-      else rec.steps.push(step);
+      if (!(el.id in orig)) orig[el.id] = el.id in snap ? snap[el.id] : null;
+      if (last && last['do'] === 'set' && last.field.id === el.id && last.phase === step.phase) {
+        if (step.kind !== 'password' && step.value === orig[el.id]) rec.steps.pop();   /* changed back: undone */
+        else rec.steps[rec.steps.length - 1] = step;
+      } else rec.steps.push(step);
       if (step.kind !== 'password') snap[el.id] = step.value;
       changed();
     }
@@ -805,20 +852,24 @@
 
   /* What PeopleSoft shows while the person works: messages, and the result of the task
      (Saved, or a process instance after Run). Recorded as notes between the steps. */
-  var observed = { doc: null, msg: null, saved: false, instance: null };
-  function observe(rec, doc) {
+  var observed = { doc: null, msg: null, saved: false, instance: null, prcs: false };
+  function observe(rec, doc, frame) {
     if (!doc || !doc.body) return false;
     var msg = psMessage(doc) || null, savedEl = doc.querySelector('#SAVED_win0');
-    var saved = !!savedEl && visible(savedEl);
-    var m = (doc.body.innerText || '').match(/Process Instance\s*:?\s*(\d+)/i), instance = m && +m[1] > 0 ? m[1] : null;
+    var saved = !!savedEl && visible(savedEl), instance = processInstance(doc), prcs = prcsDialogOpen(frame);
     var fresh = observed.doc !== doc, added = false;
     if (!fresh && rec.steps.some(isAction)) {
-      var phase = isSearchPage(doc) ? 'search' : 'page';
+      var phase = isSearchPage(doc) ? 'search' : 'page', acts = rec.steps.filter(isAction), last = acts[acts.length - 1];
       if (msg && msg !== observed.msg) { rec.steps.push({ 'do': 'message', phase: phase, text: msg.slice(0, 300) }); added = true; }
       if (saved && !observed.saved) { rec.steps.push({ 'do': 'outcome', phase: phase, kind: 'saved' }); added = true; }
       if (instance && instance !== observed.instance) { rec.steps.push({ 'do': 'outcome', phase: phase, kind: 'process', detail: instance }); added = true; }
+      /* The Process Scheduler Request closed after its OK, without a message: the request was accepted */
+      else if (observed.prcs && !prcs && !msg && last && last.phase === 'popup' && last.button
+        && (last.button.id === '#ICSave' || norm(last.button.text) === 'ok')) {
+        rec.steps.push({ 'do': 'outcome', phase: phase, kind: 'process' }); added = true;
+      }
     }
-    observed = { doc: doc, msg: msg, saved: saved, instance: instance };
+    observed = { doc: doc, msg: msg, saved: saved, instance: instance, prcs: prcs };
     return added;
   }
 
@@ -1175,7 +1226,7 @@
       var text = !r.component ? 'Go to the page for this task (NavBar or menu) and do it once, including Save or Run.'
         : r.offPage ? 'You left ' + r.component.component + '. A task covers one page: go back, or finish.'
         : acts.length + ' steps on ' + r.component.component
-          + (done ? ' · ' + (done.kind === 'saved' ? 'Saved' : 'process ' + done.detail + ' submitted') + ': click Finish recording'
+          + (done ? ' · ' + (done.kind === 'saved' ? 'Saved' : 'process ' + (done.detail ? done.detail + ' ' : '') + 'submitted') + ': click Finish recording'
             : last ? ' · last: ' + describe(last) : ' · waiting for your first entry');
       var st = recBar.querySelector('#psa-recbar-status');
       if (st.textContent !== text) st.textContent = text;
@@ -1209,7 +1260,7 @@
             if (d && d.body && d.readyState !== 'loading' && d.URL !== 'about:blank' && !d._psaRec) attachRecorder(d, r, recordingChanged, true);
           } catch (e) {}
         });
-        if (info && t.doc && t.doc._psaRec && observe(r, t.doc)) recSave(r);
+        if (info && t.doc && t.doc._psaRec && observe(r, t.doc, t.frame)) recSave(r);
       }
       updateRecBar();
     }
@@ -1262,7 +1313,7 @@
         return '<option value="' + m + '"' + (m === draft.open_mode ? ' selected' : '') + '>' + OPEN[m] + '</option>';
       }).join('') + '</select></label>' : '';
       var result = '<small>' + (draft.outcome === 'saved' ? 'At the end it checks that PeopleSoft shows <b>Saved</b>.'
-        : draft.outcome === 'process' ? 'At the end it checks that PeopleSoft shows a <b>process instance</b> number.'
+        : draft.outcome === 'process' ? 'At the end it checks that PeopleSoft <b>accepted the process request</b> (and reports the process instance when the page shows one).'
         : 'No Save or process run was recorded: the task ends after the last step.') + '</small>'
         + (draft.notes || []).map(function (n) { return '<small>' + esc(n) + '</small>'; }).join('');
       var c = card('<h4>Review the recorded task</h4>'

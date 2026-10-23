@@ -1,0 +1,64 @@
+# Recorded with PSAgent teach mode by PS on 2026-10-23.
+# Edit freely: same format as the hand-written tasks (see README).
+id: run_ae_program
+title: Run an Application Engine program
+summary: Submits an Application Engine program to the Process Scheduler using a run control on the AE Request page.
+examples:
+- Run the AE program AEMINITEST
+- Submit Application Engine program GL_JEDIT using run control AELHSB46
+component:
+  menu: APPLICATION_ENGINE
+  component: AE_REQUEST
+  market: GBL
+recorded:
+  by: PS
+  'on': '2026-10-23'
+fields:
+  run_control_id:
+    label: Run Control ID
+    required: true
+    default: AELHSB46
+    upper: true
+    hint: Reusable run control; created if it does not exist.
+  program_name:
+    label: Program Name
+    required: true
+    upper: true
+    hint: Application Engine program ID, e.g. AEMINITEST.
+playbook:
+- do: open
+  mode: add_or_open
+  keys:
+  - field:
+      id: AEREQUESTTBL_RUN_CNTL_ID
+      label: Run Control ID
+    value: '{{run_control_id}}'
+  - field:
+      id: AEREQUESTTBL_AE_APPLID
+      label: Program Name
+    value: '{{program_name}}'
+  say: Opening Run an Application Engine program
+- do: click
+  button:
+    id: PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB
+    text: Run
+- do: set
+  field:
+    id: PRCSRQSTDLG_WRK_SELECT_FLAG$0
+    column: Select
+    row:
+    - '{{program_name}}'
+  value: Y
+  popup: true
+- do: set
+  field:
+    id: PRCSRQSTDLG_WRK_SERVERNAME
+    label: Server Name
+  value: PRCS8622
+  popup: true
+- do: click
+  button:
+    id: '#ICSave'
+    text: OK
+  popup: true
+- do: expect_process

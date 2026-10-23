@@ -199,7 +199,10 @@ test('record a process run (search page, Run, Process Scheduler pop-up) -> the a
   });
   const dlg = page.frameLocator('#ptModFrame_0');
   await dlg.locator('#PRCSRQSTDLG_WRK_SERVERNAME').selectOption('PSUNX');
-  await dlg.locator('[id="PRCSRQSTDLG_WRK_SELECT_FLAG$0"]').check();
+  const row = name => dlg.locator('tr', { hasText: name }).locator('input[type="checkbox"]');
+  await row('EOAG_NOTIFY').check();                                       // wrong row, corrected
+  await row('EOAG_NOTIFY').uncheck();
+  await row('PORTAL_CSS').check();
   await dlg.locator('[id="#ICSave"]').click();                           // OK
   await f.locator('#PRCSRQSTDLG_WRK_PRCSINSTANCE', { hasText: '1001' }).waitFor();
   await page.waitForFunction(() => /process 1001 submitted/.test(document.querySelector('#psa-recbar').textContent));
@@ -218,6 +221,9 @@ test('record a process run (search page, Run, Process Scheduler pop-up) -> the a
   const yml = await (await fetch(`${BASE}/__test/task_file?id=sync_portal_security`)).text();
   assert.match(yml, /do: open\n  mode: add_or_open\n  keys:\n  - field:\n      id: PRCSRUNCNTL_RUN_CNTL_ID/);
   assert.match(yml, /popup: true/);
+  assert.match(yml, /row:\s+- Portal Cref Security Sync\s+- PORTAL_CSS\s/);      // the Select row, by its text
+  assert.ok(!yml.includes('do: grid'), 'a fixed grid became a list');
+  assert.ok(!yml.includes('EOAG_NOTIFY'), 'a ticked-and-unticked row stayed in the task');
   assert.match(yml, /- do: expect_process\n/);
   assert.ok(!yml.includes('expect_saved') && !yml.includes('Process Monitor') && !yml.includes('PTS_CFG_CL'), yml);
 
@@ -230,10 +236,27 @@ test('record a process run (search page, Run, Process Scheduler pop-up) -> the a
   await card.locator('.psa-ok').click();
   await page.locator('.psa-bot', { hasText: 'portal security sync was submitted' }).waitFor({ timeout: 60000 });
   const run = await page.frameLocator('#psa-ws-frame').locator('body').evaluate(() => window.__mockRun);
-  assert.deepEqual(run, { RUN_CNTL_ID: 'SYNC_AGENT', PORTAL: 'EMPLOYEE', SERVER: 'PSUNX', SELECTED: true });
+  // the pop-up listed the processes in another order: the row was found by its text
+  assert.deepEqual(run, { RUN_CNTL_ID: 'SYNC_AGENT', PORTAL: 'EMPLOYEE', SERVER: 'PSUNX', SELECTED: ['PORTAL_CSS'] });
   const result = JSON.parse((await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b).pop());
   assert.equal(result.status, 'success');
   assert.equal(result.message, 'Submitted: process instance 1002');
+});
+
+test('runner: a process request counts as submitted when the page shows no instance (AE requests)', async page => {
+  await page.evaluate(() => sessionStorage.setItem('mock.noinst', '1'));
+  const action = { run_id: 'ae', title: 'Run AE', component: { menu: 'PORTAL_ADMIN', component: 'PORTAL_SEC_SYNC', market: 'GBL' }, steps: [
+    { do: 'open', mode: 'add_or_open', keys: [{ field: { id: 'PRCSRUNCNTL_RUN_CNTL_ID', label: 'Run Control ID' }, value: 'NOINST1' }] },
+    { do: 'click', button: { id: 'PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB', text: 'Run' } },
+    { do: 'set', popup: true, field: { id: 'PRCSRQSTDLG_WRK_SELECT_FLAG$0', column: 'Select', row: ['AEMINITEST'] }, value: 'Y' },
+    { do: 'click', popup: true, button: { id: '#ICSave', text: 'OK' } },
+    { do: 'expect_process' },
+  ] };
+  const res = await page.evaluate(([a]) => PSAgent.run(a, {}), [action]);
+  assert.equal(res.status, 'success', JSON.stringify(res));
+  assert.match(res.message, /Submitted to the Process Scheduler/);
+  const run = await page.frameLocator('#psa-ws-frame').locator('body').evaluate(() => window.__mockRun);
+  assert.deepEqual(run.SELECTED, ['AEMINITEST']);
 });
 
 let failed = 0;

@@ -39,14 +39,24 @@
 
   /* ---- Process Scheduler Request pop-up ---- */
   if (q.get('Page') === 'PRCSRQSTDLG') {
+    /* Like the real Process List: several processes, a Select checkbox each, no "+" to add rows.
+       The order changes every time the pop-up opens, so only the row's text identifies it. */
+    var opened = +(sessionStorage.getItem('mock.popups') || 0);
+    sessionStorage.setItem('mock.popups', String(opened + 1));
+    var procs = [['Portal Cref Security Sync', 'PORTAL_CSS'], ['Simple AE test program', 'AEMINITEST'], ['Process Notifications', 'EOAG_NOTIFY']];
+    for (var r = 0; r < opened % procs.length; r++) procs.push(procs.shift());
     p.innerHTML = '<h3>Process Scheduler Request</h3>'
       + '<label for="PRCSRQSTDLG_WRK_SERVERNAME">Server Name:</label> <select id="PRCSRQSTDLG_WRK_SERVERNAME">'
       + ['', 'PSNT', 'PSUNX'].map(function (o) { return '<option value="' + o + '">' + o + '</option>'; }).join('') + '</select>'
-      + '<table><tr><th>Select</th><th>Description</th></tr><tr><td><input type="checkbox" id="PRCSRQSTDLG_WRK_SELECT_FLAG$0"></td>'
-      + '<td>Portal Security Sync</td></tr></table>'
+      + '<table><tr><th>Select</th><th>Description</th><th>Process Name</th></tr>' + procs.map(function (pr, i) {
+        return '<tr><td><input type="checkbox" id="PRCSRQSTDLG_WRK_SELECT_FLAG$' + i + '" data-prcs="' + pr[1] + '"></td>'
+          + '<td>' + pr[0] + '</td><td>' + pr[1] + '</td></tr>';
+      }).join('') + '</table>'
       + '<input type="button" id="#ICSave" value="OK"> <input type="button" id="#ICCancel" value="Cancel">';
     el('#ICSave').onclick = function () {
-      var opts = { SERVER: el('PRCSRQSTDLG_WRK_SERVERNAME').value, SELECTED: el('PRCSRQSTDLG_WRK_SELECT_FLAG$0').checked };
+      var picked = [].filter.call(document.querySelectorAll('input[data-prcs]'), function (c) { return c.checked; })
+        .map(function (c) { return c.getAttribute('data-prcs'); });
+      var opts = { SERVER: el('PRCSRQSTDLG_WRK_SERVERNAME').value, SELECTED: picked };
       roundTrip(function () { top().__mockRunCtl.__mockSubmit(opts); });
     };
     el('#ICCancel').onclick = function () { top().__mockRunCtl.__mockClose(); };
@@ -128,7 +138,8 @@
     p.innerHTML = '<h2>Portal Security Sync</h2><div>Run Control ID: <b>' + runctl + '</b></div>'
       + button('PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB', 'Run')
       + ' <a id="PRCSRQSTDLG_WRK_LOADPRCSMONITORPB" href="#">Process Monitor</a>'
-      + '<div>Process Instance:<span id="PRCSRQSTDLG_WRK_PRCSINSTANCE">' + data.instance + '</span></div>'
+      /* Pages without the standard run control subpage (e.g. AE requests) never show the instance */
+      + (sessionStorage.getItem('mock.noinst') ? '' : '<div>Process Instance:<span id="PRCSRQSTDLG_WRK_PRCSINSTANCE">' + data.instance + '</span></div>')
       + '<label for="PORTAL_CSS_RUN_PORTAL_NAME">Portal Name:</label> <input type="text" id="PORTAL_CSS_RUN_PORTAL_NAME" value="' + data.PORTAL + '" onchange="chg(this)">'
       + '<br>' + button('#ICSave', 'Save');
   }

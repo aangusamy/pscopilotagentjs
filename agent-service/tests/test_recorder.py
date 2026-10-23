@@ -259,7 +259,61 @@ USER = {
 }
 
 
+def tick(id, value, row):
+    """A Select checkbox on the pop-up's Process List: a fixed grid (no "+"), known by its row text."""
+    st = put("popup", id, value, kind="checkbox")
+    st["field"].update(column="Select", row=row, addable=False)
+    return st
+
+
+# Same system: Submit AE Process Requests for AEMINITEST. Run saves the run control (Saved) before
+# the pop-up; its Process List shows every AE program; the person ticks a wrong row and unticks it.
+AE = {
+    "title": "Run AE program",
+    "component": {"menu": "APPLICATION_ENGINE", "component": "AE_REQUEST", "market": "GBL"},
+    "query": {},
+    "steps": [
+        click("search", "PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE", "Add a New Value"),
+        put("search", "AEREQUESTTBL_RUN_CNTL_ID", "AE1", "Run Control ID"),
+        put("search", "AEREQUESTTBL_AE_APPLID", "AEMINITEST", "Program Name"),
+        click("search", "PTS_CFG_CL_WRK_PTS_ADD_BTN", "Add"),
+        click("page", "PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB", "Run"),
+        ev("outcome", "page", kind="saved"),
+        tick("PRCSRQSTDLG_WRK_SELECT_FLAG$0", "Y", ["Simple AE test program", "AEMINITEST", "Application Engine"]),
+        tick("PRCSRQSTDLG_WRK_SELECT_FLAG$5", "Y", ["Process Notifications", "EOAG_NOTIFY", "Application Engine"]),
+        tick("PRCSRQSTDLG_WRK_SELECT_FLAG$5", "N", ["Process Notifications", "EOAG_NOTIFY", "Application Engine"]),
+        click("popup", "#ICSave", "OK"),
+        ev("outcome", "page", kind="saved"),
+        ev("outcome", "page", kind="process", detail="557050"),
+    ],
+}
+
+
 class PlanTest(unittest.TestCase):
+    def test_fixed_grid_rows_and_intermediate_saved(self):
+        p = recorder.plan(AE)
+        self.assertEqual((p.mode, p.outcome), ("add_or_open", "process"))   # Saved after Run is not the end
+        self.assertEqual([k["field"]["id"] for k in p.keys], ["AEREQUESTTBL_RUN_CNTL_ID", "AEREQUESTTBL_AE_APPLID"])
+        task = parse_task(recorder.build(AE, recorder.draft(AE), "T"))
+        steps = task.render({"run_control_id": "AE1", "program_name": "MYPROG"})
+        self.assertNotIn("grid", [st["do"] for st in steps])                 # a fixed grid is not a list to extend
+        ticks = [st for st in steps if st["do"] == "set"]
+        # the row is the one showing the program asked for, wherever it is in the list
+        self.assertEqual(ticks[0]["field"]["row"], ["MYPROG"])
+        self.assertEqual(ticks[0]["value"], "Y")
+        self.assertEqual(ticks[-1]["field"]["row"], ["Process Notifications", "EOAG_NOTIFY", "Application Engine"])
+        self.assertEqual(steps[-1], {"do": "expect_process"})
+
+    def test_rows_added_with_plus_are_a_list(self):
+        rec = copy.deepcopy(USER)
+        for i, role in enumerate(["EMPLOYEE", "Manager"]):
+            st = put("page", f"PSROLEUSER_VW_ROLENAME${i}", role)
+            st["field"].update(column="Role Name", row=[], addable=True)
+            rec["steps"].insert(-2, st)
+        cands = {c["key"]: c for c in recorder.candidates(rec)}
+        self.assertEqual(cands["PSROLEUSER_VW_ROLENAME"]["kind"], "list")
+
+
     """The recording is read as search page / page / pop-up / outcome; nothing knows a specific page."""
 
     def test_process_run(self):
