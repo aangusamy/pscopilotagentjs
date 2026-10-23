@@ -7,8 +7,11 @@
   TEST FIXTURE ONLY: a small imitation of the classic PeopleTools USERMAINT
   component, used to exercise psagent.js mechanics (AJAX round trips, a full
   page reload on Add, tabs, grids with "+" row buttons, message boxes and the
-  Saved indicator). Some IDs intentionally differ from the task YAML so the
-  label/column fallbacks are exercised. It is not a copy of real PeopleSoft HTML.
+  Saved indicator). Layout and most IDs follow a real PeopleTools 8.5x
+  USERMAINT checked on 2026-10-22: Description is entered on the ID tab, and a
+  changed EMPLID is only sent to the server when focus moves to the next field,
+  whose reply redraws the tab. Some IDs intentionally differ from the task YAML
+  so the label/column fallbacks are exercised. It is not real PeopleSoft HTML.
 -->
 <style>
   body { font-family: Arial, sans-serif; font-size: 12px; margin: 12px; }
@@ -48,8 +51,18 @@
     setTimeout(function () { el('WAIT_win0').style.display = 'none'; fn(); }, 350);
   }
 
+  var pending = false;   /* changed field waiting for the next focus, like PS deferred processing */
+  document.addEventListener('focusin', function (e) {
+    if (pending && e.target.id !== pending) {
+      /* The reply reflects the server state at this moment: anything typed meanwhile is lost */
+      var server = JSON.stringify(data);
+      pending = false;
+      roundTrip(function () { data = JSON.parse(server); render(); });
+    }
+  });
+
   window.submitAction_win0 = function (form, name) {
-    if (name === '#ICSearch') {
+    if (name === 'PTS_CFG_CL_WRK_PTS_ADD_BTN') {
       var id = el('PSOPRDEFN_SRCH_OPRID').value.trim().toUpperCase();
       roundTrip(function () {
         if (!id) return msg('Enter a User ID.');
@@ -70,6 +83,7 @@
     if (idx != null) data[key][idx] = v; else data[key] = v;
     if (key === 'ROLES' && v && ROLES.indexOf(v) < 0) return roundTrip(function () { msg('Invalid value -- press the prompt button or hyperlink for a list of valid values (15,11)'); });
     if (key === 'IDTYPE') return roundTrip(render);   /* attribute grid appears */
+    if (key === 'EMPLID') { pending = input.id; return; }
     roundTrip(function () {});
   };
 
@@ -98,17 +112,16 @@
     if (!data.OPRID) {
       p.innerHTML = '<h2>User Profiles</h2><h3>Add a New Value</h3>'
         + '<label for="PSOPRDEFN_SRCH_OPRID">User ID:</label> <input type="text" id="PSOPRDEFN_SRCH_OPRID"> '
-        + '<input type="button" id="#ICSearch" name="#ICSearch" value="Add" onclick="submitAction_win0(this.form,this.name)">';
+        + '<input type="button" id="PTS_CFG_CL_WRK_PTS_ADD_BTN" name="PTS_CFG_CL_WRK_PTS_ADD_BTN" value="Add" onclick="submitAction_win0(this.form,this.name)">';
       return;
     }
     var h = '<h2>User Profiles</h2>' + tabs() + '<div>User ID: <b>' + data.OPRID + '</b></div>';
     if (tab === 'General') {
-      h += input('PSOPRDEFN_OPRDEFNDESC', 'DESCR', 'Description')
-        + '<label for="PSOPRDEFN_SYMBOLICID">Symbolic ID:</label> <select id="PSOPRDEFN_SYMBOLICID" onchange="chg(this,\'SYMBOLICID\')">'
+      h += '<label for="PSOPRDEFN_SYMBOLICID">Symbolic ID:</label> <select id="PSOPRDEFN_SYMBOLICID" onchange="chg(this,\'SYMBOLICID\')">'
         + ['', 'SYSADM1', 'SYSADM2'].map(function (o) { return '<option value="' + o + '"' + (data.SYMBOLICID === o ? ' selected' : '') + '>' + o + '</option>'; }).join('')
         + '</select><br>'
-        + input('PSOPRDEFN_OPERPSWD', 'PWD', 'Password', 'password')
-        + input('PSUSRPRFL_WRK_OPERPSWDCONF', 'PWD2', 'Confirm Password', 'password')
+        + input('PSUSRPRFL_WRK_PTPSWDCLEARTXTINPT', 'PWD', 'New Password', 'password')
+        + input('PSUSRPRFL_WRK_PTPSWDCLEARTXTCONF', 'PWD2', 'Confirm Password', 'password')
         + input('PSOPRDEFN_OPRCLASS', 'OPRCLASS', 'Primary');
     } else if (tab === 'ID') {
       /* IDs differ from the YAML on purpose: found by label / column header instead */
@@ -120,8 +133,9 @@
         h += '<table class="grid"><tr><th>Attribute Name</th><th>Attribute Value</th></tr>'
           + '<tr><td>Employee ID</td><td><input type="text" id="ATTRVAL_X$0" value="' + data.EMPLID + '" onchange="chg(this,\'EMPLID\')"></td></tr></table>';
       }
+      h += '<h4>User Description</h4>' + input('PSOPRDEFN_DVW_OPRDEFNDESC$0', 'DESCR', 'Description:');
     } else {
-      h += '<table class="grid"><tr><th>Role Name</th><th>Description</th><th></th></tr>'
+      h += '<table class="grid"><tr><th>*Role Name</th><th>Description</th><th></th></tr>'
         + data.ROLES.map(function (r, i) {
           return '<tr><td><input type="text" id="PSROLEUSER_VW_ROLENAME$' + i + '" value="' + r + '" onchange="chg(this,\'ROLES\',' + i + ')"></td>'
             + '<td>' + (r ? r + ' role' : '') + '</td>'

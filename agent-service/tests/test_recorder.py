@@ -35,7 +35,7 @@ RECORDING = {
         {"do": "click", "button": {"id": "#ICSearch", "text": "Add"}},
         s("PSOPRDEFN_OPRDEFNDESC", "Kumar Raja", "Description"),
         s("PSOPRDEFN_SYMBOLICID", "SYSADM1", "Symbolic ID", kind="select"),
-        s("PSOPRDEFN_OPERPSWD", "", "Password", kind="password"),
+        s("PSUSRPRFL_WRK_PTPSWDCLEARTXTINPT", "", "New Password", kind="password"),
         s("PSUSRPRFL_WRK_OPERPSWDCONF", "", "Confirm Password", kind="password"),
         {"do": "tab", "label": "ID"},
         s("OPRALIASTYPE_X", "Employee", "ID Type", kind="select"),
@@ -74,7 +74,7 @@ class CandidatesTest(unittest.TestCase):
         self.assertEqual(cands["ATTRVAL_X$0"]["kind"], "text")    # one grid row = plain value
         self.assertEqual(cands["ATTRVAL_X$0"]["label"], "Attribute Value")
         secrets = [k for k in cands if k.startswith("secret:")]
-        self.assertEqual(secrets, ["secret:password"])            # Password + Confirm Password
+        self.assertEqual(secrets, ["secret:password"])            # New Password + Confirm Password
         self.assertEqual(len(cands), 7)
 
     def test_validation(self):
@@ -153,6 +153,28 @@ class BuildTest(unittest.TestCase):
         grid = next(st for st in steps if st["do"] == "grid")
         self.assertEqual(grid, {"do": "grid", "field": {"id": "PSROLEUSER_VW_ROLENAME", "column": "Role Name"},
                                 "values": ["EMPLOYEE"]})
+
+    def test_real_layout_fixed_setup_follows_optional_value(self):
+        # Real PT 8.5x USERMAINT: Description is entered on the ID tab after the EMPLID,
+        # so the ID tab always runs, but ID Type = Employee only matters with an EMPLID.
+        rec = copy.deepcopy(RECORDING)
+        steps = rec["steps"]
+        del steps[2]                                                # no Description on General
+        steps.insert(8, s("PSOPRDEFN_DVW_OPRDEFNDESC$0", "Kumar Raja", "Description"))
+        d = reviewed()
+        for f in d["fields"]:
+            if f["key"] == "PSOPRDEFN_OPRDEFNDESC":
+                f["key"] = "PSOPRDEFN_DVW_OPRDEFNDESC$0"
+        task = parse_task(recorder.build(rec, d, "T"))
+        without = task.render({"user_id": "A", "description": "Anita"})
+        self.assertIn({"do": "tab", "label": "ID"}, without)
+        ids = [st["field"]["id"] for st in without if st["do"] == "set"]
+        self.assertIn("PSOPRDEFN_DVW_OPRDEFNDESC$0", ids)
+        self.assertNotIn("OPRALIASTYPE_X", ids)
+        self.assertNotIn("ATTRVAL_X$0", ids)
+        with_emp = [st["field"]["id"] for st in task.render({"user_id": "A", "description": "A", "emplid": "KU1"})
+                    if st["do"] == "set"]
+        self.assertEqual(with_emp[-3:], ["OPRALIASTYPE_X", "ATTRVAL_X$0", "PSOPRDEFN_DVW_OPRDEFNDESC$0"])
 
     def test_yaml_header(self):
         self.assertTrue(recorder.to_yaml(self.task_dict).startswith("# Recorded with PSAgent teach mode by TEACHER"))

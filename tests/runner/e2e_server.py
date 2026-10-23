@@ -38,7 +38,7 @@ DRAFT = {
     "examples": ["create user anita"],
     "fields": [{"key": k, "name": n, "label": label, "mode": m, "hint": ""} for k, n, label, m in [
         ("PSOPRDEFN_SRCH_OPRID", "user_id", "User ID", "required"),
-        ("PSOPRDEFN_OPRDEFNDESC", "description", "Description", "required"),
+        ("PSOPRDEFN_DVW_OPRDEFNDESC$0", "description", "Description", "required"),
         ("PSOPRDEFN_SYMBOLICID", "symbolic_id", "Symbolic ID", "default"),
         ("OPRALIASTYPE_X", "id_type", "ID Type", "fixed"),
         ("ATTRVAL_X$0", "emplid", "Employee ID", "required"),

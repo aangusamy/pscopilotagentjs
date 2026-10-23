@@ -67,7 +67,7 @@ def validate(rec):
 
 
 def _secret_label(label):
-    return re.sub(r"^(confirm|re-?enter|repeat|verify)\s+", "", label.strip(), flags=re.I) or "Password"
+    return re.sub(r"^(confirm|re-?enter|repeat|verify|new)\s+", "", label.strip(), flags=re.I) or "Password"
 
 
 def candidates(rec):
@@ -321,7 +321,8 @@ def build(rec, reviewed, author):
                 value = f"{{{{{name}}}}}"
             else:
                 value = c["value"]
-            playbook.append({"do": "set", "field": spec, "value": value, "_var": None if c["kind"] == "secret" else name})
+            playbook.append({"do": "set", "field": spec, "value": value,
+                             "_var": None if c["kind"] == "secret" else name, "_fixed": not name})
     last_click = next((s for s in reversed(playbook) if s["do"] == "click"), None)
     if last_click and (last_click["button"].get("id") == "#ICSave" or norm(last_click["button"].get("text")) == "save"):
         playbook.append({"do": "expect_saved"})
@@ -376,11 +377,18 @@ def _add_conditions(playbook, fields):
             for st in sec:
                 st["when"] = cond[0] if len(cond) == 1 else cond
         else:
-            for st in sec:
+            for i, st in enumerate(sec):
                 if st.get("_var") in optional:
                     st["when"] = st["_var"]
+                elif st.get("_fixed"):
+                    # A fixed value that sets up the next asked value (ID Type = Employee
+                    # before the EMPLID) is only needed when that value is given.
+                    nxt = next((x["_var"] for x in sec[i + 1:] if x.get("_var")), None)
+                    if nxt in optional:
+                        st["when"] = nxt
     for st in playbook:
         st.pop("_var", None)
+        st.pop("_fixed", None)
 
 
 def to_yaml(task):

@@ -29,7 +29,7 @@
   var cfg = { agentUrl: '', token: '', oprid: '', fullname: '' };
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-  function norm(t) { return String(t == null ? '' : t).replace(/\s+/g, ' ').replace(/[\s:*]+$/, '').trim().toLowerCase(); }
+  function norm(t) { return String(t == null ? '' : t).replace(/\s+/g, ' ').replace(/^[\s*]+|[\s:*]+$/g, '').trim().toLowerCase(); }
   function esc(t) {
     return String(t == null ? '' : t).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -179,6 +179,31 @@
 
   /* Resolves once the page is loaded, no PS processing indicator is shown and the
      DOM has been quiet for settleMs. Handles both AJAX updates and full reloads. */
+  /* Count the page's in-flight server requests (PeopleSoft AJAX round trips). */
+  function trackRequests(win) {
+    try {
+      if (!win || win.__psaReq) return;
+      var X = win.XMLHttpRequest && win.XMLHttpRequest.prototype;
+      if (!X) return;
+      win.__psaReq = { inflight: 0, last: Date.now() };
+      var send = X.send;
+      X.send = function () {
+        var st = win.__psaReq, xhr = this, ended = false;
+        function end() { if (!ended) { ended = true; st.inflight--; st.last = Date.now(); } }
+        st.inflight++; st.last = Date.now();
+        xhr.addEventListener('loadend', end);
+        try { return send.apply(xhr, arguments); } catch (e) { end(); throw e; }
+      };
+    } catch (e) {}
+  }
+
+  function requestsBusy(win) {
+    try {
+      var st = win && win.__psaReq;
+      return !!st && (st.inflight > 0 || Date.now() - st.last < RUN.settleMs);
+    } catch (e) { return false; }
+  }
+
   function waitIdle(frame, timeout, leaving) {
     var start = Date.now(), quietSince = Date.now(), doc = null, obs = null;
     return new Promise(function (resolve, reject) {
@@ -188,6 +213,7 @@
         if (d !== doc) {
           if (obs) obs.disconnect();
           doc = d; obs = null; quietSince = Date.now();
+          trackRequests(frame.contentWindow);
           if (leaving) leaving.done = leaving.done || leaving.doc !== d;
           if (d && d.documentElement) {
             obs = new MutationObserver(function () { quietSince = Date.now(); });
@@ -195,7 +221,8 @@
           }
         }
         var navigating = leaving && leaving.started && !leaving.done;
-        var busy = navigating || !d || d.readyState !== 'complete' || d.URL === 'about:blank' || isProcessing(d);
+        var busy = navigating || !d || d.readyState !== 'complete' || d.URL === 'about:blank' || isProcessing(d)
+          || requestsBusy(frame.contentWindow);
         if (!busy && Date.now() - quietSince >= RUN.settleMs) { if (obs) obs.disconnect(); return resolve(d); }
         if (Date.now() - start > timeout) { if (obs) obs.disconnect(); return reject(new Error('PeopleSoft did not finish processing in time')); }
         setTimeout(poll, RUN.pollMs);
@@ -208,6 +235,7 @@
     var win = frame.contentWindow, leaving = { doc: frame.contentDocument, started: false, done: false };
     function onLeave() { leaving.started = true; }
     try { win.addEventListener('beforeunload', onLeave); } catch (e) {}
+    trackRequests(win);
     fn();
     return sleep(RUN.afterActionMs)
       .then(function () { return waitIdle(frame, RUN.stepTimeout, leaving); })
@@ -217,8 +245,11 @@
   function waitForField(frame, spec, row) {
     var start = Date.now();
     return (function check() {
-      var el = frame.contentDocument && findField(frame.contentDocument, spec, row);
+      var doc = frame.contentDocument;
+      var el = doc && findField(doc, spec, row);
       if (el) return Promise.resolve(el);
+      var msg = doc && psMessage(doc);   /* PeopleSoft refused the last action: report its message, don't wait */
+      if (msg) return Promise.reject(new Error(msg));
       if (Date.now() - start > RUN.stepTimeout) return Promise.reject(new Error('Could not find "' + fieldName(spec) + '" on the page'));
       return sleep(RUN.pollMs * 2).then(check);
     })();
@@ -274,7 +305,7 @@
     },
     set: function (frame, step) {
       return waitForField(frame, step.field).then(function (el) {
-        return act(frame, function () { setValue(el, step.value, fieldName(step.field)); });
+        return enterValue(frame, el, step.field, null, step.value);
       });
     },
     click: function (frame, step) {
@@ -305,7 +336,7 @@
         if (el && el.value === value) { row++; k++; return next(); }               /* already there */
         var ready = el ? Promise.resolve(el) : addRow(frame, step.field, row);
         return ready.then(function (cell) {
-          return act(frame, function () { setValue(cell, value, fieldName(step.field)); });
+          return enterValue(frame, cell, step.field, row, value);
         }).then(function (d) {
           var msg = psMessage(d);
           if (msg) throw new Error(msg);
@@ -324,6 +355,18 @@
     }
   };
 
+  /* Like a person: move into the field, let PeopleSoft process the previous field's
+     change (it does that on focus and may redraw this field), then type. */
+  function enterValue(frame, el, spec, row, value) {
+    return act(frame, function () { try { el.focus(); } catch (e) {} })
+      .then(function (doc) {
+        var msg = psMessage(doc);
+        if (msg) throw new Error(msg);
+        var cur = findField(doc, spec, row) || el;
+        return act(frame, function () { setValue(cur, value, fieldName(spec)); });
+      });
+  }
+
   function addRow(frame, spec, row) {
     var prev = findField(frame.contentDocument, spec, row - 1);
     var tr = prev && closest(prev, 'TR');
@@ -334,10 +377,10 @@
 
   /* action = {run_id, title, component, steps}; secrets = {password: '...'}; ws = workspace */
   function runAction(action, secrets, ws) {
-    var steps = action.steps || [], i = 0, frame = ws.frame;
+    var steps = action.steps || [], i = 0, frame = ws.frame, saved = false;
     function next() {
       if (ws.stopped) return Promise.resolve({ status: 'stopped', message: 'Stopped by the user', failed_step: describe(steps[i] || {}) });
-      if (i >= steps.length) return Promise.resolve({ status: 'success', message: 'Saved' });
+      if (i >= steps.length) return Promise.resolve({ status: 'success', message: saved ? 'Saved' : 'Completed (no save step)' });
       var raw = steps[i], step;
       ws.progress(i + 1, steps.length, describe(raw));
       try {
@@ -347,6 +390,7 @@
       var handler = STEPS[step['do']];
       if (!handler) return Promise.resolve({ status: 'error', message: 'Unknown step ' + step['do'], failed_step: describe(raw) });
       return handler(frame, step, action).then(function () {
+        if (step['do'] === 'expect_saved') saved = true;
         /* Any PS message box after a step means a human would stop and read it */
         if (step['do'] !== 'navigate' && step['do'] !== 'expect_saved') {
           var msg = frame.contentDocument && psMessage(frame.contentDocument);

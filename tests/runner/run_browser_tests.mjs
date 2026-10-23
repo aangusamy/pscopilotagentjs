@@ -13,7 +13,8 @@ const PORT = 8765;
 const BASE = `http://127.0.0.1:${PORT}`;
 const HOME = `${BASE}/psc/ps/EMPLOYEE/HRMS/c/NUI_FRAMEWORK.PT_LANDINGPAGE.GBL`;
 
-const server = spawn('python3', [path.join(here, 'e2e_server.py'), String(PORT)], { stdio: 'inherit' });
+const PYTHON = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+const server = spawn(PYTHON, [path.join(here, 'e2e_server.py'), String(PORT)], { stdio: 'inherit' });
 async function waitForServer() {
   for (let i = 0; i < 50; i++) {
     try { if ((await fetch(`${BASE}/health`)).ok) return; } catch {}
@@ -63,7 +64,7 @@ test('runner refuses to run without the secret', async page => {
   const res = await page.evaluate(([a]) => PSAgent.run(a, {}), [action]);
   assert.equal(res.status, 'error');
   assert.match(res.message, /Missing secret value for password/);
-  assert.equal(res.failed_step, 'Set Password');
+  assert.equal(res.failed_step, 'Set New Password');
 });
 
 test('chat flow: ask -> confirm card -> password -> runs -> result; password never sent', async page => {
@@ -102,14 +103,16 @@ test('record once by hand -> review -> save -> agent does it for a new user', as
   // The teacher does the transaction by hand in the workspace
   const f = page.frameLocator('#psa-ws-frame');
   await f.locator('#PSOPRDEFN_SRCH_OPRID').fill('KUMAR');
-  await f.locator('[id="#ICSearch"]').click();
-  await f.locator('#PSOPRDEFN_OPRDEFNDESC').fill('Kumar Raja');     // after the full reload
-  await f.locator('#PSOPRDEFN_SYMBOLICID').selectOption('SYSADM1');
-  await f.locator('#PSOPRDEFN_OPERPSWD').fill('Rec0rdPw!');
-  await f.locator('#PSUSRPRFL_WRK_OPERPSWDCONF').fill('Rec0rdPw!');
+  await f.locator('#PTS_CFG_CL_WRK_PTS_ADD_BTN').click();
+  await f.locator('#PSOPRDEFN_SYMBOLICID').selectOption('SYSADM1');  // after the full reload
+  await f.locator('#PSUSRPRFL_WRK_PTPSWDCLEARTXTINPT').fill('Rec0rdPw!');
+  await f.locator('#PSUSRPRFL_WRK_PTPSWDCLEARTXTCONF').fill('Rec0rdPw!');
   await f.locator('#ICTAB_1').click();                               // ID tab
   await f.locator('#OPRALIASTYPE_X').selectOption('EMP');
   await f.locator('[id="ATTRVAL_X$0"]').fill('KU0099');
+  await f.locator('[id="PSOPRDEFN_DVW_OPRDEFNDESC$0"]').click();     // focus: PS processes the EMPLID
+  await page.waitForTimeout(800);
+  await f.locator('[id="PSOPRDEFN_DVW_OPRDEFNDESC$0"]').fill('Kumar Raja');
   await f.locator('#ICTAB_2').click();                               // Roles tab
   await f.locator('[id="PSROLEUSER_VW_ROLENAME$0"]').fill('EMPLOYEE');
   await f.locator('[id="PSROLEUSER_VW$new$0$$0"]').click();

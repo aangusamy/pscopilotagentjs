@@ -5,11 +5,10 @@
 # Each task = the fields the agent must collect + the playbook the
 # browser widget replays, i.e. exactly what a human does on the screen.
 #
-# Field IDs below are the delivered PeopleTools 8.5x/8.6x IDs as best
-# known. Every field also has a `label` (and grid fields a `column`)
-# fallback, so the runner still finds it if an ID differs on your
-# release. Verify once with PSAgent.inspect() or record the steps with
-# PSAgent.teach() (see README) and adjust here — no JS change needed.
+# Field IDs verified on a PeopleTools 8.5x HCM instance (2026-10-22).
+# Every field also has a `label` (and grid fields a `column`) fallback,
+# so the runner still finds it if an ID differs on your release. Check
+# with PSAgent.inspect() and adjust here; no JS change needed.
 # ------------------------------------------------------------------
 id: create_user_profile
 title: Create User Profile
@@ -78,23 +77,20 @@ playbook:
     field: {id: PSOPRDEFN_SRCH_OPRID, label: User ID}
     value: "{{user_id}}"
   - do: click
-    button: {id: "#ICSearch", text: Add}
+    button: {id: PTS_CFG_CL_WRK_PTS_ADD_BTN, text: Add}
     say: Adding user {{user_id}}
   - do: wait
-    field: {id: PSOPRDEFN_OPRDEFNDESC, label: Description}
+    field: {id: PSOPRDEFN_SYMBOLICID, label: Symbolic ID}
 
   # --- General tab ---
-  - do: set
-    field: {id: PSOPRDEFN_OPRDEFNDESC, label: Description}
-    value: "{{description}}"
   - do: set
     field: {id: PSOPRDEFN_SYMBOLICID, label: Symbolic ID}
     value: "{{symbolic_id}}"
   - do: set
-    field: {id: PSOPRDEFN_OPERPSWD, label: Password}
+    field: {id: PSUSRPRFL_WRK_PTPSWDCLEARTXTINPT, label: New Password}
     value: "{{secret:password}}"
   - do: set
-    field: {id: PSUSRPRFL_WRK_OPERPSWDCONF, label: Confirm Password}
+    field: {id: PSUSRPRFL_WRK_PTPSWDCLEARTXTCONF, label: Confirm Password}
     value: "{{secret:password}}"
   - do: set
     when: navigator_homepage
@@ -113,18 +109,20 @@ playbook:
     field: {id: PSOPRDEFN_ROWSECCLASS, label: Row Security}
     value: "{{row_security}}"
 
-  # --- ID tab: link to employee ---
+  # --- ID tab: employee link + description (Description is only editable here) ---
   - do: tab
-    when: emplid
     label: ID
   - do: set
     when: emplid
-    field: {id: PSOPRDEFN_OPRTYPE, label: ID Type}
+    field: {id: PSOPRALIAS_OPRALIASTYPE$0, label: ID Type}
     value: Employee            # matched against option value or visible text
   - do: set
     when: emplid
     field: {id: PSOPRALIAS_WRK_ATTRVALUE$0, column: Attribute Value}
     value: "{{emplid}}"
+  - do: set
+    field: {id: PSOPRDEFN_DVW_OPRDEFNDESC$0, label: Description}
+    value: "{{description}}"
 
   # --- Roles tab ---
   - do: tab

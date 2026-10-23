@@ -43,11 +43,14 @@ class CreateUserProfileTest(unittest.TestCase):
         kinds = [s["do"] for s in steps]
         self.assertEqual(kinds[0], "navigate")
         self.assertEqual(kinds[-2:], ["click", "expect_saved"])
-        self.assertNotIn("tab", kinds)  # no emplid / roles -> ID and Roles tabs skipped
-        values = {s["field"].get("id"): s.get("value") for s in steps if s["do"] == "set"}
+        # Description is only editable on the ID tab, so that tab always runs; Roles only with roles
+        self.assertEqual([st["label"] for st in steps if st["do"] == "tab"], ["ID"])
+        values = {st["field"].get("id"): st.get("value") for st in steps if st["do"] == "set"}
         self.assertEqual(values["PSOPRDEFN_SRCH_OPRID"], "VELU")
         self.assertEqual(values["PSOPRDEFN_SYMBOLICID"], "SYSADM1")  # default applied
-        self.assertEqual(values["PSOPRDEFN_OPERPSWD"], "{{secret:password}}")  # left for the browser
+        self.assertEqual(values["PSUSRPRFL_WRK_PTPSWDCLEARTXTINPT"], "{{secret:password}}")  # left for the browser
+        self.assertEqual(values["PSOPRDEFN_DVW_OPRDEFNDESC$0"], "Velu Arumugam")
+        self.assertNotIn("PSOPRALIAS_OPRALIASTYPE$0", values)        # no emplid -> ID Type untouched
         self.assertNotIn("PSOPRDEFN_OPRCLASS", values)
         self.assertEqual(steps[2]["say"], "Adding user VELU")
 
