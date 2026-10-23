@@ -3,6 +3,9 @@
 POST /api/chat     {session_id?, message, page?}          -> reply
 POST /api/confirm  {session_id, run_id, approved}         -> reply (+ action when approved)
 POST /api/result   {session_id, run_id, status, message?, failed_step?} -> reply
+GET  /api/me                                              -> {oprid, can_teach}
+POST /api/recordings/draft {recording}                    -> {draft}       (teachers)
+POST /api/recordings/save  {recording, draft, overwrite?} -> {task_id, ...} (teachers)
 GET  /health
 
 Every /api call needs  Authorization: Bearer <token from IScript_PSAgentConfig>.
@@ -10,6 +13,7 @@ Every /api call needs  Authorization: Bearer <token from IScript_PSAgentConfig>.
 
 import logging
 import os
+import threading
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -19,17 +23,22 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from . import auth
+from . import auth, recorder
 from .agent import Agent, SessionStore
-from .tasks import load_tasks
+from .tasks import TaskError, load_tasks, parse_task
 
 log = logging.getLogger("psagent")
 
 _STATUSES = {"success", "error", "stopped"}
 
 
-def create_app(agent, secret, allowed_origins, dev_oprid=None):
+def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), tasks_dir=None):
+    """teachers: OPRIDs allowed to record tasks ("*" = everyone). tasks_dir: where recorded tasks are saved."""
     store = SessionStore()
+    save_lock = threading.Lock()
+
+    def can_teach(oprid):
+        return "*" in teachers or oprid in teachers
 
     def oprid_of(request):
         header = request.headers.get("authorization", "")
@@ -59,6 +68,7 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None):
         if data is None or not str(data.get("message", "")).strip():
             return bad("message is required")
         s = store.get_or_create(data.get("session_id"), oprid)
+        s.can_teach = can_teach(oprid)
         page = data.get("page") if isinstance(data.get("page"), dict) else None
 
         def work():
@@ -107,6 +117,56 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None):
         reply = await run_in_threadpool(work)
         return JSONResponse({"session_id": s.id, **reply.to_dict()})
 
+    async def me(request):
+        oprid = oprid_of(request)
+        if not oprid:
+            return bad("unauthorized", 401)
+        return JSONResponse({"oprid": oprid, "can_teach": can_teach(oprid)})
+
+    async def draft(request):
+        oprid = oprid_of(request)
+        if not oprid:
+            return bad("unauthorized", 401)
+        if not can_teach(oprid):
+            return bad("you are not allowed to record tasks", 403)
+        data = await body(request)
+        if data is None:
+            return bad("recording is required")
+        try:
+            d = await run_in_threadpool(recorder.draft, data.get("recording"), agent.llm)
+        except recorder.RecordingError as e:
+            return bad(str(e))
+        d["exists"] = d["task_id"] in agent.tasks
+        return JSONResponse({"draft": d})
+
+    async def save(request):
+        oprid = oprid_of(request)
+        if not oprid:
+            return bad("unauthorized", 401)
+        if not can_teach(oprid):
+            return bad("you are not allowed to record tasks", 403)
+        if not tasks_dir:
+            return bad("saving tasks is not configured", 503)
+        data = await body(request)
+        if data is None or not isinstance(data.get("draft"), dict):
+            return bad("recording and draft are required")
+        try:
+            task_dict = recorder.build(data.get("recording"), data["draft"], oprid)
+            task = parse_task(task_dict, source=task_dict["id"])
+        except (recorder.RecordingError, TaskError) as e:
+            return bad(str(e))
+        path = Path(tasks_dir) / f"{task.id}.yaml"
+        with save_lock:
+            if task.id in agent.tasks and data.get("overwrite") is not True:
+                return bad(f"a task named {task.id} already exists", 409)
+            tmp = path.with_suffix(".yaml.tmp")
+            tmp.write_text(recorder.to_yaml(task_dict))
+            tmp.replace(path)
+            agent.add_task(task)
+        log.info("task %s recorded by %s -> %s", task.id, oprid, path)
+        return JSONResponse({"task_id": task.id, "title": task.title, "examples": task.examples,
+                             "fields": [f.label for f in task.fields.values()], "steps": len(task.playbook)})
+
     async def health(_request):
         return JSONResponse({"ok": True, "tasks": sorted(agent.tasks)})
 
@@ -115,6 +175,9 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None):
             Route("/api/chat", chat, methods=["POST"]),
             Route("/api/confirm", confirm, methods=["POST"]),
             Route("/api/result", result, methods=["POST"]),
+            Route("/api/me", me),
+            Route("/api/recordings/draft", draft, methods=["POST"]),
+            Route("/api/recordings/save", save, methods=["POST"]),
             Route("/health", health),
         ],
         middleware=[
@@ -141,8 +204,9 @@ def app_from_env():
         log.warning("PSAGENT_DEV_OPRID=%s: requests without a valid token run as this user. Never use in production.", dev_oprid)
     tasks_dir = os.environ.get("PSAGENT_TASKS_DIR", str(Path(__file__).resolve().parent.parent / "tasks"))
     origins = [o.strip() for o in os.environ.get("PSAGENT_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    teachers = {t.strip() for t in os.environ.get("PSAGENT_TEACHERS", "").split(",") if t.strip()}
     llm = ClaudeLLM(
         model=os.environ.get("PSAGENT_MODEL", "claude-opus-5-5"),
         effort=os.environ.get("PSAGENT_EFFORT", "low"),
     )
-    return create_app(Agent(llm, load_tasks(tasks_dir)), secret, origins, dev_oprid)
+    return create_app(Agent(llm, load_tasks(tasks_dir)), secret, origins, dev_oprid, teachers, tasks_dir)

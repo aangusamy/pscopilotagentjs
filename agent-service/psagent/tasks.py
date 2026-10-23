@@ -125,12 +125,19 @@ class Task:
         steps = []
         for step in self.playbook:
             cond = step.get("when")
-            if cond and not eff.get(cond):
+            if cond and not any(eff.get(c) for c in _when(cond)):
                 continue
             s = copy.deepcopy(step)
             s.pop("when", None)
             steps.append(_fill(s, eff))
         return steps
+
+
+def _when(cond):
+    """`when: field` or `when: [a, b]` (step runs if any of them has a value)."""
+    if not cond:
+        return []
+    return [cond] if isinstance(cond, str) else list(cond)
 
 
 def _fill(obj, values):
@@ -184,8 +191,9 @@ def parse_task(data, source="<task>"):
     for i, step in enumerate(task.playbook):
         if step.get("do") not in _STEP_TYPES:
             raise TaskError(f"{source}: step {i + 1} has unknown action {step.get('do')!r}")
-        if step.get("when") and step["when"] not in fields:
-            raise TaskError(f"{source}: step {i + 1} 'when' refers to unknown field {step['when']!r}")
+        for cond in _when(step.get("when")):
+            if cond not in fields:
+                raise TaskError(f"{source}: step {i + 1} 'when' refers to unknown field {cond!r}")
         for name in _template_names(step):
             ref = name.split(":", 1)[1] if name.startswith("secret:") else name
             if ref not in fields:

@@ -8,10 +8,14 @@
    performs the task on the real PeopleSoft component inside a
    visible workspace frame, the way a person would.
 
+   Teaching a new task: click "Record" in the chat header (shown to
+   users in PSAGENT_TEACHERS) or say "let me teach you ...". Do the
+   transaction once by hand, review the template, save. Done.
+
    Console helpers:
      PSAgent.inspect()                         list fields on the workspace page
      PSAgent.teach('MENU.COMPONENT.GBL', {Action:'A'})
-                                               record a task while you do it
+                                               record and print the raw steps
    ============================================================ */
 
 (function () {
@@ -385,9 +389,14 @@
         extra: el.querySelector('#psa-ws-extra')
       };
       el.querySelector('#psa-ws-stop').addEventListener('click', function () { workspace.stopped = true; workspace.status('Stopping after this step...'); });
-      el.querySelector('#psa-ws-close').addEventListener('click', function () { workspace.stopped = true; el.style.display = 'none'; });
+      el.querySelector('#psa-ws-close').addEventListener('click', function () {
+        workspace.stopped = true;
+        el.style.display = 'none';
+        if (workspace.onClose) workspace.onClose();
+      });
     }
     workspace.stopped = false;
+    workspace.onClose = null;
     workspace.el.style.display = 'flex';
     workspace.el.querySelector('#psa-ws-stop').style.display = '';
     workspace.el.querySelector('#psa-ws-title').textContent = title;
@@ -397,7 +406,7 @@
   }
 
   /* ============================================================
-     TEACH MODE + INSPECT — build playbooks by doing the task once
+     RECORDER + INSPECT — learn a task by watching a person do it once
      ============================================================ */
 
   function labelOf(doc, el) {
@@ -408,13 +417,31 @@
     return el.getAttribute('aria-label') || el.title || '';
   }
 
+  /* Header text of the grid column an input sits in ("Role Name") */
+  function columnOf(el) {
+    var td = closest(el, 'TD'), tr = td && closest(td, 'TR'), table = tr && closest(tr, 'TABLE');
+    if (!table) return '';
+    var col = 0, c;
+    for (c = tr.firstElementChild; c && c !== td; c = c.nextElementSibling) col += c.colSpan || 1;
+    for (var r = 0; r < table.rows.length && table.rows[r] !== tr; r++) {
+      var row = table.rows[r];
+      if (!row.querySelector('th,[role="columnheader"],td[class*="GRIDCOLUMNHDR"],td[class*="GridColumnHdr"]')) continue;
+      var pos = 0;
+      for (c = row.firstElementChild; c; c = c.nextElementSibling) {
+        if (pos === col) return c.textContent.replace(/\s+/g, ' ').trim();
+        pos += c.colSpan || 1;
+      }
+    }
+    return '';
+  }
+
   function inspect() {
     var frame = workspace && workspace.el.style.display !== 'none' ? workspace.frame : getContentFrameEl();
     var doc = frame ? frame.contentDocument : document;
     var rows = [];
     doc.querySelectorAll('input,select,textarea').forEach(function (el) {
       if (!isInput(el) || !el.id) return;
-      rows.push({ id: el.id, label: labelOf(doc, el), type: el.tagName === 'SELECT' ? 'select' : el.type,
+      rows.push({ id: el.id, label: labelOf(doc, el) || columnOf(el), type: el.tagName === 'SELECT' ? 'select' : el.type,
         value: el.type === 'password' ? '***' : el.value });
     });
     doc.querySelectorAll('a[id],input[type="button"],button[id]').forEach(function (el) {
@@ -425,53 +452,108 @@
     return rows;
   }
 
-  function teach(component, query) {
-    var parts = String(component).split('.');
-    var ws = openWorkspace('Teaching: ' + component);
-    var steps = [{ 'do': 'navigate', query: query || {} }];
-    ws.done();
-    ws.extra.innerHTML = '<span>Do the task by hand below, then </span><button type="button" id="psa-teach-done">Finish teaching</button>';
+  function kindOf(el) {
+    if (el.type === 'password') return 'password';
+    if (el.tagName === 'SELECT') return 'select';
+    if (el.type === 'checkbox' || el.type === 'radio') return 'checkbox';
+    return 'text';
+  }
+  function valueOf(el) {
+    var k = kindOf(el);
+    if (k === 'password') return '';
+    if (k === 'select') return el.selectedIndex >= 0 ? el.options[el.selectedIndex].text.trim() : '';
+    if (k === 'checkbox') return el.checked ? 'Y' : 'N';
+    return el.value;
+  }
+  function recordable(el) {
+    return isInput(el) && el.id && !/^(button|submit|reset|image|file)$/.test(el.type);
+  }
 
-    function record(step) {
+  /* opts = {title, component: {menu, component, market}, query}
+     Resolves with {title, component, query, steps} or null if cancelled.
+     Password values are never captured, only that a password was typed. */
+  function record(opts) {
+    var ws = openWorkspace('Recording: ' + opts.title);
+    var steps = [], snap = {}, finished = false, resolveFn;
+    ws.done();
+    ws.extra.innerHTML = '<div><strong>Do the task by hand below, including Save.</strong> Every value you enter is recorded '
+      + '(passwords are not). To make a list, such as roles, fill at least two rows.</div>'
+      + '<div style="margin-top:6px;display:flex;gap:8px;align-items:center"><span id="psa-rec-count">Nothing recorded yet</span>'
+      + '<button type="button" id="psa-rec-done">Finish recording</button><button type="button" id="psa-rec-cancel">Cancel</button></div>';
+
+    function update() {
       var last = steps[steps.length - 1];
-      if (step['do'] === 'set' && last['do'] === 'set' && last.field.id === step.field.id) steps[steps.length - 1] = step;
+      ws.extra.querySelector('#psa-rec-count').textContent = steps.length + ' steps recorded' + (last ? ' (last: ' + describe(last) + ')' : '');
+    }
+    function setStep(doc, el) {
+      var field = { id: el.id, label: labelOf(doc, el) };
+      if (/\$\d+$/.test(el.id)) { var col = columnOf(el); if (col) field.column = col; }
+      var step = { 'do': 'set', field: field, kind: kindOf(el), value: valueOf(el) };
+      var last = steps[steps.length - 1];
+      if (last && last['do'] === 'set' && last.field.id === el.id) steps[steps.length - 1] = step;
       else steps.push(step);
-      ws.status(steps.length + ' steps recorded');
+      if (step.kind !== 'password') snap[el.id] = step.value;
+      update();
+    }
+    function snapshot(doc) {
+      snap = {};
+      doc.querySelectorAll('input,select,textarea').forEach(function (el) {
+        if (recordable(el) && kindOf(el) !== 'password') snap[el.id] = valueOf(el);
+      });
+    }
+    /* Values set by script (lookup prompts, calendars) fire no change event: diff instead */
+    function diff(doc) {
+      doc.querySelectorAll('input,select,textarea').forEach(function (el) {
+        if (recordable(el) && kindOf(el) !== 'password' && el.id in snap && valueOf(el) !== snap[el.id]) setStep(doc, el);
+      });
     }
     function attach() {
       var doc = ws.frame.contentDocument;
-      if (!doc || doc._psaTeach) return;
-      doc._psaTeach = true;
-      doc.addEventListener('change', function (e) {
-        var el = e.target;
-        if (!isInput(el) || !el.id || el.type === 'button') return;
-        var value = el.type === 'password' ? '{{secret:password}}'
-          : el.type === 'checkbox' ? (el.checked ? 'Y' : 'N')
-          : el.tagName === 'SELECT' ? (el.options[el.selectedIndex] || {}).text : el.value;
-        record({ 'do': 'set', field: { id: el.id, label: labelOf(doc, el) }, value: value });
-      }, true);
+      if (!doc || doc._psaRec) return;
+      doc._psaRec = true;
+      snapshot(doc);
+      doc.addEventListener('change', function (e) { if (!finished && recordable(e.target)) setStep(doc, e.target); }, true);
       doc.addEventListener('click', function (e) {
-        var el = e.target.closest && e.target.closest('a,button,input[type="button"],input[type="submit"]');
-        if (!el) return;
+        var el = !finished && e.target.closest && e.target.closest('a,button,input[type="button"],input[type="submit"]');
+        if (!el || /\$(new|delete|prompt)\$|\$prompt$/i.test(el.id)) return;   /* grid +/- and lookups: replayed by grid steps */
+        diff(doc);
         var text = (el.tagName === 'INPUT' ? el.value : el.textContent).replace(/\s+/g, ' ').trim();
-        if (/^(ICTAB|PSTAB)/.test(el.id) || /tab/i.test(el.parentElement && el.parentElement.className)) record({ 'do': 'tab', label: text });
-        else if (el.id || text) record({ 'do': 'click', button: { id: el.id || undefined, text: text || undefined } });
+        if (/^(ICTAB|PSTAB)/.test(el.id) || /tab/i.test(el.parentElement && el.parentElement.className)) steps.push({ 'do': 'tab', label: text });
+        else if (el.id || text) steps.push({ 'do': 'click', button: { id: el.id || undefined, text: text || undefined } });
+        update();
+        /* Re-baseline once PeopleSoft has processed, so values it re-renders are not recorded */
+        sleep(RUN.afterActionMs).then(function () { return waitIdle(ws.frame, RUN.stepTimeout); })
+          .then(function (d) { if (d === ws.frame.contentDocument) snapshot(d); }, function () {});
       }, true);
     }
-    ws.frame.addEventListener('load', attach);
-    ws.frame.src = componentUrl({ menu: parts[0], component: parts[1], market: parts[2] || 'GBL' }, query);
+    function finish(result) {
+      if (finished) return;
+      finished = true;
+      ws.frame.removeEventListener('load', attach);
+      ws.onClose = null;
+      resolveFn(result);
+    }
 
+    ws.frame.addEventListener('load', attach);
+    ws.frame.src = componentUrl(opts.component, opts.query);
     return new Promise(function (resolve) {
-      ws.extra.querySelector('#psa-teach-done').addEventListener('click', function () {
-        ws.frame.removeEventListener('load', attach);
-        var json = JSON.stringify(steps, null, 2);
-        ws.extra.innerHTML = '<div>Recorded playbook. Paste it under <code>playbook:</code> in the task YAML and replace typed values with <code>{{field}}</code>:</div>'
-          + '<textarea readonly rows="10" style="width:100%;font:12px monospace">' + esc(json) + '</textarea>';
-        try { navigator.clipboard.writeText(json); } catch (e) {}
-        console.log(json);
-        resolve(steps);
+      resolveFn = resolve;
+      ws.onClose = function () { finish(null); };
+      ws.extra.querySelector('#psa-rec-cancel').addEventListener('click', function () { ws.el.style.display = 'none'; finish(null); });
+      ws.extra.querySelector('#psa-rec-done').addEventListener('click', function () {
+        try { if (ws.frame.contentDocument) diff(ws.frame.contentDocument); } catch (e) {}
+        ws.extra.innerHTML = '';
+        ws.status('Recording finished: ' + steps.length + ' steps');
+        finish({ title: opts.title, component: opts.component, query: opts.query || {}, steps: steps });
       });
     });
+  }
+
+  /* Console: PSAgent.teach('MENU.COMPONENT.GBL', {Action: 'A'}) prints the raw recording */
+  function teach(component, query) {
+    var parts = String(component).split('.');
+    return record({ title: component, component: { menu: parts[0], component: parts[1], market: parts[2] || 'GBL' }, query: query })
+      .then(function (rec) { if (rec) console.log(JSON.stringify(rec, null, 2)); return rec; });
   }
 
   /* ============================================================
@@ -484,12 +566,12 @@
   }
 
   function pageContext() {
-    var ctx = { title: '', component: '', menu: '', error: '' };
+    var ctx = { title: '', component: '', menu: '', market: '', error: '' };
     var fr = getContentFrameEl(), w = window, d = document;
     try { if (fr && fr.contentWindow) { w = fr.contentWindow; d = fr.contentDocument; } } catch (e) {}
     try {
       var m = w.location.href.match(/\/ps[cp][^/]*\/[^/]+\/[^/]+\/[^/]+\/[ch]\/([^?#/]+)/i);
-      if (m) { var p = m[1].split('.'); ctx.menu = p[0] || ''; ctx.component = p[1] || ''; }
+      if (m) { var p = m[1].split('.'); ctx.menu = p[0] || ''; ctx.component = p[1] || ''; ctx.market = p[2] || ''; }
       ctx.title = (w.szCrefLabel || w.szPinCrefLabel || (d && d.title) || '').trim();
       ctx.error = (d && psMessage(d)) || psMessage(document) || '';
     } catch (e) {}
@@ -530,6 +612,12 @@
       + '.psa-ok{background:#0078d4;color:#fff;}.psa-ok:disabled{opacity:.5;cursor:default;}'
       + '.psa-no{background:#fff;color:#0078d4;}'
       + '.psa-typing{color:#888;font-style:italic;}'
+      + '.psa-card select{width:100%;font-size:12px;padding:3px;}'
+      + '.psa-card small{color:#777;display:block;}'
+      + '.psa-card details{margin:6px 0;font-size:12px;}'
+      + '.psa-card ol{margin:4px 0;padding-left:20px;max-height:140px;overflow-y:auto;}'
+      + '.psa-card .psa-check{display:flex;gap:6px;align-items:center;}'
+      + '.psa-card .psa-check input{width:auto;}'
       + '#psa-form{display:flex;gap:6px;padding:8px;border-top:1px solid #e0e0e0;background:#f8f9fa;}'
       + '#psa-input{flex:1;resize:none;height:38px;padding:8px;border:1px solid #ccc;border-radius:8px;font:inherit;}'
       + '#psa-send{background:#0078d4;color:#fff;border:none;border-radius:8px;padding:0 14px;cursor:pointer;}'
@@ -558,7 +646,9 @@
     panel.setAttribute('role', 'dialog');
     panel.setAttribute('aria-label', 'PeopleSoft Agent');
     panel.innerHTML =
-      '<div id="psa-hdr"><h3>PeopleSoft Agent</h3><button id="psa-new" type="button" title="Start a new conversation">New</button>'
+      '<div id="psa-hdr"><h3>PeopleSoft Agent</h3>'
+      + '<button id="psa-rec" type="button" title="Teach me a new task by doing it once" style="display:none">&#9210; Record</button>'
+      + '<button id="psa-new" type="button" title="Start a new conversation">New</button>'
       + '<button id="psa-close" type="button" aria-label="Close">&#x2715;</button></div>'
       + '<div id="psa-log" role="log" aria-live="polite"></div>'
       + '<form id="psa-form"><textarea id="psa-input" aria-label="Message" placeholder="Ask or tell me what to do..."></textarea>'
@@ -640,6 +730,7 @@
       if (r.session_id) { state.sessionId = r.session_id; saveState(); }
       (r.messages || []).forEach(function (m) { addMsg('bot', m); });
       if (r.confirm) showConfirm(r.confirm);
+      if (r.record) showRecordCard(r.record);
       if (r.action) return runAndReport(r.action);
     }
 
@@ -702,6 +793,108 @@
 
     var pendingSecrets = {};  /* run_id -> secrets, kept only in memory until the run ends */
 
+    /* ---- Recording: pick the page, record, review, save ---- */
+
+    function parsePage(text) {
+      var t = String(text || '').trim(), m = t.match(/\/c\/([^?#\/]+)/i) || [null, t];
+      var p = m[1].split('.');
+      if (p.length < 2 || !/^[A-Z0-9_]+$/i.test(p[0]) || !/^[A-Z0-9_]+$/i.test(p[1])) return null;
+      return { menu: p[0].toUpperCase(), component: p[1].toUpperCase(), market: (p[2] || 'GBL').toUpperCase() };
+    }
+
+    function card(html) {
+      var c = document.createElement('div');
+      c.className = 'psa-card';
+      c.innerHTML = html;
+      logEl.appendChild(c);
+      logEl.scrollTop = logEl.scrollHeight;
+      return c;
+    }
+
+    function disable(c) { c.querySelectorAll('input,select,button,textarea').forEach(function (i) { i.disabled = true; }); }
+
+    function showRecordCard(offer) {
+      var pg = pageContext();
+      var here = pg.menu && pg.component ? pg.menu + '.' + pg.component + '.' + (pg.market || 'GBL') : '';
+      var c = card('<h4>Record a new task</h4>'
+        + '<label>Task name<input data-k="title" placeholder="e.g. Create Requisition" value="' + esc(offer && offer.title || '') + '"></label>'
+        + '<label>PeopleSoft page<input data-k="page" placeholder="MENU.COMPONENT.GBL or paste the page URL" value="' + esc(here) + '"></label>'
+        + '<label>Start in<select data-k="mode"><option value="A">Add a New Value</option><option value="U">Find an Existing Value</option>'
+        + '<option value="">The page as it opens</option></select></label>'
+        + '<small>I will open the page in the workspace. Do the task once by hand, including Save, then click Finish recording.</small>'
+        + '<div class="psa-actions"><button type="button" class="psa-ok">Start recording</button><button type="button" class="psa-no">Cancel</button></div>');
+      var ok = c.querySelector('.psa-ok');
+      function get(k) { return c.querySelector('[data-k="' + k + '"]').value; }
+      function refresh() { ok.disabled = !get('title').trim() || !parsePage(get('page')); }
+      c.querySelectorAll('input').forEach(function (i) { i.addEventListener('input', refresh); });
+      refresh();
+      c.querySelector('.psa-no').addEventListener('click', function () { disable(c); });
+      ok.addEventListener('click', function () {
+        var opts = { title: get('title').trim(), component: parsePage(get('page')), query: get('mode') ? { Action: get('mode') } : {} };
+        disable(c);
+        record(opts).then(function (rec) {
+          if (!rec) { addMsg('bot', 'Recording cancelled.', false); return; }
+          if (!rec.steps.some(function (st) { return st['do'] === 'set'; })) {
+            addMsg('bot', 'Nothing was entered during the recording, so there is nothing to learn. Try again and type the values on the page.', false);
+            return;
+          }
+          var t = typing();
+          return api('/api/recordings/draft', { recording: rec })
+            .then(function (r) { t.remove(); showReviewCard(rec, r.draft); },
+                  function (e) { t.remove(); addMsg('bot', 'I could not build a template from that recording: ' + e.message, false); });
+        });
+      });
+    }
+
+    var MODE_LABELS = { required: 'Ask every time', optional: 'Ask, can be blank', 'default': 'Ask, default = recorded', fixed: 'Always the recorded value' };
+
+    function showReviewCard(rec, draft) {
+      var rows = draft.fields.map(function (f) {
+        var shown = Array.isArray(f.value) ? f.value.join(', ') : f.value;
+        var choice = f.mode === 'secret' ? '<small>Typed on the confirm card each time</small>'
+          : '<select data-key="' + esc(f.key) + '">' + Object.keys(MODE_LABELS).map(function (m) {
+            return '<option value="' + m + '"' + (m === f.mode ? ' selected' : '') + '>' + MODE_LABELS[m] + '</option>';
+          }).join('') + '</select>';
+        return '<tr><td>' + esc(f.label) + (f.kind === 'list' ? ' (list)' : '') + '<small>'
+          + (f.mode === 'secret' ? 'secret' : 'recorded: ' + esc(shown || '(blank)')) + '</small></td><td>' + choice + '</td></tr>';
+      }).join('');
+      var stepList = rec.steps.map(function (st) { return '<li>' + esc(describe(st)) + '</li>'; }).join('');
+      var c = card('<h4>Review the recorded task</h4>'
+        + '<label>Task name<input data-k="title" value="' + esc(draft.title) + '"></label>'
+        + '<label>What it does<input data-k="summary" value="' + esc(draft.summary) + '"></label>'
+        + '<table>' + rows + '</table>'
+        + '<details><summary>' + rec.steps.length + ' recorded steps</summary><ol>' + stepList + '</ol></details>'
+        + (draft.exists ? '<label class="psa-check"><input type="checkbox" data-k="overwrite"> Replace the existing task <code>' + esc(draft.task_id) + '</code></label>' : '')
+        + '<small>Task ID: ' + esc(draft.task_id) + (draft.suggested_by === 'claude' ? ' · suggestions by Claude' : '') + '</small>'
+        + '<div class="psa-actions"><button type="button" class="psa-ok">Save task</button><button type="button" class="psa-no">Discard</button></div>');
+      var ok = c.querySelector('.psa-ok'), over = c.querySelector('[data-k="overwrite"]');
+      function refresh() { ok.disabled = !c.querySelector('[data-k="title"]').value.trim() || (over && !over.checked); }
+      c.querySelectorAll('input').forEach(function (i) { i.addEventListener('input', refresh); i.addEventListener('change', refresh); });
+      refresh();
+      c.querySelector('.psa-no').addEventListener('click', function () { disable(c); addMsg('bot', 'Recording discarded.', false); });
+      ok.addEventListener('click', function () {
+        var edited = JSON.parse(JSON.stringify(draft));
+        edited.title = c.querySelector('[data-k="title"]').value.trim();
+        edited.summary = c.querySelector('[data-k="summary"]').value.trim();
+        c.querySelectorAll('select[data-key]').forEach(function (sel) {
+          edited.fields.forEach(function (f) { if (f.key === sel.getAttribute('data-key')) f.mode = sel.value; });
+        });
+        disable(c);
+        var t = typing();
+        api('/api/recordings/save', { recording: rec, draft: edited, overwrite: !!(over && over.checked) }).then(function (r) {
+          t.remove();
+          addMsg('bot', 'Saved **' + r.title + '**. From now on I can do it for you'
+            + (r.fields.length ? '; I will ask for: ' + r.fields.join(', ') + '.' : '.'));
+          if (r.examples && r.examples.length) addChips(r.examples);
+        }, function (e) {
+          t.remove();
+          addMsg('bot', 'Saving failed: ' + e.message, false);
+          c.querySelectorAll('input,select,button').forEach(function (i) { i.disabled = false; });
+          refresh();
+        });
+      });
+    }
+
     function runAndReport(action) {
       var secrets = pendingSecrets[action.run_id] || {};
       delete pendingSecrets[action.run_id];
@@ -719,6 +912,9 @@
       fab.setAttribute('aria-expanded', 'true');
       if (!logEl.childNodes.length) {
         ensureConfig().then(function () {
+          apiGet('/api/me').then(function (me) {
+            if (me.can_teach) panel.querySelector('#psa-rec').style.display = '';
+          }, function () {});
           if (state.history.length) state.history.forEach(function (h) { addMsg(h.who, h.text, false); });
           else greet();
         }, function () { addMsg('bot', 'Sorry, the agent is not available right now.', false); });
@@ -729,6 +925,7 @@
 
     fab.addEventListener('click', function () { panel.classList.contains('psa-open') ? close() : open(); });
     panel.querySelector('#psa-close').addEventListener('click', close);
+    panel.querySelector('#psa-rec').addEventListener('click', function () { showRecordCard({ title: '' }); });
     panel.querySelector('#psa-new').addEventListener('click', function () {
       state = { sessionId: null, history: [] };
       saveState();
@@ -771,25 +968,29 @@
     return configPromise;
   }
 
+  /* POST payload as JSON (GET when payload is undefined); errors carry the service's message */
   function api(path, payload, retried) {
     return ensureConfig().then(function () {
-      return fetch(cfg.agentUrl.replace(/\/$/, '') + path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.token },
-        body: JSON.stringify(payload)
-      });
+      var opts = { method: payload === undefined ? 'GET' : 'POST', headers: { 'Authorization': 'Bearer ' + cfg.token } };
+      if (payload !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(payload); }
+      return fetch(cfg.agentUrl.replace(/\/$/, '') + path, opts);
     }).then(function (r) {
       if (r.status === 401 && !retried && !window.PSAGENT_CONFIG) {
         return ensureConfig(true).then(function () { return api(path, payload, true); });
       }
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (!r.ok) {
+        return r.json().then(function (j) { return j.error; }, function () { return null; })
+          .then(function (msg) { throw new Error(msg || 'HTTP ' + r.status); });
+      }
       return r.json();
     });
   }
+  function apiGet(path) { return api(path, undefined); }
 
   window.PSAgent = {
     inspect: inspect,
     teach: teach,
+    record: record,
     run: function (action, secrets) { return runAction(action, secrets || {}, openWorkspace('Agent: ' + (action.title || 'test'))); }
   };
 

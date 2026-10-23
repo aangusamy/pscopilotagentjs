@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+from psagent.llm import LLMError
+
 
 def text(t):
     return SimpleNamespace(type="text", text=t)
@@ -18,9 +20,17 @@ def response(*blocks, stop_reason=None):
 
 
 class FakeLLM:
-    def __init__(self, *responses):
+    def __init__(self, *responses, drafts=()):
         self.responses = list(responses)
+        self.drafts = list(drafts)  # answers for structured(); none left -> LLMError
         self.calls = []
+        self.structured_calls = []
+
+    def structured(self, system, prompt, schema):
+        self.structured_calls.append((prompt, schema))
+        if not self.drafts:
+            raise LLMError("no scripted draft")
+        return self.drafts.pop(0)
 
     def create(self, system, messages, tools):
         self.calls.append(list(messages))

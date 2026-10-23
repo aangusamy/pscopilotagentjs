@@ -46,7 +46,11 @@ card and never reach you. Never ask for them in chat. If a user types a \
 password in chat, do not repeat it and tell them to enter it on the card instead.
 
 If the user asks for something that is not in the task list, say you cannot do \
-that yet and describe it as a step-by-step guide instead.
+that yet and describe it as a step-by-step guide instead. Users allowed to teach \
+can add tasks: when a user wants to teach or record a new task, or asks you to \
+learn something you cannot do yet, call offer_recording. They then do the task \
+once by hand while the widget records it, review the template and save it. New \
+or updated tasks are announced to you in system messages during the conversation.
 
 ## Context
 Each user message may start with <page_context>: the PeopleSoft page the user \
@@ -71,14 +75,15 @@ def _strict(name, description, properties, required):
     }
 
 
-def build_tools(tasks):
-    field_names = sorted({n for t in tasks.values() for n, f in t.fields.items() if not f.sensitive})
+def build_tools():
+    # No enums of task ids or field names: tasks recorded mid-conversation must
+    # not change the tool list (that would break the cached, append-only prefix).
     return [
         _strict(
             "start_task",
-            "Begin collecting values for a task. Returns the task's fields, defaults and what is still missing. "
-            "Calling it again for another task discards the current one.",
-            {"task_id": {"type": "string", "enum": sorted(tasks)}},
+            "Begin collecting values for a task from the task list. Returns the task's fields, defaults and "
+            "what is still missing. Calling it again for another task discards the current one.",
+            {"task_id": {"type": "string"}},
             ["task_id"],
         ),
         _strict(
@@ -92,7 +97,7 @@ def build_tools(tasks):
                     "items": {
                         "type": "object",
                         "properties": {
-                            "name": {"type": "string", "enum": field_names},
+                            "name": {"type": "string"},
                             "value": {"type": "string"},
                         },
                         "required": ["name", "value"],
@@ -115,7 +120,17 @@ def build_tools(tasks):
             {},
             [],
         ),
+        _strict(
+            "offer_recording",
+            "Show the Record card so the user can teach a new task by doing it once by hand.",
+            {"title": {"type": "string", "description": "Short task title starting with a verb, e.g. 'Create Requisition'"}},
+            ["title"],
+        ),
     ]
+
+
+def _signature(task):
+    return json.dumps([task.title, task.summary, list(task.fields), task.playbook], sort_keys=True, default=str)
 
 
 def _catalog(tasks):
@@ -132,9 +147,10 @@ class Reply:
     messages: list[str] = field(default_factory=list)
     confirm: dict | None = None
     action: dict | None = None
+    record: dict | None = None
 
     def to_dict(self):
-        return {"messages": self.messages, "confirm": self.confirm, "action": self.action}
+        return {"messages": self.messages, "confirm": self.confirm, "action": self.action, "record": self.record}
 
 
 @dataclass
@@ -146,6 +162,9 @@ class Session:
     values: dict = field(default_factory=dict)
     pending: dict | None = None  # {run_id, task_id, values} awaiting the user's click
     running: dict | None = None  # {run_id, task_id} handed to the widget
+    can_teach: bool = False
+    system: str | None = None  # frozen at the first turn so the prompt prefix never changes
+    known: dict | None = None  # task_id -> signature the model has been told about
     lock: threading.Lock = field(default_factory=threading.Lock)
     touched: float = field(default_factory=time.time)
 
@@ -179,9 +198,16 @@ class SessionStore:
 class Agent:
     def __init__(self, llm, tasks):
         self.llm = llm
-        self.tasks = tasks
-        self.system = SYSTEM_PROMPT.format(catalog=_catalog(tasks))
-        self.tools = build_tools(tasks)
+        self.tasks = dict(tasks)
+        self.tools = build_tools()
+        self._tasks_lock = threading.Lock()
+
+    def add_task(self, task):
+        """Register a new or updated task; live sessions hear about it on their next turn."""
+        with self._tasks_lock:
+            tasks = dict(self.tasks)
+            tasks[task.id] = task
+            self.tasks = tasks
 
     # ----- public entry points (call with session.lock held) ------------
     def chat(self, s, text, page=None):
@@ -194,7 +220,7 @@ class Agent:
         s.pending = None
         if not approved:
             return self._turn(s, f"[event] The user clicked Cancel on the confirmation card for run {run_id}.")
-        task = self.tasks[p["task_id"]]
+        task = p["task"]  # the version the user confirmed, even if re-recorded since
         s.running = {"run_id": run_id, "task_id": task.id}
         s.messages.append({"role": "user", "content": f"[event] The user confirmed run {run_id}. The widget is running it now."})
         log.info("run %s confirmed by %s: %s %s", run_id, s.oprid, task.id, json.dumps(p["values"]))
@@ -227,18 +253,29 @@ class Agent:
     # ----- agent loop ---------------------------------------------------
     def _turn(self, s, user_content):
         reply = Reply()
+        tasks, previous = self.tasks, None  # previous: s.known before an unanswered announcement
         s.messages.append({"role": "user", "content": user_content})
+        if s.system is None:
+            s.system = SYSTEM_PROMPT.format(catalog=_catalog(tasks))
+            s.known = {t.id: _signature(t) for t in tasks.values()}
+        else:
+            changed = {i: t for i, t in tasks.items() if s.known.get(i) != _signature(t)}
+            if changed:
+                previous = dict(s.known)
+                s.known.update({i: _signature(t) for i, t in changed.items()})
+                s.messages.append({"role": "system", "content": "The task list changed. New or updated tasks:\n" + _catalog(changed)})
         for _ in range(MAX_TOOL_ROUNDS):
             try:
-                resp = self.llm.create(self.system, s.messages, self.tools)
+                resp = self.llm.create(s.system, s.messages, self.tools)
             except LLMError as e:
                 log.warning("LLM call failed: %s", e)
                 reply.messages.append("Sorry, the AI service is unavailable right now. Please try again in a moment.")
-                return reply
+                return self._unannounce(s, reply, previous)
             if resp.stop_reason == "refusal":
                 reply.messages.append("Sorry, I can't help with that request.")
-                return reply
+                return self._unannounce(s, reply, previous)
             s.messages.append({"role": "assistant", "content": resp.content})
+            previous = None
             text = "\n\n".join(b.text for b in resp.content if b.type == "text" and b.text.strip())
             if text:
                 reply.messages.append(text)
@@ -258,6 +295,14 @@ class Agent:
         reply.messages.append("I got stuck working that out. Could you rephrase?")
         return reply
 
+    def _unannounce(self, s, reply, previous):
+        """A system message must be followed by an assistant turn. If the model gave no
+        answer, take back the announcement at the end so it is sent again next turn."""
+        if previous is not None and s.messages[-1]["role"] == "system":
+            s.messages.pop()
+            s.known = previous
+        return reply
+
     # ----- tools --------------------------------------------------------
     def _run_tool(self, s, name, args, reply):
         args = args or {}
@@ -268,6 +313,12 @@ class Agent:
             s.task_id, s.values, s.pending = task.id, {}, None
             reply.confirm = None
             return task.describe(s.values), False
+
+        if name == "offer_recording":
+            if not s.can_teach:
+                return {"error": "this user is not allowed to record tasks; an administrator can add them to PSAGENT_TEACHERS"}, True
+            reply.record = {"title": str(args.get("title") or "")[:80]}
+            return {"shown": True, "note": "The Record card is shown. Tell the user to open the page, start recording and do the task once, including Save."}, False
 
         task = self.tasks.get(s.task_id) if s.task_id else None
         if name == "cancel_task":
@@ -302,7 +353,7 @@ class Agent:
             if missing:
                 return {"error": "required fields missing", "missing_required": [task.fields[n].label for n in missing]}, True
             run_id = uuid.uuid4().hex[:12]
-            s.pending = {"run_id": run_id, "task_id": task.id, "values": dict(s.values)}
+            s.pending = {"run_id": run_id, "task": task, "values": dict(s.values)}
             reply.confirm = {
                 "run_id": run_id,
                 "title": task.title,

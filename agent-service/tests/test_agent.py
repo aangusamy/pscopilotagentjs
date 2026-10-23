@@ -144,13 +144,24 @@ class AgentFlowTest(unittest.TestCase):
         self.assertIn("can't help", agent.chat(s, "hi").messages[0])
         self.assertEqual([m["role"] for m in s.messages], ["user"])
 
-    def test_tool_schema_excludes_secret_fields(self):
-        tools = {t["name"]: t for t in Agent(FakeLLM(), TASKS).tools}
-        names = tools["set_fields"]["input_schema"]["properties"]["fields"]["items"]["properties"]["name"]["enum"]
-        self.assertIn("user_id", names)
-        self.assertNotIn("password", names)
-        self.assertTrue(all(t["strict"] for t in tools.values()))
+    def test_password_cannot_be_set_through_chat(self):
+        llm = FakeLLM(
+            response(tool("start_task", {"task_id": "create_user_profile"}),
+                     tool("set_fields", {"fields": [{"name": "password", "value": "hunter2"}]}, id="b")),
+            response(text("Please type the password on the card.")),
+        )
+        agent, s = Agent(llm, TASKS), Session(id="s", oprid="PS")
+        agent.chat(s, "password is hunter2")
+        self.assertNotIn("password", s.values)
+        out = json.loads(llm.calls[-1][-1]["content"][1]["content"])
+        self.assertEqual(out["rejected"], [{"name": "password", "error": "not a field of this task"}])
 
+    def test_tools_are_strict_and_fixed(self):
+        agent = Agent(FakeLLM(), TASKS)
+        before = json.dumps(agent.tools)
+        agent.add_task(TASKS["create_user_profile"])
+        self.assertEqual(json.dumps(agent.tools), before)
+        self.assertTrue(all(t["strict"] for t in agent.tools))
 
 if __name__ == "__main__":
     unittest.main()

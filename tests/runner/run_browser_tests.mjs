@@ -84,10 +84,73 @@ test('chat flow: ask -> confirm card -> password -> runs -> result; password nev
   await page.locator('.psa-bot', { hasText: 'was created' }).waitFor({ timeout: 60000 });
   assert.equal((await saved(page)).PWD, 'Tr0ub4dor&3');
   assert.match(await page.locator('#psa-ws-status').innerText(), /^Done/);
-  const bodies = await (await fetch(`${BASE}/__test/bodies`)).json();
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b);  // POSTs only
   assert.equal(bodies.length, 3);                       // chat, confirm, result
   assert.ok(bodies.every(b => !b.includes('Tr0ub4dor')), 'password leaked to the agent service');
   assert.equal(JSON.parse(bodies[2]).status, 'success');
+});
+
+test('record once by hand -> review -> save -> agent does it for a new user', async page => {
+  await page.click('#psa-fab');
+  await page.locator('#psa-rec').waitFor();             // visible for teachers only
+  await page.click('#psa-rec');
+  const rc = page.locator('.psa-card').last();
+  await rc.locator('[data-k="title"]').fill('Create user (quick)');
+  await rc.locator('[data-k="page"]').fill('MAINTAIN_SECURITY.USERMAINT.GBL');
+  await rc.locator('.psa-ok').click();
+
+  // The teacher does the transaction by hand in the workspace
+  const f = page.frameLocator('#psa-ws-frame');
+  await f.locator('#PSOPRDEFN_SRCH_OPRID').fill('KUMAR');
+  await f.locator('[id="#ICSearch"]').click();
+  await f.locator('#PSOPRDEFN_OPRDEFNDESC').fill('Kumar Raja');     // after the full reload
+  await f.locator('#PSOPRDEFN_SYMBOLICID').selectOption('SYSADM1');
+  await f.locator('#PSOPRDEFN_OPERPSWD').fill('Rec0rdPw!');
+  await f.locator('#PSUSRPRFL_WRK_OPERPSWDCONF').fill('Rec0rdPw!');
+  await f.locator('#ICTAB_1').click();                               // ID tab
+  await f.locator('#OPRALIASTYPE_X').selectOption('EMP');
+  await f.locator('[id="ATTRVAL_X$0"]').fill('KU0099');
+  await f.locator('#ICTAB_2').click();                               // Roles tab
+  await f.locator('[id="PSROLEUSER_VW_ROLENAME$0"]').fill('EMPLOYEE');
+  await f.locator('[id="PSROLEUSER_VW$new$0$$0"]').click();
+  await f.locator('[id="PSROLEUSER_VW_ROLENAME$1"]').fill('Manager');
+  await f.locator('[id="#ICSave"]').click();
+  await f.locator('#SAVED_win0').waitFor();
+  assert.equal((await saved(page)).OPRID, 'KUMAR');
+  await page.click('#psa-rec-done');
+
+  // Review card: Claude's suggestions, one changed by the teacher
+  const review = page.locator('.psa-card', { hasText: 'Review the recorded task' });
+  await review.waitFor();
+  const rtext = await review.innerText();
+  for (const s of ['User ID', 'recorded: KUMAR', 'Roles (list)', 'recorded: EMPLOYEE, Manager', 'Password', '13 recorded steps'])
+    assert.ok(rtext.includes(s), s);
+  assert.equal(await review.locator('select[data-key="OPRALIASTYPE_X"]').inputValue(), 'fixed');
+  await review.locator('select[data-key="ATTRVAL_X$0"]').selectOption('optional');
+  await review.locator('.psa-ok').click();
+  await page.locator('.psa-bot', { hasText: 'Saved Create User (quick)' }).waitFor();
+
+  const yml = await (await fetch(`${BASE}/__test/task_file?id=create_user_quick`)).text();
+  assert.match(yml, /^# Recorded with PSAgent teach mode by TESTER/);
+  assert.match(yml, /when: emplid/);                     // ID tab only runs when an EMPLID is given
+  assert.match(yml, /value: Employee/);                  // fixed value kept
+  assert.ok(!yml.includes('Rec0rdPw'), 'recorded password leaked into the task');
+
+  // Now the agent does it for a different user, using the recorded task
+  await page.fill('#psa-input', 'create user anita, Anita Rao, roles EMPLOYEE and Manager');
+  await page.press('#psa-input', 'Enter');
+  const card = page.locator('.psa-card', { hasText: 'please review' });
+  await card.waitFor();
+  await card.locator('[data-secret="password"]').fill('An1ta!pw');
+  await card.locator('[data-confirm="password"]').fill('An1ta!pw');
+  await card.locator('.psa-ok').click();
+  await page.locator('.psa-bot', { hasText: 'created with the recorded task' }).waitFor({ timeout: 60000 });
+  assert.deepEqual(await saved(page), {
+    OPRID: 'ANITA', DESCR: 'Anita Rao', SYMBOLICID: 'SYSADM1', PWD: 'An1ta!pw', PWD2: 'An1ta!pw',
+    OPRCLASS: '', IDTYPE: 'NON', EMPLID: '', ROLES: ['EMPLOYEE', 'Manager'],
+  });
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).join('\n');
+  assert.ok(!bodies.includes('Rec0rdPw') && !bodies.includes('An1ta'), 'password reached the agent service');
 });
 
 let failed = 0;

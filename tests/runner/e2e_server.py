@@ -4,11 +4,14 @@ One origin serves everything, like PeopleSoft + a reverse-proxied agent:
   /psc/ps/EMPLOYEE/HRMS/c/NUI_FRAMEWORK.PT_LANDINGPAGE.GBL  host page with psagent.js
   /psc/ps/EMPLOYEE/HRMS/c/MAINTAIN_SECURITY.USERMAINT.GBL   mock component
   /api/*                                                   real agent API, scripted LLM
-  /__test/action, /__test/bodies                           test hooks
+  /__test/action, /__test/bodies, /__test/task_file        test hooks
+Recorded tasks are saved to a temporary copy of agent-service/tasks.
 """
 
 import json
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,8 +26,25 @@ from psagent.agent import Agent  # noqa: E402
 from psagent.server import create_app  # noqa: E402
 from psagent.tasks import load_tasks  # noqa: E402
 
-TASKS = load_tasks(ROOT / "agent-service" / "tasks")
+TASKS_DIR = Path(tempfile.mkdtemp(prefix="psagent-tasks-"))
+shutil.copytree(ROOT / "agent-service" / "tasks", TASKS_DIR, dirs_exist_ok=True)
+TASKS = load_tasks(TASKS_DIR)
 HERE = Path(__file__).resolve().parent
+
+# Claude's suggestions for the recording made in the browser test. emplid is
+# deliberately "required" here; the test changes it to optional on the review card.
+DRAFT = {
+    "task_id": "create_user_quick", "title": "Create User (quick)", "summary": "Adds a user from the recorded steps.",
+    "examples": ["create user anita"],
+    "fields": [{"key": k, "name": n, "label": label, "mode": m, "hint": ""} for k, n, label, m in [
+        ("PSOPRDEFN_SRCH_OPRID", "user_id", "User ID", "required"),
+        ("PSOPRDEFN_OPRDEFNDESC", "description", "Description", "required"),
+        ("PSOPRDEFN_SYMBOLICID", "symbolic_id", "Symbolic ID", "default"),
+        ("OPRALIASTYPE_X", "id_type", "ID Type", "fixed"),
+        ("ATTRVAL_X$0", "emplid", "Employee ID", "required"),
+        ("PSROLEUSER_VW_ROLENAME", "roles", "Roles", "optional"),
+    ]],
+}
 
 USER = {"user_id": "VELU", "description": "Velu Arumugam", "emplid": "KU0042",
         "roles": "EMPLOYEE, PeopleSoft User", "primary_permission_list": "HCCPEMPLOYEE"}
@@ -35,8 +55,18 @@ llm = FakeLLM(
              tool("request_confirmation", {}, id="c")),
     response(text("Here is the summary. Enter the password and click **Confirm**.")),
     response(text("Done. User **VELU** was created and linked to employee **KU0042**.")),
+    # after the recording test saved create_user_quick:
+    response(tool("start_task", {"task_id": "create_user_quick"}),
+             tool("set_fields", {"fields": [{"name": "user_id", "value": "anita"},
+                                            {"name": "description", "value": "Anita Rao"},
+                                            {"name": "roles", "value": "EMPLOYEE, Manager"}]}, id="b2"),
+             tool("request_confirmation", {}, id="c2")),
+    response(text("Please confirm.")),
+    response(text("Done. User **ANITA** was created with the recorded task.")),
+    drafts=[DRAFT],
 )
-app = create_app(Agent(llm, TASKS), secret="", allowed_origins=[], dev_oprid="TESTER")
+app = create_app(Agent(llm, TASKS), secret="", allowed_origins=[], dev_oprid="TESTER",
+                 teachers={"*"}, tasks_dir=str(TASKS_DIR))
 bodies = []
 
 
@@ -96,6 +126,7 @@ app.router.routes.extend([
     Route("/psagent.js", lambda r: FileResponse(ROOT / "psagent.js", media_type="text/javascript")),
     Route("/__test/action", action),
     Route("/__test/bodies", lambda r: JSONResponse(bodies)),
+    Route("/__test/task_file", lambda r: Response((TASKS_DIR / (r.query_params["id"] + ".yaml")).read_text())),
 ])
 
 if __name__ == "__main__":

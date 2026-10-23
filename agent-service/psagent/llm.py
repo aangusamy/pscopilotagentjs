@@ -1,5 +1,6 @@
 """Claude client used by the agent. Imported lazily so tests run without the SDK."""
 
+import json
 import logging
 
 log = logging.getLogger("psagent")
@@ -43,3 +44,28 @@ class ClaudeLLM:
             raise LLMError(f"connection error: {e}") from e
         log.debug("claude %s stop=%s usage=%s", resp._request_id, resp.stop_reason, resp.usage)
         return resp
+
+    def structured(self, system, prompt, schema):
+        """One-shot JSON answer matching `schema` (used to draft recorded tasks)."""
+        a = self._anthropic
+        try:
+            resp = self.client.beta.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+                output_config={"effort": self.effort, "format": {"type": "json_schema", "schema": schema}},
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+            )
+        except a.APIStatusError as e:
+            raise LLMError(f"API error {e.status_code}: {e.message}") from e
+        except a.APIConnectionError as e:
+            raise LLMError(f"connection error: {e}") from e
+        if resp.stop_reason in ("refusal", "max_tokens"):
+            raise LLMError(f"no usable answer (stop_reason={resp.stop_reason})")
+        text = next((b.text for b in resp.content if b.type == "text"), "")
+        try:
+            return json.loads(text)
+        except ValueError as e:
+            raise LLMError("answer was not valid JSON") from e
