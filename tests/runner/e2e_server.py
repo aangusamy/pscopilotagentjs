@@ -3,6 +3,7 @@
 One origin serves everything, like PeopleSoft + a reverse-proxied agent:
   /psc/ps/EMPLOYEE/HRMS/c/NUI_FRAMEWORK.PT_LANDINGPAGE.GBL  host page with psagent.js
   /psc/ps/EMPLOYEE/HRMS/c/MAINTAIN_SECURITY.USERMAINT.GBL   mock component
+  /psp/ps/EMPLOYEE/HRMS/c/MAINTAIN_SECURITY.USERMAINT.GBL   portal page: header + TargetContent frame
   /api/*                                                   real agent API, scripted LLM
   /__test/action, /__test/bodies, /__test/task_file        test hooks
 Recorded tasks are saved to a temporary copy of agent-service/tasks.
@@ -102,6 +103,20 @@ HOST = """<!doctype html><html><head><meta charset="utf-8"><title>Homepage</titl
 <script src="/psagent.js"></script></body></html>"""
 
 
+PORTAL = """<!doctype html><html><head><meta charset="utf-8"><title>User Profiles</title>
+<style>html,body{margin:0;height:100%}#PT_HEADER{height:40px;background:#333;color:#fff;padding:8px}
+#ptifrmtgtframe{width:100%;height:calc(100% - 60px);border:0}</style></head>
+<body><div id="PT_HEADER"><a id="PT_NAVBAR" href="#" onclick="return false">NavBar</a></div>
+<iframe id="ptifrmtgtframe" name="TargetContent" src="/psc/ps/EMPLOYEE/HRMS/c/{name}?{query}"></iframe>
+<script>window.PSAGENT_CONFIG = {agentUrl: '', token: 'dev', oprid: 'TESTER', fullname: 'Test User'};</script>
+<script src="/psagent.js"></script></body></html>"""
+
+
+def portal(request):
+    query = "&".join(filter(None, [request.url.query, "PortalActualURL=x&PortalRegistryName=EMPLOYEE"]))
+    return HTMLResponse(PORTAL.replace("{name}", request.path_params["name"]).replace("{query}", query))
+
+
 def component(request):
     name = request.path_params["name"]
     if name.startswith("NUI_FRAMEWORK."):
@@ -123,6 +138,7 @@ def action(request):
 
 app.router.routes.extend([
     Route("/psc/ps/EMPLOYEE/HRMS/c/{name}", component),
+    Route("/psp/ps/EMPLOYEE/HRMS/c/{name}", portal),
     Route("/psagent.js", lambda r: FileResponse(ROOT / "psagent.js", media_type="text/javascript")),
     Route("/__test/action", action),
     Route("/__test/bodies", lambda r: JSONResponse(bodies)),

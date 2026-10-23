@@ -10,8 +10,12 @@
   Saved indicator). Layout and most IDs follow a real PeopleTools 8.5x
   USERMAINT checked on 2026-10-22: Description is entered on the ID tab, and a
   changed EMPLID is only sent to the server when focus moves to the next field,
-  whose reply redraws the tab. Some IDs intentionally differ from the task YAML
-  so the label/column fallbacks are exercised. It is not real PeopleSoft HTML.
+  whose reply redraws the tab. Message boxes are drawn in the TOP window
+  (#pt_modals > #alertmsg, one OK button) even when this page is in a frame,
+  "already exists" is inline search-page text (#PTS_CRITTEXT_DISP), and the
+  search page opens in Find mode unless Action=A (both as on 2026-10-23).
+  Some IDs intentionally differ from the task YAML so the label/column
+  fallbacks are exercised. It is not real PeopleSoft HTML.
 -->
 <style>
   body { font-family: Arial, sans-serif; font-size: 12px; margin: 12px; }
@@ -19,14 +23,12 @@
   #SAVED_win0 { position: fixed; top: 4px; right: 4px; background: #cfc; padding: 4px 8px; display: none; }
   .tabs a, .tabs span { margin-right: 12px; }
   .tabs span { font-weight: bold; }
-  #modal { display: none; position: fixed; top: 30%; left: 30%; border: 2px solid #900; background: #fff; padding: 16px; }
   table.grid th { text-align: left; }
 </style>
 </head>
 <body>
 <div id="WAIT_win0">Processing...</div>
 <div id="SAVED_win0">Saved</div>
-<div id="modal"><span id="alertmsg"></span><br><input type="button" id="#ICOK" value="OK" onclick="closeMsg()"></div>
 <form name="win0" id="win0" onsubmit="return false"><div id="page"></div></form>
 <script>
 (function () {
@@ -36,12 +38,24 @@
   var data = { OPRID: q.get('OPRID') || '', DESCR: '', SYMBOLICID: '', PWD: '', PWD2: '', OPRCLASS: '',
                IDTYPE: 'NON', EMPLID: '', ROLES: [''] };
   var tab = 'General';
+  var addMode = q.get('Action') === 'A' || !!data.OPRID;
+  var searchMsg = '';
   window.__mockSaved = null;
   window.__mockRoundTrips = 0;
 
   function el(id) { return document.getElementById(id); }
-  function msg(text) { el('alertmsg').textContent = text; el('modal').style.display = 'block'; }
-  window.closeMsg = function () { el('modal').style.display = 'none'; };
+  /* Like PeopleSoft: the message box goes to the TOP window, also when this page is in a frame */
+  function msg(text) {
+    var d = document;
+    try { if (window.top !== window && window.top.document.body) d = window.top.document; } catch (e) {}
+    var host = d.getElementById('pt_modals');
+    if (!host) { host = d.createElement('div'); host.id = 'pt_modals'; d.body.appendChild(host); }
+    host.innerHTML = '<div id="ptMod_0" style="position:fixed;top:30%;left:30%;z-index:2147483646;border:2px solid #900;'
+      + 'background:#fff;padding:16px;font:12px Arial"><a href="#" style="display:inline-block;width:2px">&nbsp;</a>'
+      + '<span id="alertmsg" class="popupText"></span><br><input type="button" id="#ICOK" value="OK"></div>';
+    host.querySelector('#alertmsg').textContent = text;
+    host.querySelector('input').onclick = function () { host.innerHTML = ''; };
+  }
 
   /* Every action is a server round trip: show the processing indicator, then re-render. */
   function roundTrip(fn) {
@@ -62,11 +76,16 @@
   });
 
   window.submitAction_win0 = function (form, name) {
-    if (name === 'PTS_CFG_CL_WRK_PTS_ADD_BTN') {
+    if (name === 'PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE') {
+      roundTrip(function () { addMode = !addMode; searchMsg = ''; render(); });
+    } else if (name === 'PTS_CFG_CL_WRK_PTS_ADD_BTN') {
       var id = el('PSOPRDEFN_SRCH_OPRID').value.trim().toUpperCase();
       roundTrip(function () {
         if (!id) return msg('Enter a User ID.');
-        if (EXISTING.indexOf(id) >= 0) return msg('The User ID ' + id + ' already exists. (48,23)');
+        if (EXISTING.indexOf(id) >= 0) {
+          searchMsg = "The value you tried to add already exists. Select it below if you'd like to update it, or specify a new value in the fields above.";
+          return render();
+        }
         location.href = location.pathname + '?Action=A&OPRID=' + encodeURIComponent(id);   /* full reload */
       });
     } else if (name.indexOf('#ICPanel') === 0) {
@@ -110,9 +129,15 @@
   function render() {
     var p = el('page');
     if (!data.OPRID) {
-      p.innerHTML = '<h2>User Profiles</h2><h3>Add a New Value</h3>'
-        + '<label for="PSOPRDEFN_SRCH_OPRID">User ID:</label> <input type="text" id="PSOPRDEFN_SRCH_OPRID"> '
-        + '<input type="button" id="PTS_CFG_CL_WRK_PTS_ADD_BTN" name="PTS_CFG_CL_WRK_PTS_ADD_BTN" value="Add" onclick="submitAction_win0(this.form,this.name)">';
+      var toggle = '<a id="PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE" href="javascript:submitAction_win0(document.win0,\'PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE\')">'
+        + (addMode ? 'Find an Existing Value' : 'Add a New Value') + '</a>';
+      p.innerHTML = addMode
+        ? '<h2>User Profiles</h2><h3>Add a New Value</h3>' + toggle + '<br>'
+          + (searchMsg ? '<span id="PTS_CRITTEXT_DISP" class="PSSRCHINSTRUCTIONS">' + searchMsg + '</span><br>' : '')
+          + '<label for="PSOPRDEFN_SRCH_OPRID">User ID:</label> <input type="text" id="PSOPRDEFN_SRCH_OPRID"> '
+          + '<input type="button" id="PTS_CFG_CL_WRK_PTS_ADD_BTN" name="PTS_CFG_CL_WRK_PTS_ADD_BTN" value="Add" onclick="submitAction_win0(this.form,this.name)">'
+        : '<h2>User Profiles</h2><h3>Find an Existing Value</h3>' + toggle + '<br>'
+          + '<label for="PSOPRDEFN_SRCH_OPRID">User ID begins with:</label> <input type="text" id="PSOPRDEFN_SRCH_OPRID">';
       return;
     }
     var h = '<h2>User Profiles</h2>' + tabs() + '<div>User ID: <b>' + data.OPRID + '</b></div>';

@@ -30,7 +30,8 @@ async function actionFor(values) {
   const r = await fetch(`${BASE}/__test/action?values=${encodeURIComponent(JSON.stringify(values))}`);
   return r.json();
 }
-const saved = page => page.frameLocator('#psa-ws-frame').locator('body').evaluate(() => window.__mockSaved);
+const saved = (page, frame = '#psa-ws-frame') => page.frameLocator(frame).locator('body').evaluate(() => window.__mockSaved);
+const modalOpen = page => page.evaluate(() => { const e = document.querySelector('#pt_modals #alertmsg'); return !!e && !!e.offsetHeight; });
 
 test('runner creates a full user (reload on Add, label/column fallbacks, grid rows)', async page => {
   const action = await actionFor({ user_id: 'velu', description: 'Velu Arumugam', emplid: 'KU0042',
@@ -55,7 +56,9 @@ test('runner stops on invalid role and never saves', async page => {
   const action = await actionFor({ user_id: 'VELU', description: 'Velu', roles: 'EMPLOYEE, BADROLE' });
   const res = await page.evaluate(([a]) => PSAgent.run(a, { password: 'x' }), [action]);
   assert.equal(res.status, 'error');
-  assert.match(res.message, /Invalid value/);
+  assert.match(res.message, /Invalid value/);       // the box is drawn in the TOP window, like PeopleSoft does
+  assert.equal(res.failed_step, 'Fill Role Name rows');
+  assert.equal(await modalOpen(page), false);         // OK-only box closed after its text was captured
   assert.equal(await saved(page), null);
 });
 
@@ -91,36 +94,51 @@ test('chat flow: ask -> confirm card -> password -> runs -> result; password nev
   assert.equal(JSON.parse(bodies[2]).status, 'success');
 });
 
-test('record once by hand -> review -> save -> agent does it for a new user', async page => {
+test('record in the real UI across page loads -> review -> save -> agent does it for a new user', async page => {
   await page.click('#psa-fab');
   await page.locator('#psa-rec').waitFor();             // visible for teachers only
   await page.click('#psa-rec');
   const rc = page.locator('.psa-card').last();
+  assert.equal(await rc.locator('[data-k="page"]').inputValue(), '');   // the homepage is never offered
   await rc.locator('[data-k="title"]').fill('Create user (quick)');
-  await rc.locator('[data-k="page"]').fill('MAINTAIN_SECURITY.USERMAINT.GBL');
+  await rc.locator('[data-k="page"]').fill('NUI_FRAMEWORK.PT_LANDINGPAGE.GBL');
+  assert.equal(await rc.locator('.psa-ok').isDisabled(), true);
+  assert.match(await rc.innerText(), /homepage or navigation page/);
+  await rc.locator('[data-k="page"]').fill('');                          // the page is optional
   await rc.locator('.psa-ok').click();
+  const bar = page.locator('#psa-recbar');
+  await bar.waitFor();
+  assert.match(await bar.innerText(), /Go to the page/);
 
-  // The teacher does the transaction by hand in the workspace
-  const f = page.frameLocator('#psa-ws-frame');
+  // The teacher navigates the normal way (a full page load, like the NavBar does)
+  await page.goto(`${BASE}/psp/ps/EMPLOYEE/HRMS/c/MAINTAIN_SECURITY.USERMAINT.GBL`);
+  await bar.waitFor();                                                   // recording resumed after the page load
+  await page.waitForFunction(() => /steps on USERMAINT/.test(document.querySelector('#psa-recbar').textContent));
+  await page.click('#PT_NAVBAR');                                        // portal header: not part of the task
+  const f = page.frameLocator('#ptifrmtgtframe');
+  await f.locator('#PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE').click();           // Find -> Add a New Value: becomes Action=A
+  await f.locator('#PTS_CFG_CL_WRK_PTS_ADD_BTN').waitFor();
   await f.locator('#PSOPRDEFN_SRCH_OPRID').fill('KUMAR');
   await f.locator('#PTS_CFG_CL_WRK_PTS_ADD_BTN').click();
-  await f.locator('#PSOPRDEFN_SYMBOLICID').selectOption('SYSADM1');  // after the full reload
+  await f.locator('#PSOPRDEFN_SYMBOLICID').selectOption('SYSADM1');      // after the frame's full reload
   await f.locator('#PSUSRPRFL_WRK_PTPSWDCLEARTXTINPT').fill('Rec0rdPw!');
   await f.locator('#PSUSRPRFL_WRK_PTPSWDCLEARTXTCONF').fill('Rec0rdPw!');
-  await f.locator('#ICTAB_1').click();                               // ID tab
+  await f.locator('#ICTAB_1').click();                                   // ID tab
   await f.locator('#OPRALIASTYPE_X').selectOption('EMP');
   await f.locator('[id="ATTRVAL_X$0"]').fill('KU0099');
-  await f.locator('[id="PSOPRDEFN_DVW_OPRDEFNDESC$0"]').click();     // focus: PS processes the EMPLID
+  await f.locator('[id="PSOPRDEFN_DVW_OPRDEFNDESC$0"]').click();         // focus: PS processes the EMPLID
   await page.waitForTimeout(800);
   await f.locator('[id="PSOPRDEFN_DVW_OPRDEFNDESC$0"]').fill('Kumar Raja');
-  await f.locator('#ICTAB_2').click();                               // Roles tab
+  await f.locator('#ICTAB_2').click();                                   // Roles tab
   await f.locator('[id="PSROLEUSER_VW_ROLENAME$0"]').fill('EMPLOYEE');
   await f.locator('[id="PSROLEUSER_VW$new$0$$0"]').click();
   await f.locator('[id="PSROLEUSER_VW_ROLENAME$1"]').fill('Manager');
   await f.locator('[id="#ICSave"]').click();
   await f.locator('#SAVED_win0').waitFor();
-  assert.equal((await saved(page)).OPRID, 'KUMAR');
-  await page.click('#psa-rec-done');
+  assert.equal((await saved(page, '#ptifrmtgtframe')).OPRID, 'KUMAR');
+  assert.match(await bar.innerText(), /13 steps on USERMAINT/);
+  await page.click('#psa-recbar-finish');
+  assert.equal(await bar.count(), 0);
 
   // Review card: Claude's suggestions, one changed by the teacher
   const review = page.locator('.psa-card', { hasText: 'Review the recorded task' });
@@ -137,6 +155,8 @@ test('record once by hand -> review -> save -> agent does it for a new user', as
   assert.match(yml, /^# Recorded with PSAgent teach mode by TESTER/);
   assert.match(yml, /when: emplid/);                     // ID tab only runs when an EMPLID is given
   assert.match(yml, /value: Employee/);                  // fixed value kept
+  assert.match(yml, /Action: A/);                        // the Find -> Add switch became the start mode
+  assert.ok(!yml.includes('PT_NAVBAR') && !yml.includes('Portal'), 'portal header or parameters leaked into the task');
   assert.ok(!yml.includes('Rec0rdPw'), 'recorded password leaked into the task');
 
   // Now the agent does it for a different user, using the recorded task

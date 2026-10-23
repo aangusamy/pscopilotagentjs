@@ -1,7 +1,7 @@
 /* ============================================================
    PEOPLESOFT AGENT WIDGET — chat + on-screen task automation
-   Paste at the BOTTOM of PTNUI_MENU_JS in App Designer
-   (instead of pscopilotagent.js, or alongside it).
+   Load it on every page: Branding Object (JavaScript) added under
+   Branding System Options > Additional JavaScript Objects.
 
    Talks to the Python agent service (agent-service/). The agent
    collects the values by chat, the user confirms, and this widget
@@ -9,18 +9,19 @@
    visible workspace frame, the way a person would.
 
    Teaching a new task: click "Record" in the chat header (shown to
-   users in PSAGENT_TEACHERS) or say "let me teach you ...". Do the
-   transaction once by hand, review the template, save. Done.
+   users in PSAGENT_TEACHERS) or say "let me teach you ...". Name the
+   task, then go to the page as usual and do it once, including Save.
+   A red bar follows you across pages; Finish, review, save. Done.
 
    Console helpers:
-     PSAgent.inspect()                         list fields on the workspace page
+     PSAgent.inspect()                         list fields on the current page
      PSAgent.teach('MENU.COMPONENT.GBL', {Action:'A'})
-                                               record and print the raw steps
+                                               start recording on that page
    ============================================================ */
 
 (function () {
 
-  var VERSION = '2026-10-23.1';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-10-23.2';   /* shown as PSAgent.version and in the console: check after uploading */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
@@ -61,8 +62,11 @@
   var MESSAGE_SELECTORS = [
     '#alertmsg', '#PTMSGBOXTEXT', '.PTMSGBOXTEXT', '#win0divPT_MSGBOX', '[class*="PTMSGBOX"]',
     '#PSPAGE_MSGTEXT', '#ERRMSGTEXT', '#PSWARNINGMSGTEXT', '.PSWARNINGMSGTEXT', '.PSERROREDITEMTEXT',
-    '.ps-exception-msg', '.ps_box-error', '.ps-alert-error'
+    '.ps-exception-msg', '.ps_box-error', '.ps-alert-error',
+    '#PTS_CRITTEXT_DISP'            /* 8.5x search page, e.g. "The value you tried to add already exists." */
   ];
+  /* PeopleSoft draws message boxes in the TOP window (#pt_modals), also for pages inside a frame */
+  var MODAL_SELECTORS = ['#pt_modals #alertmsg', '#pt_modals .popupText'];
 
   function isInput(el) {
     return !!el && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName) && el.type !== 'hidden';
@@ -166,15 +170,47 @@
     try { el.blur(); } catch (e) {}
   }
 
-  function psMessage(doc) {
-    for (var i = 0; i < MESSAGE_SELECTORS.length; i++) {
-      var els = doc.querySelectorAll(MESSAGE_SELECTORS[i]);
+  function firstVisibleText(doc, selectors) {
+    for (var i = 0; i < selectors.length; i++) {
+      var els = doc.querySelectorAll(selectors[i]);
       for (var j = 0; j < els.length; j++) {
         var t = (els[j].innerText || els[j].textContent || '').trim();
-        if (t && visible(els[j])) return t;
+        if (t && visible(els[j])) return { text: t, el: els[j] };
       }
     }
     return null;
+  }
+
+  /* A PeopleSoft message box open in the top window */
+  function modalMessage() { return firstVisibleText(document, MODAL_SELECTORS); }
+
+  /* Message PeopleSoft shows for the page in doc: on the page itself, or as a box in the top window */
+  function psMessage(doc) {
+    var m = (doc && firstVisibleText(doc, MESSAGE_SELECTORS)) || modalMessage();
+    return m ? m.text : null;
+  }
+
+  /* Close a message box whose only button is OK (after its text was captured).
+     Yes/No questions are left open for the person to answer. */
+  function dismissModal() {
+    var m = modalMessage();
+    if (!m) return false;
+    var box = (m.el.closest && (m.el.closest('[id^="ptMod_"]') || m.el.closest('#pt_modals'))) || document;
+    var btns = [].filter.call(box.querySelectorAll('input[type="button"],input[type="submit"],button'), function (b) {
+      return visible(b) && (b.value || b.textContent || '').trim();
+    });
+    if (btns.length !== 1 || !/^ok$/i.test((btns[0].value || btns[0].textContent).trim())) return false;
+    btns[0].click();
+    return true;
+  }
+
+  /* Fields PeopleSoft marked as wrong (red) */
+  function errorFields(doc) {
+    var out = [];
+    [].forEach.call(doc.querySelectorAll('input[class*="PSERROR"],select[class*="PSERROR"],textarea[class*="PSERROR"]'), function (el) {
+      if (visible(el)) out.push(labelOf(doc, el) || columnOf(el) || el.id);
+    });
+    return out;
   }
 
   function isProcessing(doc) {
@@ -359,6 +395,8 @@
       if (msg && !/saved/i.test(msg)) return Promise.reject(new Error(msg));
       var saved = doc.querySelector('#SAVED_win0,[id^="SAVED_"]');
       if (saved && visible(saved)) return Promise.resolve('Saved');
+      var bad = errorFields(doc);
+      if (bad.length) return Promise.reject(new Error('PeopleSoft marked these fields as invalid: ' + bad.join(', ')));
       return Promise.reject(new Error('No PeopleSoft error appeared, but the "Saved" confirmation was not seen. Please check the page.'));
     }
   };
@@ -386,6 +424,11 @@
   /* action = {run_id, title, component, steps}; secrets = {password: '...'}; ws = workspace */
   function runAction(action, secrets, ws) {
     var steps = action.steps || [], i = 0, frame = ws.frame, saved = false;
+    dismissModal();   /* a message box left over from earlier would be mistaken for this run's */
+    function fail(message, raw) {
+      dismissModal();
+      return { status: 'error', message: message, failed_step: describe(raw || {}) };
+    }
     function next() {
       if (ws.stopped) return Promise.resolve({ status: 'stopped', message: 'Stopped by the user', failed_step: describe(steps[i] || {}) });
       if (i >= steps.length) return Promise.resolve({ status: 'success', message: saved ? 'Saved' : 'Completed (no save step)' });
@@ -394,20 +437,22 @@
       try {
         step = JSON.parse(JSON.stringify(raw));
         step.value = fillSecrets(step.value, secrets);
-      } catch (e) { return Promise.resolve({ status: 'error', message: e.message, failed_step: describe(raw) }); }
+      } catch (e) { return Promise.resolve(fail(e.message, raw)); }
       var handler = STEPS[step['do']];
-      if (!handler) return Promise.resolve({ status: 'error', message: 'Unknown step ' + step['do'], failed_step: describe(raw) });
-      return handler(frame, step, action).then(function () {
+      if (!handler) return Promise.resolve(fail('Unknown step ' + step['do'], raw));
+      var run;
+      try { run = handler(frame, step, action); } catch (e) { run = Promise.reject(e); }
+      return run.then(function () {
         if (step['do'] === 'expect_saved') saved = true;
-        /* Any PS message box after a step means a human would stop and read it */
+        /* Any PS message after a step means a human would stop and read it */
         if (step['do'] !== 'navigate' && step['do'] !== 'expect_saved') {
-          var msg = frame.contentDocument && psMessage(frame.contentDocument);
-          if (msg) return { status: 'error', message: msg, failed_step: describe(raw) };
+          var msg = psMessage(frame.contentDocument);
+          if (msg) return fail(msg, raw);
         }
         i++;
         return next();
       }, function (err) {
-        return { status: 'error', message: (err && err.message) || String(err), failed_step: describe(raw) };
+        return fail((err && err.message) || String(err), raw);
       });
     }
     return next();
@@ -436,7 +481,11 @@
         frame: el.querySelector('#psa-ws-frame'),
         stopped: false,
         progress: function (n, total, text) { this.status('Step ' + n + '/' + total + ': ' + text); },
-        status: function (text) { el.querySelector('#psa-ws-status').textContent = text; },
+        status: function (text, isError) {
+          var st = el.querySelector('#psa-ws-status');
+          st.textContent = text;
+          st.className = isError ? 'psa-err' : '';
+        },
         done: function () { el.querySelector('#psa-ws-stop').style.display = 'none'; },
         extra: el.querySelector('#psa-ws-extra')
       };
@@ -464,7 +513,7 @@
   function labelOf(doc, el) {
     if (el.id) {
       var l = doc.querySelector('label[for="' + el.id.replace(/["\\]/g, '\\$&') + '"]');
-      if (l) return l.textContent.replace(/\s+/g, ' ').replace(/[\s:*]+$/, '').trim();
+      if (l) return l.textContent.replace(/\s+/g, ' ').replace(/^[\s*]+|[\s:*]+$/g, '').trim();
     }
     return el.getAttribute('aria-label') || el.title || '';
   }
@@ -480,7 +529,7 @@
       if (!row.querySelector('th,[role="columnheader"],td[class*="GRIDCOLUMNHDR"],td[class*="GridColumnHdr"]')) continue;
       var pos = 0;
       for (c = row.firstElementChild; c; c = c.nextElementSibling) {
-        if (pos === col) return c.textContent.replace(/\s+/g, ' ').trim();
+        if (pos === col) return c.textContent.replace(/\s+/g, ' ').replace(/^[\s*]+/, '').trim();   /* '*' marks required fields */
         pos += c.colSpan || 1;
       }
     }
@@ -521,91 +570,105 @@
     return isInput(el) && el.id && !/^(button|submit|reset|image|file)$/.test(el.type);
   }
 
-  /* opts = {title, component: {menu, component, market}, query}
-     Resolves with {title, component, query, steps} or null if cancelled.
-     Password values are never captured, only that a password was typed. */
-  function record(opts) {
-    var ws = openWorkspace('Recording: ' + opts.title);
-    var steps = [], snap = {}, finished = false, resolveFn;
-    ws.done();
-    ws.extra.innerHTML = '<div><strong>Do the task by hand below, including Save.</strong> Every value you enter is recorded '
-      + '(passwords are not). To make a list, such as roles, fill at least two rows.</div>'
-      + '<div style="margin-top:6px;display:flex;gap:8px;align-items:center"><span id="psa-rec-count">Nothing recorded yet</span>'
-      + '<button type="button" id="psa-rec-done">Finish recording</button><button type="button" id="psa-rec-cancel">Cancel</button></div>';
+  /* Recording follows the person through normal PeopleSoft navigation (NavBar, menus,
+     search pages). The widget is loaded on every page, so the recording lives in
+     sessionStorage and resumes after each page load. Password values are never
+     captured, only that a password was typed. */
 
-    function update() {
-      var last = steps[steps.length - 1];
-      ws.extra.querySelector('#psa-rec-count').textContent = steps.length + ' steps recorded' + (last ? ' (last: ' + describe(last) + ')' : '');
+  var REC_KEY = 'psagent.rec';
+  /* Homepages, NavBar and portal pages are navigation only: nothing to record there */
+  var FRAMEWORK_MENU = /^(NUI_FRAMEWORK|PT_FLDASHBOARD|PTPP_PORTAL|PORTAL_ADMIN)$/i;
+
+  function recLoad() { try { return JSON.parse(sessionStorage.getItem(REC_KEY)); } catch (e) { return null; } }
+  function recSave(rec) {
+    try { if (rec) sessionStorage.setItem(REC_KEY, JSON.stringify(rec)); else sessionStorage.removeItem(REC_KEY); } catch (e) {}
+  }
+  function isSet(st) { return st['do'] === 'set'; }
+  function isFrameworkPage(comp) { return !!comp && FRAMEWORK_MENU.test(comp.menu); }
+
+  /* {component, query} of a PeopleSoft component URL; portal and internal parameters dropped */
+  function parseComponentUrl(href) {
+    var m = String(href || '').match(/\/ps[cp]\/[^\/]+\/[^\/]+\/[^\/]+\/c\/([^?#\/]+)(?:\?([^#]*))?/i);
+    if (!m) return null;
+    var p = m[1].split('.');
+    if (p.length < 2 || !/^[A-Z0-9_]+$/i.test(p[0]) || !/^[A-Z0-9_]+$/i.test(p[1])) return null;
+    var query = {};
+    (m[2] || '').split('&').forEach(function (kv) {
+      if (!kv) return;
+      var i = kv.indexOf('='), k, v;
+      try { k = decodeURIComponent(i < 0 ? kv : kv.slice(0, i)); v = i < 0 ? '' : decodeURIComponent(kv.slice(i + 1).replace(/\+/g, ' ')); }
+      catch (e) { return; }
+      if (!/^(Portal|NoCrumbs|IC|cmd$|nav|FolderPath|IsFolder)/i.test(k)) query[k] = v;
+    });
+    return { component: { menu: p[0].toUpperCase(), component: p[1].toUpperCase(), market: (p[2] || 'GBL').toUpperCase() }, query: query };
+  }
+
+  /* Where the transaction is shown: the classic content frame when the page has one (also
+     while it is still loading), otherwise the page itself (Fluid) */
+  function workTarget() {
+    var fr = getContentFrameEl();
+    if (fr) {
+      try { return { win: fr.contentWindow, doc: fr.contentDocument, frame: fr }; } catch (e) { return { win: null, doc: null, frame: fr }; }
     }
-    function setStep(doc, el) {
+    return { win: window, doc: document, frame: null };
+  }
+
+  /* Record what the person does on doc into rec.steps; changed() runs after each step */
+  function attachRecorder(doc, rec, changed) {
+    if (doc._psaRec) return;
+    var snap = {};
+    function ignored(el) {
+      /* the agent's own UI, PeopleSoft's header/NavBar and message boxes are not part of the task */
+      return /^PT_/.test(el.id || '')
+        || !!(el.closest && el.closest('[id^="psa-"],#pt_modals,#PT_HEADER,#pthdr2container,#PT_NAVBAR,.ps_header'));
+    }
+    function snapshot() {
+      snap = {};
+      doc.querySelectorAll('input,select,textarea').forEach(function (el) {
+        if (recordable(el) && kindOf(el) !== 'password' && !ignored(el)) snap[el.id] = valueOf(el);
+      });
+    }
+    function setStep(el) {
       var field = { id: el.id, label: labelOf(doc, el) };
       if (/\$\d+$/.test(el.id)) { var col = columnOf(el); if (col) field.column = col; }
       var step = { 'do': 'set', field: field, kind: kindOf(el), value: valueOf(el) };
-      var last = steps[steps.length - 1];
-      if (last && last['do'] === 'set' && last.field.id === el.id) steps[steps.length - 1] = step;
-      else steps.push(step);
+      var last = rec.steps[rec.steps.length - 1];
+      if (last && last['do'] === 'set' && last.field.id === el.id) rec.steps[rec.steps.length - 1] = step;
+      else rec.steps.push(step);
       if (step.kind !== 'password') snap[el.id] = step.value;
-      update();
-    }
-    function snapshot(doc) {
-      snap = {};
-      doc.querySelectorAll('input,select,textarea').forEach(function (el) {
-        if (recordable(el) && kindOf(el) !== 'password') snap[el.id] = valueOf(el);
-      });
+      changed();
     }
     /* Values set by script (lookup prompts, calendars) fire no change event: diff instead */
-    function diff(doc) {
+    function diff() {
+      if (rec.stopped) return;
       doc.querySelectorAll('input,select,textarea').forEach(function (el) {
-        if (recordable(el) && kindOf(el) !== 'password' && el.id in snap && valueOf(el) !== snap[el.id]) setStep(doc, el);
+        if (recordable(el) && kindOf(el) !== 'password' && el.id in snap && valueOf(el) !== snap[el.id]) setStep(el);
       });
     }
-    function attach() {
-      var doc = ws.frame.contentDocument;
-      if (!doc || doc._psaRec) return;
-      doc._psaRec = true;
-      snapshot(doc);
-      doc.addEventListener('change', function (e) { if (!finished && recordable(e.target)) setStep(doc, e.target); }, true);
-      doc.addEventListener('click', function (e) {
-        var el = !finished && e.target.closest && e.target.closest('a,button,input[type="button"],input[type="submit"]');
-        if (!el || /\$(new|delete|prompt)\$|\$prompt$/i.test(el.id)) return;   /* grid +/- and lookups: replayed by grid steps */
-        diff(doc);
-        var text = (el.tagName === 'INPUT' ? el.value : el.textContent).replace(/\s+/g, ' ').trim();
-        if (/^(ICTAB|PSTAB)/.test(el.id) || /tab/i.test(el.parentElement && el.parentElement.className)) steps.push({ 'do': 'tab', label: text });
-        else if (el.id || text) steps.push({ 'do': 'click', button: { id: el.id || undefined, text: text || undefined } });
-        update();
-        /* Re-baseline once PeopleSoft has processed, so values it re-renders are not recorded */
-        sleep(RUN.afterActionMs).then(function () { return waitIdle(ws.frame, RUN.stepTimeout); })
-          .then(function (d) { if (d === ws.frame.contentDocument) snapshot(d); }, function () {});
-      }, true);
-    }
-    function finish(result) {
-      if (finished) return;
-      finished = true;
-      ws.frame.removeEventListener('load', attach);
-      ws.onClose = null;
-      resolveFn(result);
-    }
-
-    ws.frame.addEventListener('load', attach);
-    ws.frame.src = componentUrl(opts.component, opts.query);
-    return new Promise(function (resolve) {
-      resolveFn = resolve;
-      ws.onClose = function () { finish(null); };
-      ws.extra.querySelector('#psa-rec-cancel').addEventListener('click', function () { ws.el.style.display = 'none'; finish(null); });
-      ws.extra.querySelector('#psa-rec-done').addEventListener('click', function () {
-        try { if (ws.frame.contentDocument) diff(ws.frame.contentDocument); } catch (e) {}
-        ws.extra.innerHTML = '';
-        ws.status('Recording finished: ' + steps.length + ' steps');
-        finish({ title: opts.title, component: opts.component, query: opts.query || {}, steps: steps });
-      });
-    });
-  }
-
-  /* Console: PSAgent.teach('MENU.COMPONENT.GBL', {Action: 'A'}) prints the raw recording */
-  function teach(component, query) {
-    var parts = String(component).split('.');
-    return record({ title: component, component: { menu: parts[0], component: parts[1], market: parts[2] || 'GBL' }, query: query })
-      .then(function (rec) { if (rec) console.log(JSON.stringify(rec, null, 2)); return rec; });
+    doc._psaRec = { diff: diff };
+    snapshot();
+    doc.addEventListener('change', function (e) {
+      if (!rec.stopped && recordable(e.target) && !ignored(e.target)) setStep(e.target);
+    }, true);
+    doc.addEventListener('click', function (e) {
+      if (rec.stopped) return;
+      var el = e.target.closest && e.target.closest('a,button,input[type="button"],input[type="submit"]');
+      if (!el || ignored(el) || /\$(new|delete|prompt)\$|\$prompt$/i.test(el.id)) return;   /* grid +/- and lookups: replayed by grid steps */
+      diff();
+      var text = (el.tagName === 'INPUT' ? el.value : el.textContent).replace(/\s+/g, ' ').trim();
+      /* The search page's mode switch becomes the task's start mode */
+      if (!rec.steps.some(isSet) && /^(add a new value|find an existing value)$/i.test(text)) {
+        rec.query = rec.query || {};
+        rec.query.Action = /^add/i.test(text) ? 'A' : 'U';
+        changed();
+        return;
+      }
+      if (/^(ICTAB|PSTAB)/.test(el.id) || /tab/i.test(el.parentElement && el.parentElement.className)) rec.steps.push({ 'do': 'tab', label: text });
+      else if (el.id || text) rec.steps.push({ 'do': 'click', button: { id: el.id || undefined, text: text || undefined } });
+      changed();
+      /* Re-baseline once PeopleSoft has redrawn the page, so values it fills in itself are not recorded */
+      setTimeout(function () { try { if (!rec.stopped) snapshot(); } catch (e2) {} }, 2500);
+    }, true);
   }
 
   /* ============================================================
@@ -677,10 +740,18 @@
       + '#psa-ws{position:fixed;top:16px;left:16px;right:420px;bottom:16px;display:none;flex-direction:column;background:#fff;border:2px solid #0078d4;border-radius:12px;overflow:hidden;z-index:2147483644;box-shadow:0 8px 40px rgba(0,0,0,.25);font-family:Segoe UI,sans-serif;font-size:13px;}'
       + '#psa-ws-hdr{display:flex;align-items:center;gap:10px;padding:8px 12px;background:#003865;color:#fff;}'
       + '#psa-ws-status{flex:1;opacity:.9;}'
+      + '#psa-ws-status.psa-err{opacity:1;background:#c0392b;padding:2px 8px;border-radius:4px;}'
       + '#psa-ws-hdr button{background:rgba(255,255,255,.2);border:none;color:#fff;border-radius:6px;cursor:pointer;padding:4px 10px;}'
       + '#psa-ws-extra:not(:empty){padding:8px 12px;background:#fff8e1;border-bottom:1px solid #f0d58a;}'
       + '#psa-ws-frame{flex:1;border:none;width:100%;}'
-      + '#psa-panel *:focus,#psa-ws *:focus{outline:3px solid #003865;outline-offset:2px;}';
+      + '#psa-recbar{position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:2147483647;display:flex;align-items:center;gap:10px;'
+      + 'max-width:calc(100vw - 32px);padding:8px 12px;background:#b42318;color:#fff;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.3);font:13px Segoe UI,sans-serif;}'
+      + '#psa-recbar .psa-recdot{flex:0 0 auto;width:10px;height:10px;border-radius:50%;background:#fff;animation:psaBlink 1.2s infinite;}'
+      + '@keyframes psaBlink{50%{opacity:.25;}}'
+      + '#psa-recbar-status{opacity:.95;}'
+      + '#psa-recbar button{flex:0 0 auto;height:auto!important;margin:0!important;padding:4px 10px!important;border:none;border-radius:6px;cursor:pointer;font:600 12px Segoe UI,sans-serif;background:#fff!important;color:#b42318!important;}'
+      + '#psa-recbar button.psa-rec-cancel{background:rgba(255,255,255,.2)!important;color:#fff!important;}'
+      + '#psa-panel *:focus,#psa-ws *:focus,#psa-recbar *:focus{outline:3px solid #003865;outline-offset:2px;}';
     var st = document.createElement('style');
     st.id = 'psa-styles';
     st.textContent = css;
@@ -847,7 +918,7 @@
 
     var pendingSecrets = {};  /* run_id -> secrets, kept only in memory until the run ends */
 
-    /* ---- Recording: pick the page, record, review, save ---- */
+    /* ---- Recording: name the task, then the person does it in PeopleSoft as usual ---- */
 
     function parsePage(text) {
       var t = String(text || '').trim(), m = t.match(/\/c\/([^?#\/]+)/i) || [null, t];
@@ -869,34 +940,136 @@
 
     function showRecordCard(offer) {
       var pg = pageContext();
-      var here = pg.menu && pg.component ? pg.menu + '.' + pg.component + '.' + (pg.market || 'GBL') : '';
+      var here = pg.menu && pg.component && !isFrameworkPage(pg) ? pg.menu + '.' + pg.component + '.' + (pg.market || 'GBL') : '';
       var c = card('<h4>Record a new task</h4>'
         + '<label>Task name<input data-k="title" placeholder="e.g. Create Requisition" value="' + esc(offer && offer.title || '') + '"></label>'
-        + '<label>PeopleSoft page<input data-k="page" placeholder="MENU.COMPONENT.GBL or paste the page URL" value="' + esc(here) + '"></label>'
+        + '<label>PeopleSoft page (optional)<input data-k="page" placeholder="Leave empty and navigate there yourself" value="' + esc(here) + '"></label>'
         + '<label>Start in<select data-k="mode"><option value="A">Add a New Value</option><option value="U">Find an Existing Value</option>'
         + '<option value="">The page as it opens</option></select></label>'
-        + '<small>I will open the page in the workspace. Do the task once by hand, including Save, then click Finish recording.</small>'
+        + '<small data-k="hint">After Start, go to the page the way you normally do (NavBar, menu, search) and do the task once, '
+        + 'including Save. A red bar at the top shows what is recorded; click Finish recording there.</small>'
         + '<div class="psa-actions"><button type="button" class="psa-ok">Start recording</button><button type="button" class="psa-no">Cancel</button></div>');
-      var ok = c.querySelector('.psa-ok');
+      var ok = c.querySelector('.psa-ok'), hint = c.querySelector('[data-k="hint"]'), hintText = hint.textContent;
+      var mode = c.querySelector('[data-k="mode"]');
       function get(k) { return c.querySelector('[data-k="' + k + '"]').value; }
-      function refresh() { ok.disabled = !get('title').trim() || !parsePage(get('page')); }
+      function refresh() {
+        var text = get('page').trim(), comp = parsePage(text);
+        hint.textContent = !text ? hintText
+          : !comp ? 'Type MENU.COMPONENT.GBL (e.g. MAINTAIN_SECURITY.USERMAINT.GBL), paste the page URL, or leave it empty.'
+          : isFrameworkPage(comp) ? 'That is a homepage or navigation page. Leave this empty and navigate to the transaction yourself after Start.'
+          : hintText;
+        mode.disabled = !comp || isFrameworkPage(comp);
+        ok.disabled = !get('title').trim() || (!!text && (!comp || isFrameworkPage(comp)));
+      }
       c.querySelectorAll('input').forEach(function (i) { i.addEventListener('input', refresh); });
       refresh();
       c.querySelector('.psa-no').addEventListener('click', function () { disable(c); });
       ok.addEventListener('click', function () {
-        var opts = { title: get('title').trim(), component: parsePage(get('page')), query: get('mode') ? { Action: get('mode') } : {} };
+        var comp = parsePage(get('page'));
+        var rec = { title: get('title').trim(), steps: [], component: null, query: {} };
+        if (comp && !isFrameworkPage(comp)) {
+          rec.component = comp;
+          if (get('mode')) rec.query.Action = get('mode');
+        }
         disable(c);
-        record(opts).then(function (rec) {
-          if (!rec) { addMsg('bot', 'Recording cancelled.', false); return; }
-          if (!rec.steps.some(function (st) { return st['do'] === 'set'; })) {
-            addMsg('bot', 'Nothing was entered during the recording, so there is nothing to learn. Try again and type the values on the page.', false);
-            return;
-          }
-          var t = typing();
-          return api('/api/recordings/draft', { recording: rec })
-            .then(function (r) { t.remove(); showReviewCard(rec, r.draft); },
-                  function (e) { t.remove(); addMsg('bot', 'I could not build a template from that recording: ' + e.message, false); });
+        startRecording(rec);
+      });
+    }
+
+    var recBar = null, recording = null, recTimer = null;
+
+    function startRecording(rec) {
+      recSave(rec);
+      addMsg('bot', 'Recording **' + rec.title + '**. '
+        + (rec.component ? 'Opening the page.' : 'Go to the page for this task the way you normally do.')
+        + ' Do the task once by hand, including Save, then click **Finish recording** in the red bar at the top.');
+      close();
+      resumeRecording();
+      if (rec.component) location.href = componentUrl(rec.component, rec.query).replace('/psc/', '/psp/');
+    }
+
+    function resumeRecording() {
+      recording = recLoad();
+      if (!recording) return;
+      if (!recBar) {
+        recBar = document.createElement('div');
+        recBar.id = 'psa-recbar';
+        recBar.setAttribute('role', 'status');
+        recBar.innerHTML = '<span class="psa-recdot" aria-hidden="true"></span><strong id="psa-recbar-title"></strong>'
+          + '<span id="psa-recbar-status"></span>'
+          + '<button type="button" id="psa-recbar-finish">Finish recording</button>'
+          + '<button type="button" id="psa-recbar-cancel" class="psa-rec-cancel">Cancel</button>';
+        document.body.appendChild(recBar);
+        recBar.querySelector('#psa-recbar-finish').addEventListener('click', finishRecording);
+        recBar.querySelector('#psa-recbar-cancel').addEventListener('click', function () {
+          stopRecording();
+          open();
+          addMsg('bot', 'Recording cancelled.', false);
         });
+      }
+      recBar.querySelector('#psa-recbar-title').textContent = 'Recording: ' + recording.title;
+      recordingTick();
+      clearInterval(recTimer);
+      recTimer = setInterval(recordingTick, 400);
+    }
+
+    function recordingChanged() { recSave(recording); updateRecBar(); }
+
+    function updateRecBar() {
+      if (!recBar || !recording) return;
+      var r = recording, last = r.steps[r.steps.length - 1];
+      recBar.querySelector('#psa-recbar-status').textContent =
+        !r.component ? 'Go to the page for this task (NavBar or menu) and do it once, including Save.'
+        : r.offPage ? 'You left ' + r.component.component + '. A task covers one page: go back, or finish.'
+        : r.steps.length + ' steps on ' + r.component.component + (last ? ' · last: ' + describe(last) : ' · waiting for your first entry');
+    }
+
+    /* Follow the person: find the transaction page and attach to each new document */
+    function recordingTick() {
+      var r = recording;
+      if (!r) return;
+      var t = workTarget(), info = null;
+      if (t.frame && !t.frame._psaRecHook) {           /* attach the moment each new page loads in the frame */
+        t.frame._psaRecHook = true;
+        t.frame.addEventListener('load', function () { setTimeout(recordingTick, 0); });
+      }
+      try { info = t.doc && t.doc.readyState !== 'loading' && parseComponentUrl(t.win.location.href); } catch (e) {}
+      if (info && !isFrameworkPage(info.component)) {
+        var same = !!r.component && r.component.menu === info.component.menu && r.component.component === info.component.component;
+        if (!same && r.component && r.steps.some(isSet)) {
+          if (!r.offPage) { r.offPage = true; recordingChanged(); }
+        } else {
+          if (!same) { r.component = info.component; r.query = info.query; r.steps = []; }
+          r.offPage = false;
+          if (!t.doc._psaRec) { attachRecorder(t.doc, r, recordingChanged); recordingChanged(); }
+        }
+      }
+      updateRecBar();
+    }
+
+    function stopRecording() {
+      if (recording) recording.stopped = true;
+      recording = null;
+      recSave(null);
+      clearInterval(recTimer);
+      if (recBar) { recBar.remove(); recBar = null; }
+    }
+
+    function finishRecording() {
+      var r = recording;
+      try { var d = workTarget().doc; if (d._psaRec) d._psaRec.diff(); } catch (e) {}
+      stopRecording();
+      open();
+      if (!r || !r.component || !r.steps.some(isSet)) {
+        addMsg('bot', 'Nothing was entered on a transaction page, so there is nothing to learn. Click **Record** and try again: '
+          + 'go to the page and type the values there.', false);
+        return;
+      }
+      var rec = { title: r.title, component: r.component, query: r.query || {}, steps: r.steps };
+      ensureConfig().then(function () {
+        var t = typing();
+        return api('/api/recordings/draft', { recording: rec }).then(function (res) { t.remove(); showReviewCard(rec, res.draft); },
+          function (e) { t.remove(); addMsg('bot', 'I could not build a template from that recording: ' + e.message, false); });
       });
     }
 
@@ -953,12 +1126,21 @@
       var secrets = pendingSecrets[action.run_id] || {};
       delete pendingSecrets[action.run_id];
       var ws = openWorkspace('Agent: ' + action.title);
-      return runAction(action, secrets, ws).then(function (res) {
+      return runAction(action, secrets, ws).catch(function (e) {
+        return { status: 'error', message: 'The agent hit an unexpected problem: ' + ((e && e.message) || e) };
+      }).then(function (res) {
         secrets = null;
         ws.done();
-        ws.status(res.status === 'success' ? 'Done: ' + action.title : (res.status === 'stopped' ? 'Stopped' : 'Stopped: ' + res.message));
-        return api('/api/result', { session_id: state.sessionId, run_id: action.run_id, status: res.status, message: res.message, failed_step: res.failed_step });
-      }).then(function (r) { return handleReply(r); });
+        if (res.status === 'success') ws.status('Done: ' + action.title);
+        else if (res.status === 'stopped') ws.status('Stopped', true);
+        else ws.status('Stopped at "' + (res.failed_step || 'a step') + '": ' + res.message, true);
+        /* Show PeopleSoft's own words right away; the agent's explanation follows */
+        if (res.status === 'error') addMsg('bot', '⚠️ Stopped at **' + (res.failed_step || 'a step') + '**. PeopleSoft says:\n\n' + res.message);
+        var t = typing();
+        return api('/api/result', { session_id: state.sessionId, run_id: action.run_id, status: res.status, message: res.message, failed_step: res.failed_step })
+          .then(function (r) { t.remove(); return handleReply(r); },
+                function (e) { t.remove(); addMsg('bot', 'I could not report the result to the agent service: ' + e.message, false); });
+      });
     }
 
     function open() {
@@ -1006,6 +1188,13 @@
     document.addEventListener('keydown', function (e) {
       if (e.key === 'Escape' && panel.classList.contains('psa-open')) close();
     });
+
+    window.PSAgent.teach = function (component, query) {
+      var comp = parsePage(component);
+      if (!comp) throw new Error('Use MENU.COMPONENT.GBL');
+      startRecording({ title: comp.component, steps: [], component: comp, query: query || {} });
+    };
+    resumeRecording();   /* a recording started on an earlier page continues here */
   }
 
   /* ============================================================
@@ -1060,8 +1249,6 @@
   window.PSAgent = {
     version: VERSION,
     inspect: inspect,
-    teach: teach,
-    record: record,
     run: function (action, secrets) { return runAction(action, secrets || {}, openWorkspace('Agent: ' + (action.title || 'test'))); }
   };
 

@@ -104,14 +104,18 @@ Do the transaction once by hand and the agent can do it from then on:
 
 1. Click **Record** in the chat header (only shown to `PSAGENT_TEACHERS`), or
    type *"let me teach you how to create a requisition"*.
-2. Name the task and pick the page. The page you are on is filled in, or you can
-   paste its URL or `MENU.COMPONENT.GBL`. Choose Add or Find mode.
-3. The page opens in the workspace. **Do the task by hand, including Save**, and
-   click **Finish recording**.
+2. Name the task. The page is optional: leave it empty and click **Start recording**.
+3. A red bar appears at the top. **Go to the page the way you normally do** (NavBar,
+   menu, search) and do the task once by hand, including Save. The bar follows you
+   across page loads and counts the steps; click **Finish recording** in it.
    * Every value you type, pick or tick is recorded. That includes values a
      lookup fills in.
    * Password fields are recorded as "a password goes here", never the value.
+   * Switching the search page to "Add a New Value" becomes the task's start mode.
+   * The NavBar, header and message boxes are not part of the task.
    * To make a list (roles, requisition lines), fill **at least two rows**.
+   * A task covers one page (component). If you move to another one with values
+     already entered, the bar says so; go back or finish.
 4. On the review card, Claude suggests how to treat each recorded value. Change
    any of them, then click **Save task**:
    * **Ask every time**: for IDs, names, amounts and dates.
