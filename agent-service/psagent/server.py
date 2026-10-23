@@ -191,10 +191,28 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
     )
 
 
+def load_dotenv(path):
+    """Read KEY=VALUE lines into os.environ. Variables already set win."""
+    path = Path(path)
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and value:
+            os.environ.setdefault(key, value)
+
+
 def app_from_env():
     """Entry point for uvicorn: `uvicorn --factory psagent.server:app_from_env`."""
     from .llm import ClaudeLLM  # noqa: PLC0415
 
+    load_dotenv(os.environ.get("PSAGENT_ENV_FILE", Path(__file__).resolve().parent.parent / ".env"))
     logging.basicConfig(level=os.environ.get("PSAGENT_LOG_LEVEL", "INFO"))
     secret = os.environ.get("PSAGENT_SHARED_SECRET", "")
     dev_oprid = os.environ.get("PSAGENT_DEV_OPRID") or None

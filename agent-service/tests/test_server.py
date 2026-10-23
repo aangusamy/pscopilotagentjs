@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -6,7 +8,7 @@ from starlette.testclient import TestClient
 
 from psagent import auth
 from psagent.agent import Agent
-from psagent.server import create_app
+from psagent.server import create_app, load_dotenv
 from psagent.tasks import load_tasks
 
 from fakes import FakeLLM, response, text, tool
@@ -31,6 +33,24 @@ class AuthTest(unittest.TestCase):
                     auth.make_token(SECRET, "A|B")]:
             with self.assertRaises(auth.AuthError, msg=bad):
                 auth.verify(bad, SECRET)
+
+
+class DotenvTest(unittest.TestCase):
+    def test_load(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, ".env")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write('# comment\nPSA_T_A=one\nPSA_T_B = "two words"\nPSA_T_EMPTY=\nPSA_T_SET=file\n')
+            os.environ["PSA_T_SET"] = "env"
+            try:
+                load_dotenv(p)
+                self.assertEqual(os.environ["PSA_T_A"], "one")
+                self.assertEqual(os.environ["PSA_T_B"], "two words")
+                self.assertNotIn("PSA_T_EMPTY", os.environ)        # blank = not set
+                self.assertEqual(os.environ["PSA_T_SET"], "env")    # real environment wins
+            finally:
+                for k in ("PSA_T_A", "PSA_T_B", "PSA_T_SET"):
+                    os.environ.pop(k, None)
 
 
 class ServerTest(unittest.TestCase):

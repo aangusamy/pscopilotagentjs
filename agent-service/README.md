@@ -40,11 +40,12 @@ Design points:
 ```bash
 cd agent-service
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=...              # Claude API key
-export PSAGENT_SHARED_SECRET=...          # same as &AGENT_SECRET in the iScript
-export PSAGENT_ALLOWED_ORIGINS=https://your-peoplesoft-host
+cp .env.example .env                      # then fill in the API key, secret and origin
 uvicorn --factory psagent.server:app_from_env --host 0.0.0.0 --port 8080 --workers 1
 ```
+
+Settings are read from `agent-service/.env` (see `.env.example`); real
+environment variables take precedence.
 
 | Variable | Default | |
 |---|---|---|
