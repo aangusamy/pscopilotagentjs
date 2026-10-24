@@ -320,7 +320,8 @@ def app_from_env():
     if dev_oprid:
         log.warning("PSAGENT_DEV_OPRID=%s: requests without a valid token run as this user. Never use in production.", dev_oprid)
     tasks_dir = os.environ.get("PSAGENT_TASKS_DIR", str(Path(__file__).resolve().parent.parent / "tasks"))
-    origins = [o.strip() for o in os.environ.get("PSAGENT_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    # Browsers send the origin without a trailing slash: "http://host:8000/" would never match
+    origins = [o.strip().rstrip("/") for o in os.environ.get("PSAGENT_ALLOWED_ORIGINS", "").split(",") if o.strip()]
     teachers = {t.strip() for t in os.environ.get("PSAGENT_TEACHERS", "").split(",") if t.strip()}
     log.info("Allowed browser origins (PSAGENT_ALLOWED_ORIGINS): %s", origins or "none: only same-origin calls (reverse proxy) will work")
     log.info("Teachers (PSAGENT_TEACHERS): %s", sorted(teachers) or "none: recording is off")
