@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 from . import live as livemode
 from .db import QueryError
+from .security import AccessChecker, apply_goal
 from .troubleshoot import Troubleshooter
 from .llm import LLMError
 
@@ -64,7 +65,11 @@ you to do it live, figure it out yourself, or not use the recorded task. Gather 
 details; you can ask for more during the run. For questions (not actions), \
 just answer. When the user asks why a process failed or to troubleshoot a \
 process instance (or "my last failed process"), call troubleshoot_process: it \
-investigates the message log, log files, code and data and shows a diagnosis. Users allowed to teach can also add tasks: when a user wants to \
+investigates the message log, log files, code and data and shows a diagnosis. \
+When the user asks why someone (or they themselves) cannot open, see or use a \
+page, call check_user_access: it walks that user's security (roles, permission \
+lists, pages, menu link, row security) and shows the missing access and the \
+smallest fix. Never grant access yourself. Users allowed to teach can also add tasks: when a user wants to \
 teach or record a new task, call offer_recording. They then do the task \
 once by hand while the widget records it, review the template and save it. New \
 or updated tasks are announced to you in system messages during the conversation.
@@ -204,6 +209,18 @@ def build_tools():
             ["instance", "question"],
         ),
         _strict(
+            "check_user_access",
+            "Find out why a user cannot open or use a page: user profile, roles, permission lists, pages and "
+            "actions, menu link and row security (read-only), then show the missing access and the smallest fix. "
+            "Only for security administrators.",
+            {
+                "user": {"type": "string", "description": "The user ID (OPRID) whose access to check"},
+                "page": {"type": "string", "description": "The page as the user named it, e.g. 'Create Job Opening'"},
+                "question": {"type": "string", "description": "What the user wants to know, in their words"},
+            },
+            ["user", "page", "question"],
+        ),
+        _strict(
             "offer_recording",
             "Show the Record card so the user can teach a new task by doing it once by hand.",
             {"title": {"type": "string", "description": "Short task title starting with a verb, e.g. 'Create Requisition'"}},
@@ -254,7 +271,8 @@ class Session:
     live: livemode.LiveRun | None = None  # live run in progress
     unsure: dict = field(default_factory=dict)   # field name -> note, for the active task
     batch: dict | None = None                    # {task, items: [{label, values, unsure}]} being prepared
-    investigation: object | None = None          # troubleshoot.Investigation in progress
+    investigation: object | None = None          # troubleshoot.Investigation / security.AccessInvestigation in progress
+    security_fixes: dict = field(default_factory=dict)   # access check run_id -> proposed fix (applied only on request)
     can_teach: bool = False
     system: str | None = None  # frozen at the first turn so the prompt prefix never changes
     known: dict | None = None  # task_id -> signature the model has been told about
@@ -289,10 +307,16 @@ class SessionStore:
 
 
 class Agent:
-    def __init__(self, llm, tasks, db=None, troubleshoot_effort="medium"):
+    def __init__(self, llm, tasks, db=None, troubleshoot_effort="medium", security_admins=(), security_roles=None):
+        """security_admins: OPRIDs allowed to check access ("*" = everyone); security_roles: roles that make a user
+        a security admin (default: Security Administrator, PeopleSoft Administrator)."""
         self.llm = llm
         self.operator = livemode.LiveOperator(llm)
         self.troubleshooter = Troubleshooter(llm, db, troubleshoot_effort) if db is not None else None
+        self.access = None
+        if db is not None:
+            roles = security_roles if security_roles is not None else ("Security Administrator", "PeopleSoft Administrator")
+            self.access = AccessChecker(llm, db, troubleshoot_effort, security_admins, roles)
         self.tasks = dict(tasks)
         self.tools = build_tools()
         self._tasks_lock = threading.Lock()
@@ -461,6 +485,8 @@ class Agent:
         inv = s.investigation
         if not inv or inv.run_id != run_id or not self.troubleshooter:
             return {"steps": [], "done": True, "diagnosis": None, "error": "This investigation is no longer active."}
+        if getattr(inv, "kind", "") == "security":
+            return self._access_step(s, inv)
         out = self.troubleshooter.step(inv, s.oprid, logs)
         if out.get("done"):
             s.investigation = None
@@ -472,6 +498,44 @@ class Agent:
             log.info("troubleshoot %s of %s for %s: %s", inv.run_id, inv.instance, s.oprid,
                      (d or {}).get("summary") or out.get("error"))
         return out
+
+    def _access_step(self, s, inv):
+        if not self.access.is_admin(s.oprid):
+            s.investigation = None
+            return {"steps": [], "done": True, "diagnosis": None, "error": "Only security administrators can check access."}
+        out = self.access.step(inv, s.oprid)
+        if out.get("done"):
+            s.investigation = None
+            d = out.get("diagnosis")
+            if d:
+                d["run_id"] = inv.run_id
+                if d["can_apply"]:
+                    s.security_fixes = {**dict(list(s.security_fixes.items())[-4:]), inv.run_id: d["fix"]}
+            note = (f"[access check result] {inv.user} / {inv.target}: " + json.dumps(
+                {k: d[k] for k in ("verdict", "confidence", "summary", "missing", "fix", "alternatives", "after_fix")})
+                if d else f"[access check result] {inv.user} / {inv.target}: {out.get('error') or 'no diagnosis'}")
+            s.messages.append({"role": "user", "content": note[:6000]})
+            log.info("access check %s of %s / %s for %s: %s", inv.run_id, inv.user, inv.target, s.oprid,
+                     (d or {}).get("summary") or out.get("error"))
+        return out
+
+    def apply_security_fix(self, s, run_id):
+        """Start a live run that makes the proposed correction; the admin approves Save on screen.
+        -> {"live": {...}} or {"error": ...}"""
+        if not self.access or not self.access.is_admin(s.oprid):
+            return {"error": "Only security administrators can change security."}
+        fix = s.security_fixes.get(run_id)
+        goal = apply_goal(fix) if fix else None
+        if not goal:
+            return {"error": "There is no correction to apply for this check."}
+        run = livemode.new_run(goal[0], goal[1] + " Do not grant anything else.")
+        s.live, s.pending = run, None
+        s.running = {"run_id": run.run_id, "task_id": "security fix"}
+        s.messages.append({"role": "user", "content": (
+            f"[event] The admin clicked Apply on the access check {run_id}. You are making this change live as run "
+            f"{run.run_id}: {goal[0]}. The admin approves the save on screen.")})
+        log.info("security fix %s by %s: %s", run.run_id, s.oprid, goal[0])
+        return {"live": {"run_id": run.run_id, "goal": run.goal}}
 
     def report(self, s, run_id, status, message, failed_step=None):
         if not s.running or s.running["run_id"] != run_id:
@@ -623,6 +687,23 @@ class Agent:
             return {"started": True, "instance": instance,
                     "note": "The investigation runs now and the user sees each step and the diagnosis card. "
                             "Tell them in one short sentence that you are looking into it."}, False
+
+        if name == "check_user_access":
+            if not self.access:
+                return {"error": "checking access needs read-only database access; an administrator sets PSAGENT_DB_* "
+                                 "in the agent service settings"}, True
+            if not self.access.is_admin(s.oprid):
+                return {"error": "only security administrators can check users' access; tell the user to ask their "
+                                 "security administrator"}, True
+            user, page = str(args.get("user") or "").strip(), str(args.get("page") or "").strip()
+            if not user or not page:
+                return {"error": "ask which user and which page"}, True
+            inv = self.access.begin(user, page, args.get("question") or "")
+            s.investigation = inv
+            reply.troubleshoot = {"run_id": inv.run_id, "kind": "security", "user": inv.user, "target": inv.target,
+                                  "title": f"Checking {inv.user}'s access to {inv.target}", "logs": []}
+            return {"started": True, "note": "The check runs now and the user sees each step and the diagnosis card. "
+                                             "Tell them in one short sentence that you are checking."}, False
 
         if name == "offer_recording":
             if not s.can_teach:

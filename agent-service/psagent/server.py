@@ -3,11 +3,12 @@
 POST /api/chat     {session_id?, message, page?, attachment?{name, media_type, data}} -> reply
 POST /api/confirm  {session_id, run_id, approved, rows?}  -> reply (+ action / batch_action when approved)
 POST /api/batch/result {session_id, batch_id, results}    -> reply
-POST /api/troubleshoot/step {session_id, run_id, logs?}   -> {steps, done, diagnosis}
+POST /api/troubleshoot/step {session_id, run_id, logs?}   -> {steps, done, diagnosis}  (processes and access checks)
+POST /api/security/apply {session_id, run_id}             -> {live}  (security admins: make the proposed fix live)
 POST /api/result   {session_id, run_id, status, message?, failed_step?} -> reply
 POST /api/live/step {session_id, run_id, snapshot, result?, answer?, approved?, declined?} -> {action}
 POST /api/live/recover {session_id, run_id, failed_index, error}  -> {live}  (recorded run hit a changed page)
-GET  /api/me                                              -> {oprid, can_teach, tasks}
+GET  /api/me                                              -> {oprid, can_teach, tasks, troubleshoot, security}
 POST /api/recordings/draft {recording}                    -> {draft}       (teachers)
 POST /api/recordings/save  {recording, draft, overwrite?} -> {task_id, ...} (teachers)
 GET  /health
@@ -148,6 +149,26 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
 
         return JSONResponse(await run_in_threadpool(work))
 
+    async def security_apply(request):
+        oprid = oprid_of(request)
+        if not oprid:
+            return bad("unauthorized", 401)
+        data = await body(request)
+        if data is None or not data.get("run_id"):
+            return bad("run_id is required")
+        s = store.get(data.get("session_id"), oprid)
+        if s is None:
+            return bad("unknown session", 404)
+
+        def work():
+            with s.lock:
+                return agent.apply_security_fix(s, str(data["run_id"]))
+
+        out = await run_in_threadpool(work)
+        if out.get("error"):
+            return bad(out["error"], 403 if "administrators" in out["error"] else 409)
+        return JSONResponse(out)
+
     async def batch_result(request):
         oprid = oprid_of(request)
         if not oprid:
@@ -215,8 +236,9 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
         if not oprid:
             return bad("unauthorized", 401)
         tasks = [{"id": t.id, "title": t.title, "example": (t.examples or [t.title])[0]} for t in agent.tasks.values()]
+        security = agent.access is not None and await run_in_threadpool(agent.access.is_admin, oprid)
         return JSONResponse({"oprid": oprid, "can_teach": can_teach(oprid), "tasks": tasks,
-                             "troubleshoot": agent.troubleshooter is not None})
+                             "troubleshoot": agent.troubleshooter is not None, "security": security})
 
     async def draft(request):
         oprid = oprid_of(request)
@@ -272,6 +294,7 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
             Route("/api/result", result, methods=["POST"]),
             Route("/api/batch/result", batch_result, methods=["POST"]),
             Route("/api/troubleshoot/step", troubleshoot_step, methods=["POST"]),
+            Route("/api/security/apply", security_apply, methods=["POST"]),
             Route("/api/live/step", live_step, methods=["POST"]),
             Route("/api/live/recover", live_recover, methods=["POST"]),
             Route("/api/me", me),
@@ -336,5 +359,11 @@ def app_from_env():
     except ImportError:
         log.warning("python-oracledb is not installed: troubleshooting is off (pip install oracledb)")
     log.info("Troubleshooting database (PSAGENT_DB_*): %s", db.label if db else "not configured: troubleshooting is off")
-    agent = Agent(llm, load_tasks(tasks_dir), db, os.environ.get("PSAGENT_TROUBLESHOOT_EFFORT", "medium"))
+    admins = [a.strip() for a in os.environ.get("PSAGENT_SECURITY_ADMINS", "").split(",") if a.strip()]
+    roles = os.environ.get("PSAGENT_SECURITY_ROLES")
+    roles = [r.strip() for r in roles.split(",") if r.strip()] if roles is not None else None
+    if db:
+        log.info("Security admins (PSAGENT_SECURITY_ADMINS / _ROLES): %s; roles %s", admins or "none listed",
+                 roles if roles is not None else "Security Administrator, PeopleSoft Administrator")
+    agent = Agent(llm, load_tasks(tasks_dir), db, os.environ.get("PSAGENT_TROUBLESHOOT_EFFORT", "medium"), admins, roles)
     return create_app(agent, secret, origins, dev_oprid, teachers, tasks_dir)

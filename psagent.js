@@ -22,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-10-24.8';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-10-25.1';   /* shown as PSAgent.version and in the console: check after uploading */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
@@ -1179,6 +1179,12 @@
       '.psa-card pre.psa-code{margin:4px 0;padding:10px 12px;max-height:260px;overflow:auto;background:#0f172a;color:#e2e8f0;border-radius:10px;font:12px/1.5 Consolas,"Courier New",monospace;white-space:pre-wrap;word-break:break-word;}',
       '.psa-card code.psa-where{display:inline-block;padding:2px 8px;background:#eef2ff;color:#3730a3;border-radius:6px;font:12px Consolas,monospace;}',
       '.psa-q{margin:6px 0;font-size:12px;}',
+      '.psa-chk{display:flex;gap:8px;align-items:flex-start;margin:5px 0;font-size:13px;line-height:1.4;}',
+      '.psa-chk>i{font-style:normal;flex:none;width:18px;height:18px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;margin-top:1px;}',
+      '.psa-chk.ok>i{background:#16a34a;}.psa-chk.missing>i{background:#dc2626;}.psa-chk.warning>i{background:#d97706;}.psa-chk.info>i{background:#64748b;}',
+      '.psa-chk b{font-weight:600;}.psa-fix{border:1px solid #c7d2fe;background:#eef2ff;border-radius:10px;padding:8px 10px;}',
+      '.psa-links{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}.psa-links a{font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--psa-line);color:#3730a3!important;text-decoration:none!important;background:#fff;}',
+      '.psa-links a:hover{border-color:#a5b4fc;}',
       /* workspace: where the agent works, next to the panel */
       '#psa-ws{position:fixed;top:12px;left:12px;right:12px;bottom:12px;display:none;flex-direction:column;background:#fff;border-radius:18px;overflow:hidden;z-index:2147483644;box-shadow:0 24px 64px rgba(15,23,42,.28),0 0 0 2px rgba(79,70,229,.45);font-size:13px;}',
       'body.psa-docked #psa-ws{right:464px;}body.psa-docked.psa-widebody #psa-ws{right:744px;}',
@@ -1330,10 +1336,12 @@
       if (ctx.error) tiles.push({ t: 'Help with this error', s: ctx.error, q: 'Help me with this error' });
       ((me && me.tasks) || []).slice(0, 6).forEach(function (t) { tiles.push({ t: t.title, s: t.example, q: t.example }); });
       if (me && me.troubleshoot) tiles.push({ t: 'Troubleshoot a process', s: 'Why did my last process fail?', q: 'Why did my last process fail?' });
+      if (me && me.security) tiles.push({ t: 'Check someone\'s access', s: 'Why can\'t a user open a page?', q: '', fill: 'Why can\'t ' });
       if (ctx.component && !isFrameworkPage(ctx)) tiles.push({ t: 'Explain this page', s: ctx.title || ctx.component, q: 'What is this page for and how do I use it?' });
       tiles.push({ t: 'Something new', s: 'Describe it and I will work it out on screen', q: '', cls: ' psa-new' });
       html += '<div class="psa-sec">I can</div><div class="psa-grid">' + tiles.map(function (x) {
-        return '<button type="button" class="psa-tile' + (x.cls || '') + '" data-q="' + esc(x.q) + '"><b>' + esc(x.t) + '</b><small>' + esc(x.s || '') + '</small></button>';
+        return '<button type="button" class="psa-tile' + (x.cls || '') + '" data-q="' + esc(x.q) + '"' + (x.fill ? ' data-fill="' + esc(x.fill) + '"' : '')
+          + '><b>' + esc(x.t) + '</b><small>' + esc(x.s || '') + '</small></button>';
       }).join('') + '</div>';
       w.innerHTML = html;
       w.addEventListener('click', function (e) {
@@ -1341,7 +1349,9 @@
         if (!b) return;
         var q = b.getAttribute('data-q');
         if (q) send(q);
-        else { input.placeholder = 'e.g. Lock the account of user JSMITH and add the role Manager'; input.focus(); }
+        else if (b.getAttribute('data-fill')) {
+          input.value = b.getAttribute('data-fill'); input.placeholder = 'e.g. Why can\'t ABSMITH access Create Job Opening?'; input.focus();
+        } else { input.placeholder = 'e.g. Lock the account of user JSMITH and add the role Manager'; input.focus(); }
       });
       logEl.appendChild(w);
     }
@@ -1961,8 +1971,9 @@
     }
 
     function runTroubleshoot(t) {
-      var feed = activity('Troubleshooting process ' + t.instance), logs = [], first = true;
-      setStatus('working', 'Investigating process ' + t.instance);
+      var title = t.title || ('Troubleshooting process ' + t.instance), what = t.kind === 'security' ? 'Checking access' : 'Investigating process ' + t.instance;
+      var feed = activity(title), logs = [], first = true;
+      setStatus('working', what);
       var reads = (t.logs || []).map(function (lf) {
         var item = feed.add((+lf.size > BIG_LOG ? 'Reading the end of log file ' + lf.name + ' (' + mb(+lf.size) + ')' : 'Reading log file ' + lf.name));
         return readLog(lf).then(function (got) {
@@ -1972,16 +1983,16 @@
       });
       function next() {
         var looking = feed.add('Deciding what to check next', 'think');
-        setStatus('thinking', 'Investigating process ' + t.instance + '...');
+        setStatus('thinking', what + '...');
         var body = { session_id: state.sessionId, run_id: t.run_id };
         if (first) { body.logs = logs; first = false; }
         return api('/api/troubleshoot/step', body).then(function (r) {
           looking.remove();
           (r.steps || []).forEach(function (text) { feed.add(text).end(true); });
-          if (!r.done) { setStatus('working', 'Investigating process ' + t.instance); return next(); }
+          if (!r.done) { setStatus('working', what); return next(); }
           feed.finish(r.diagnosis ? 'success' : 'error');
           setStatus(r.diagnosis ? 'idle' : 'error');
-          if (r.diagnosis) showDiagnosis(r.diagnosis);
+          if (r.diagnosis) (r.diagnosis.kind === 'security' ? showAccess : showDiagnosis)(r.diagnosis);
           else addMsg('bot', '⚠️ ' + (r.error || 'I could not finish the investigation.'));
         }, function (e) {
           looking.remove();
@@ -2021,6 +2032,67 @@
           'Root cause: ' + d.root_cause, '', 'Evidence:'].concat((d.evidence || []).map(function (x) { return '- ' + x; }), ['', 'Fix:'],
           (d.fix_steps || []).map(function (x, i) { return (i + 1) + '. ' + x; }), d.code_fix ? ['', 'Suggested code:', d.code_fix] : [],
           d.rerun ? ['', 'Then: ' + d.rerun] : []).join('\n');
+        var btn = e.target;
+        (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(function () { btn.textContent = 'Copied'; },
+          function () { btn.textContent = 'Copy not allowed here'; });
+      });
+    }
+
+    var VERDICT = {
+      missing_access: ['Missing access', '#991b1b', '#fee2e2'], partial_access: ['Partial access', '#92400e', '#fef3c7'],
+      account_locked: ['Account locked', '#991b1b', '#fee2e2'], no_user: ['No such user', '#334155', '#f1f5f9'],
+      row_security: ['Row security', '#92400e', '#fef3c7'], navigation: ['Menu link missing', '#075985', '#e0f2fe'],
+      has_access: ['Has access', '#065f46', '#d1fae5'], unknown: ['Not conclusive', '#334155', '#f1f5f9']
+    };
+    var MARK = { ok: '✓', missing: '✕', warning: '!', info: 'i' };
+
+    /* Access check result: the security chain, what is missing, the smallest fix, links to the security pages,
+       and Apply (security admins): the agent makes the change on screen and stops for approval before Save. */
+    function showAccess(d) {
+      var v = VERDICT[d.verdict] || VERDICT.unknown, f = d.fix || {};
+      function link(label, menu, comp, query) {
+        return '<a target="_blank" rel="noopener" href="' + esc(componentUrl({ menu: menu, component: comp }, query).replace('/psc/', '/psp/')) + '">' + esc(label) + '</a>';
+      }
+      var links = [link('User profile ' + d.user, 'MAINTAIN_SECURITY', 'USERMAINT', { OPRID: d.user })];
+      if (f.role) links.push(link('Role ' + f.role, 'MAINTAIN_SECURITY', 'ROLEMAINT', { ROLENAME: f.role }));
+      if (f.permission_list) links.push(link('Permission list ' + f.permission_list, 'MAINTAIN_SECURITY', 'ACCESS_CNTRL_LISTX', { CLASSID: f.permission_list }));
+      var pm = String(d.page || '').match(/([A-Z0-9_#$]+(?:\([A-Z0-9_]+\))?)\.([A-Z0-9_#$]+)\.([A-Z0-9_#$]+)/);
+      if (pm) links.push('<a target="_blank" rel="noopener" href="' + esc(componentUrl({ menu: pm[1], component: pm[2], market: pm[3] }).replace('/psc/', '/psp/')) + '">The page</a>');
+      var c = card('<h4>' + esc(d.user) + ' → ' + esc(d.target) + '</h4>'
+        + '<div class="psa-diag-top"><span class="psa-badge" style="color:' + v[1] + ';background:' + v[2] + '">' + v[0] + '</span>'
+        + '<small>Confidence: ' + esc(d.confidence || '?') + '</small></div>'
+        + '<p class="psa-diag-sum">' + md(d.summary || '') + '</p>'
+        + (d.page ? '<div class="psa-diag-sec"><b>Page</b><code class="psa-where">' + esc(d.page) + '</code></div>' : '')
+        + ((d.checks || []).length ? '<div class="psa-diag-sec"><b>Security chain</b>' + d.checks.map(function (x) {
+          return '<div class="psa-chk ' + esc(x.status) + '"><i>' + (MARK[x.status] || 'i') + '</i><span><b>' + esc(x.check) + '</b>: ' + md(x.detail) + '</span></div>';
+        }).join('') + '</div>' : '')
+        + (d.missing ? '<div class="psa-diag-sec"><b>Missing</b>' + md(d.missing) + '</div>' : '')
+        + (f.kind && f.kind !== 'none' ? '<div class="psa-diag-sec"><b>Smallest fix</b><div class="psa-fix">' + md(f.description || '')
+          + (f.side_effects ? '<div style="margin-top:4px;color:var(--psa-sub);font-size:12px">' + md('Side effects: ' + f.side_effects) + '</div>' : '') + '</div></div>' : '')
+        + ((d.alternatives || []).length ? '<details><summary>Alternatives</summary><ul>' + d.alternatives.map(function (x) { return '<li>' + md(x) + '</li>'; }).join('') + '</ul></details>' : '')
+        + (d.after_fix ? '<div class="psa-diag-sec"><b>Then</b>' + md(d.after_fix) + '</div>' : '')
+        + '<div class="psa-links">' + links.join('') + '</div>'
+        + ((d.queries || []).length ? '<details><summary>' + d.queries.length + ' extra read-only ' + (d.queries.length === 1 ? 'query' : 'queries') + '</summary>'
+          + d.queries.map(function (q) { return '<div class="psa-q"><b>' + esc(q.purpose) + '</b> (' + q.rows + ' rows)<pre class="psa-code">' + esc(q.sql) + '</pre></div>'; }).join('')
+          + '</details>' : '')
+        + '<div class="psa-actions">' + (d.can_apply ? '<button type="button" class="psa-ok" data-apply>Apply (you approve the save)</button>' : '')
+        + '<button type="button" class="psa-no" data-copy>Copy report</button></div>');
+      c.classList.add('psa-diag');
+      var apply = c.querySelector('[data-apply]');
+      if (apply) apply.addEventListener('click', function () {
+        apply.disabled = true;
+        apply.textContent = 'Starting...';
+        api('/api/security/apply', { session_id: state.sessionId, run_id: d.run_id }).then(function (r) {
+          apply.textContent = 'Applying on screen';
+          return runLive(r.live);
+        }, function (e) { apply.disabled = false; apply.textContent = 'Apply (you approve the save)'; addMsg('bot', '⚠️ ' + e.message, false); });
+      });
+      c.querySelector('[data-copy]').addEventListener('click', function (e) {
+        var text = [d.user + ' → ' + d.target + ' (' + v[0] + ', confidence ' + d.confidence + ')', d.summary, '', 'Page: ' + (d.page || '-'), '']
+          .concat((d.checks || []).map(function (x) { return '[' + x.status + '] ' + x.check + ': ' + x.detail; }),
+            d.missing ? ['', 'Missing: ' + d.missing] : [], f.description ? ['', 'Fix: ' + f.description, 'Side effects: ' + (f.side_effects || '-')] : [],
+            (d.alternatives || []).length ? ['', 'Alternatives:'].concat(d.alternatives.map(function (x) { return '- ' + x; })) : [],
+            d.after_fix ? ['', 'Then: ' + d.after_fix] : []).join('\n');
         var btn = e.target;
         (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(function () { btn.textContent = 'Copied'; },
           function () { btn.textContent = 'Copy not allowed here'; });

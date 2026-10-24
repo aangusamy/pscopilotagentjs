@@ -152,6 +152,39 @@ END;
 The driver is `python-oracledb` in thin mode: nothing to install on the database
 server. A typical investigation takes 20-60 seconds and costs a few tens of cents.
 
+## Security access checks
+
+Security administrators can ask *"why can't ABSMITH access Create Job Opening?"*
+or *"why can't VELU find employee KU0001 in Job Data?"* (also the *Check
+someone's access* tile). The agent walks the chain a security admin would, from
+the same read-only database, and shows each step:
+
+1. the page: menu label → `MENU.COMPONENT.MARKET` (portal registry);
+2. the user profile (exists, locked), roles and permission lists;
+3. the component's pages and actions (Add, Update/Display, ...) against what the
+   user's permission lists authorize;
+4. the menu link (content reference permission);
+5. row security: whether the search record (the menu item's override if any)
+   filters rows, and for a person, whether the user's security classes
+   (SJT_OPR_CLS / SJT_CLASS_ALL) reach that person's SJT_PERSON rows;
+6. every permission list and role that would grant the access, with how many
+   new components each would also give the user and how many users each
+   affects, so the smallest (least-privilege) fix can be chosen.
+
+The card shows the chain (✓ / ✕), what is missing, the smallest fix with its
+side effects, alternatives, links to the User Profile, Role and Permission List
+pages and the page itself, and *Copy report*. Nothing is granted automatically.
+For adding a role, adding a permission list to a role, authorizing a page in a
+permission list or unlocking an account, *Apply* starts a live run that makes
+exactly that change on screen and stops for your approval before Save.
+
+Who may use it (both asking and Apply):
+
+```
+PSAGENT_SECURITY_ROLES=Security Administrator,PeopleSoft Administrator   # default
+PSAGENT_SECURITY_ADMINS=SECADMIN1,SECADMIN2                              # extra OPRIDs
+```
+
 ## The chat panel
 
 The widget is a panel docked on the right, with the workspace beside it:

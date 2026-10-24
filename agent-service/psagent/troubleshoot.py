@@ -135,6 +135,8 @@ class Investigation:
 
 
 class Troubleshooter:
+    system, tools = SYSTEM, TOOLS   # the investigator's prompt and tools (security.AccessChecker has its own)
+
     def __init__(self, llm, db, effort="medium"):
         self.llm, self.db, self.effort = llm, db, effort
 
@@ -183,7 +185,7 @@ class Troubleshooter:
             return self._give_up(inv, "The investigation took too many steps without a clear answer.")
         inv.rounds += 1
         try:
-            resp = self.llm.create(SYSTEM, inv.messages, TOOLS, effort=self.effort)
+            resp = self.llm.create(self.system, inv.messages, self.tools, effort=self.effort)
         except LLMError as e:
             log.warning("troubleshoot step failed: %s", e)
             return {"steps": [], "done": True, "diagnosis": None, "error": "The AI service is unavailable right now."}

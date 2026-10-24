@@ -26,7 +26,7 @@ from fakes import FakeLLM, response, text, tool  # noqa: E402
 from psagent.agent import Agent  # noqa: E402
 from psagent.server import create_app  # noqa: E402
 from psagent.tasks import load_tasks  # noqa: E402
-from test_troubleshoot import FakeDB  # noqa: E402  (rows from the real instance 557060)
+from test_security import FINISH as ACCESS_FINISH, SecDB  # noqa: E402  (real security rows: ABSMITH, HCCPRS1040)
 
 TASKS_DIR = Path(tempfile.mkdtemp(prefix="psagent-tasks-"))
 shutil.copytree(ROOT / "agent-service" / "tests" / "fixtures" / "tasks", TASKS_DIR, dirs_exist_ok=True)
@@ -145,9 +145,20 @@ llm = FakeLLM(
                       "Rerun the process."],
         "code_fix": "Local number &nTest = 0;\nLocal string &sName = \"PSIQ\";\n\n&nTest = &nTest + 1;",
         "rerun": "Run AEMINITEST again from Request AE (or ask me to run it)."}, id="t4")),
+    # security access check: ABSMITH cannot open Create Job Opening; Apply adds the role live
+    response(tool("check_user_access", {"user": "ABSMITH", "page": "Create Job Opening",
+                                        "question": "Why can't ABSMITH access Create Job Opening?"}, id="s1")),
+    response(text("I'm checking **ABSMITH**'s security for Create Job Opening now.")),
+    response(tool("find_page", {"text": "Create Job Opening"}, id="s2")),
+    response(tool("check_access", {"user": "ABSMITH", "component": "HRS_HRPM.HRS_JO_LAUNCH.GBL"}, id="s3")),
+    response(tool("finish", ACCESS_FINISH, id="s4")),
+    response(tool("act", {"note": "Opening User Profiles", "actions": [
+        {"kind": "open_page", "target": "MAINTAIN_SECURITY.USERMAINT.GBL", "value": ""}]}, id="s5")),
+    response(tool("finish", {"success": True, "summary": "Added role Hiring Manager to ABSMITH and PeopleSoft saved it."}, id="s6")),
+    response(text("Done: **ABSMITH** now has the role **Hiring Manager**. Ask them to sign out and in again.")),
     drafts=[DRAFT, DRAFT_PROCESS],
 )
-class TraceDB(FakeDB):
+class TraceDB(SecDB):
     """Also posts a 232 MB trace file (like the real PORTAL_CSS run): the widget must read only its end."""
 
     def query(self, sql, params=None, **kw):
@@ -170,7 +181,7 @@ def trace(request):
                     headers={"Content-Range": f"bytes {TRACE_SIZE - len(tail)}-{TRACE_SIZE - 1}/{TRACE_SIZE}"})
 
 
-app = create_app(Agent(llm, TASKS, TraceDB()), secret="", allowed_origins=[], dev_oprid="TESTER",
+app = create_app(Agent(llm, TASKS, TraceDB(), security_admins=["TESTER"]), secret="", allowed_origins=[], dev_oprid="TESTER",
                  teachers={"*"}, tasks_dir=str(TASKS_DIR))
 bodies = []
 

@@ -400,6 +400,36 @@ test('troubleshoot: "why did my last process fail?" -> log file, message log and
   assert.ok(!JSON.parse(bodies[1]).logs);
 });
 
+test('security: "why can\'t ABSMITH access Create Job Opening?" -> security chain, smallest fix, links -> Apply live', async page => {
+  await page.click('#psa-fab');
+  await page.locator('.psa-tile', { hasText: 'Check someone\'s access' }).click();     // security admins only
+  assert.equal(await page.inputValue('#psa-input'), "Why can't ");
+  await page.type('#psa-input', 'ABSMITH access Create Job Opening?');
+  await page.press('#psa-input', 'Enter');
+  const card = page.locator('.psa-card.psa-diag', { hasText: 'ABSMITH → Create Job Opening' });
+  await card.waitFor({ timeout: 60000 });
+  const text = await card.innerText();
+  for (const s of ['Missing access', 'Confidence: high', 'HRS_HRPM.HRS_JO_LAUNCH.GBL', 'SECURITY CHAIN', 'Permission lists: No permission list grants',
+    'SMALLEST FIX', 'Add role Hiring Manager to ABSMITH.', 'Side effects: Only ABSMITH', 'ABSMITH signs out and in again.'])
+    assert.ok(text.toUpperCase().includes(s.toUpperCase()), s + ' missing in\n' + text);
+  assert.equal(await card.locator('.psa-chk.missing').count(), 1);
+  const hrefs = await card.locator('.psa-links a').evaluateAll(as => as.map(a => a.getAttribute('href')));
+  assert.deepEqual(hrefs, ['/psp/ps/EMPLOYEE/HRMS/c/MAINTAIN_SECURITY.USERMAINT.GBL?OPRID=ABSMITH',
+    '/psp/ps/EMPLOYEE/HRMS/c/MAINTAIN_SECURITY.ROLEMAINT.GBL?ROLENAME=Hiring%20Manager',
+    '/psp/ps/EMPLOYEE/HRMS/c/MAINTAIN_SECURITY.ACCESS_CNTRL_LISTX.GBL?CLASSID=HCCPRS1040',
+    '/psp/ps/EMPLOYEE/HRMS/c/HRS_HRPM.HRS_JO_LAUNCH.GBL']);
+  const feed = await page.locator('.psa-feed').last().innerText();
+  for (const s of ["Checking ABSMITH's access to Create Job Opening", 'Looked up the page "Create Job Opening" in the menu',
+    "Checked ABSMITH's roles, permission lists, pages and menu link for HRS_HRPM.HRS_JO_LAUNCH.GBL", 'Diagnosis ready'])
+    assert.ok(feed.includes(s), s + ' missing in\n' + feed);
+  await card.locator('[data-apply]').click();                                         // nothing changes until this click
+  await page.locator('.psa-msg.psa-bot', { hasText: 'now has the role Hiring Manager' }).waitFor({ timeout: 60000 });
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b);
+  const apply = bodies.filter(b => b.includes('"run_id":"sec-') && !b.includes('"snapshot"'));
+  assert.ok(apply.length >= 2, 'steps and apply sent with the access check id');
+  assert.ok(bodies.some(b => b.includes('"run_id":"live-') && b.includes('"snapshot"')), 'the fix ran live');
+});
+
 let failed = 0;
 try {
   await waitForServer();
