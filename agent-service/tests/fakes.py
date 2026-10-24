@@ -32,7 +32,7 @@ class FakeLLM:
             raise LLMError("no scripted draft")
         return self.drafts.pop(0)
 
-    def create(self, system, messages, tools, tool_choice=None):
+    def create(self, system, messages, tools, tool_choice=None, cache="conversation"):
         self.calls.append(list(messages))
         if not self.responses:
             raise AssertionError("FakeLLM ran out of scripted responses")

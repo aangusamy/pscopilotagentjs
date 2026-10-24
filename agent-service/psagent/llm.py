@@ -21,8 +21,13 @@ class ClaudeLLM:
         self.effort = effort
         self.max_tokens = max_tokens
 
-    def create(self, system, messages, tools, tool_choice=None):
+    def create(self, system, messages, tools, tool_choice=None, cache="conversation"):
+        """cache="conversation": cache everything up to the last message (the chat grows append-only).
+        cache="prefix": cache only tools + system (live mode sends a new page snapshot every call)."""
         a = self._anthropic
+        caching = ({"cache_control": {"type": "ephemeral"}} if cache == "conversation" else {})
+        if cache == "prefix":
+            system = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
         try:
             resp = self.client.beta.messages.create(
                 model=self.model,
@@ -32,7 +37,7 @@ class ClaudeLLM:
                 messages=messages,
                 **({"tool_choice": tool_choice} if tool_choice else {}),
                 output_config={"effort": self.effort},
-                cache_control={"type": "ephemeral"},
+                **caching,
                 # On a safety-classifier decline, retry server-side on Anthropic's recommended model.
                 betas=["server-side-fallback-2026-07-01"],
                 fallbacks="default",

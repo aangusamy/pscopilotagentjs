@@ -209,7 +209,8 @@ class LiveOperator:
             try:
                 # Forced tool choice is not available with every model: the prompt asks for one tool call,
                 # and a reply without one is sent back with a reminder.
-                resp = self.llm.create(LIVE_SYSTEM, [{"role": "user", "content": self._prompt(run, snapshot)}], LIVE_TOOLS)
+                resp = self.llm.create(LIVE_SYSTEM, [{"role": "user", "content": self._prompt(run, snapshot)}], LIVE_TOOLS,
+                                       cache="prefix")   # the instructions repeat every step; the page does not
             except LLMError as e:
                 log.warning("live step failed: %s", e)
                 return {"type": "fail", "summary": "The AI service is unavailable right now."}
