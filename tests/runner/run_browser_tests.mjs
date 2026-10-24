@@ -300,6 +300,39 @@ test('live mode: no task fits, so the agent reads each page and decides; Save wa
   assert.match(await review.innerText(), /shows Saved/);
 });
 
+test('recovery: the recorded task meets a changed page and is finished live; Save asked again; task update offered', async page => {
+  await page.evaluate(() => sessionStorage.setItem('mock.upgraded', '1'));   // Description got a new id and label
+  await page.click('#psa-fab');
+  await page.fill('#psa-input', 'create user RECOV, Recov User, role EMPLOYEE');
+  await page.press('#psa-input', 'Enter');
+  const card = page.locator('.psa-card', { hasText: 'please review' });
+  await card.waitFor();
+  await card.locator('[data-secret="password"]').fill('Rec0v!pw');
+  await card.locator('[data-confirm="password"]').fill('Rec0v!pw');
+  await card.locator('.psa-ok').click();
+  // the recorded steps run until Description, which is not there any more; then Claude takes over
+  const approve = page.locator('.psa-card', { hasText: 'Approve: Save' });
+  await approve.waitFor({ timeout: 90000 });
+  const feed = page.locator('.psa-feed').last();
+  assert.match(await feed.innerText(), /did not match the page: working out the rest live/);
+  assert.equal(await saved(page), null);                                   // your approval first, again
+  await approve.locator('.psa-ok').click();
+  await page.locator('.psa-bot', { hasText: 'finished it live' }).waitFor({ timeout: 60000 });
+  assert.deepEqual(await saved(page), {
+    OPRID: 'RECOV', DESCR: 'Recov User', SYMBOLICID: 'SYSADM1', PWD: 'Rec0v!pw', PWD2: 'Rec0v!pw',
+    OPRCLASS: '', IDTYPE: 'NON', EMPLID: '', ROLES: ['EMPLOYEE'],
+  });
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).join('\n');
+  assert.ok(!bodies.includes('Rec0v!pw'), 'password reached the agent service');
+  // the run (recorded part + live part) can replace the task
+  const offer = page.locator('.psa-card', { hasText: 'Update the task?' });
+  await offer.locator('.psa-ok').click();
+  const review = page.locator('.psa-card', { hasText: 'Review the recorded task' });
+  await review.waitFor();
+  assert.match(await review.innerText(), /Replace the existing task\s*create_user_profile/);
+  assert.match(await review.innerText(), /Long Description/);              // the field as it is now
+});
+
 let failed = 0;
 try {
   await waitForServer();

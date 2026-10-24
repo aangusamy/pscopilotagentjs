@@ -348,7 +348,7 @@ def draft(rec, llm=None):
     }
     plain = [c for c in cands if c["kind"] != "secret"]
     if llm is None or not plain:
-        return d
+        return _keep_id(rec, d)
     prompt = json.dumps({
         "title_given_by_user": rec.get("title") or "",
         "component": f"{comp['menu']}.{comp['component']}.{comp.get('market') or 'GBL'}",
@@ -364,7 +364,7 @@ def draft(rec, llm=None):
         out = llm.structured(DRAFT_SYSTEM, prompt, _draft_schema([c["key"] for c in plain]))
     except LLMError as e:
         log.warning("draft suggestion failed, using rules: %s", e)
-        return d
+        return _keep_id(rec, d)
     by_key = {f["key"]: f for f in d["fields"]}
     for s in out.get("fields") or []:
         f = by_key.get(s.get("key"))
@@ -377,6 +377,13 @@ def draft(rec, llm=None):
     d["summary"] = _str(out.get("summary"), 300).strip() or d["summary"]
     d["examples"] = [_str(e, 200) for e in (out.get("examples") or [])[:3] if str(e).strip()] or d["examples"]
     d["suggested_by"] = "claude"
+    return _keep_id(rec, d)
+
+
+def _keep_id(rec, d):
+    """Updating an existing task (after a live recovery): keep its id so saving replaces it."""
+    if TASK_ID.fullmatch(_str(rec.get("task_id"), 80)):
+        d["task_id"] = rec["task_id"]
     return d
 
 

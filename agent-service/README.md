@@ -64,6 +64,17 @@ Safety is enforced in `live.py`, not left to the model:
   straight into PeopleSoft;
 * questions appear in the chat and your answer goes back into the run.
 
+**Recorded tasks recover live.** When a recorded step no longer matches the
+page (a field, button or tab is missing, or PeopleSoft does not respond), the run
+does not stop: Claude gets the confirmed values, the steps already done, the
+failed step and the rest of the recording, and finishes from that point in the
+same workspace (at most 20 steps; Save still waits for your approval; the
+password from the confirm card is reused in the browser). PeopleSoft's own
+messages ("already exists", invalid value) still stop the run and come back to
+you, because they need your decision. After a recovery, teachers are offered
+**"Update the task?"** with the run as the new version. Say *"do it live"* to
+skip the recorded task.
+
 While it works, the recorder watches the workspace. When a live run succeeds,
 teachers get **"Make this a task?"**: one click turns what Claude worked out into
 a reviewed, reusable task, so the next time is one step.
@@ -242,8 +253,8 @@ of asking for them. That is the natural next step.
 ## Tests
 
 ```bash
-cd agent-service && python3 -m unittest discover -s tests -t tests       # 68 unit tests, scripted LLM
-cd .. && node tests/runner/run_browser_tests.mjs                          # 9 browser tests (Playwright)
+cd agent-service && python3 -m unittest discover -s tests -t tests       # 71 unit tests, scripted LLM
+cd .. && node tests/runner/run_browser_tests.mjs                          # 10 browser tests (Playwright)
 ```
 
 The browser tests run the real widget and the real service (with a scripted

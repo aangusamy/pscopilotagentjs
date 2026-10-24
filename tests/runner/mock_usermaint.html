@@ -161,7 +161,10 @@
         h += '<table class="grid"><tr><th>Attribute Name</th><th>Attribute Value</th></tr>'
           + '<tr><td>Employee ID</td><td><input type="text" id="ATTRVAL_X$0" value="' + data.EMPLID + '" onchange="chg(this,\'EMPLID\')"></td></tr></table>';
       }
-      h += '<h4>User Description</h4>' + input('PSOPRDEFN_DVW_OPRDEFNDESC$0', 'DESCR', 'Description:');
+      /* After an "upgrade" (test flag) the field has a new id and label: recorded tasks no longer match */
+      h += '<h4>User Description</h4>' + (sessionStorage.getItem('mock.upgraded')
+        ? input('PSOPRDEFN_LONGDESCR', 'DESCR', 'Long Description')
+        : input('PSOPRDEFN_DVW_OPRDEFNDESC$0', 'DESCR', 'Description:'));
     } else {
       h += '<table class="grid"><tr><th>*Role Name</th><th>Description</th><th></th></tr>'
         + data.ROLES.map(function (r, i) {

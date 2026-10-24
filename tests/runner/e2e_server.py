@@ -103,6 +103,22 @@ llm = FakeLLM(
         ("finish", {"success": True, "summary": "Created user LIVE1 (Live One) and PeopleSoft saved it."}),
     ])],
     response(text("Done: user **LIVE1** was created, worked out live.")),
+    # recovery: the recorded task meets a changed page and is finished live
+    response(tool("start_task", {"task_id": "create_user_profile"}, id="r1"),
+             tool("set_fields", {"fields": [{"name": "user_id", "value": "RECOV"}, {"name": "description", "value": "Recov User"},
+                                            {"name": "roles", "value": "EMPLOYEE"}]}, id="r2"),
+             tool("request_confirmation", {}, id="r3")),
+    response(text("Please confirm.")),
+    *[response(tool(n, a, id=f"rv{i}")) for i, (n, a) in enumerate([
+        ("act", {"note": "Description moved: Long Description", "actions": [
+            {"kind": "set", "target": "PSOPRDEFN_LONGDESCR", "value": "Recov User"}]}),
+        ("act", {"note": "Roles tab", "actions": [{"kind": "tab", "target": "Roles", "value": ""}]}),
+        ("act", {"note": "Role EMPLOYEE", "actions": [{"kind": "set", "target": "PSROLEUSER_VW_ROLENAME$0", "value": "EMPLOYEE"}]}),
+        ("request_commit", {"target": "#ICSave", "summary": [{"label": "User ID", "value": "RECOV"},
+                                                             {"label": "Description", "value": "Recov User (field moved)"}]}),
+        ("finish", {"success": True, "summary": "Created RECOV; Description is now Long Description on the ID tab."}),
+    ])],
+    response(text("Done: **RECOV** created. The Description field had moved, so I finished it live.")),
     drafts=[DRAFT, DRAFT_PROCESS],
 )
 app = create_app(Agent(llm, TASKS), secret="", allowed_origins=[], dev_oprid="TESTER",

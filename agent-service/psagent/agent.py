@@ -49,7 +49,8 @@ password in chat, do not repeat it and tell them to enter it on the card instead
 If the user asks you to do something on screen that no task in the list \
 covers, call work_live: you then operate PeopleSoft step by step yourself, \
 reading each page and deciding the next move, and the user approves anything \
-that saves or submits. Gather the values the user already gave into its \
+that saves or submits. Also call work_live (not start_task) when the user asks \
+you to do it live, figure it out yourself, or not use the recorded task. Gather the values the user already gave into its \
 details; you can ask for more during the run. For questions (not actions), \
 just answer. Users allowed to teach can also add tasks: when a user wants to \
 teach or record a new task, call offer_recording. They then do the task \
@@ -239,7 +240,8 @@ class Agent:
         if not approved:
             return self._turn(s, f"[event] The user clicked Cancel on the confirmation card for run {run_id}.")
         task = p["task"]  # the version the user confirmed, even if re-recorded since
-        s.running = {"run_id": run_id, "task_id": task.id}
+        steps = task.render(p["values"])
+        s.running = {"run_id": run_id, "task_id": task.id, "task": task, "values": p["values"], "steps": steps}
         s.messages.append({"role": "user", "content": f"[event] The user confirmed run {run_id}. The widget is running it now."})
         log.info("run %s confirmed by %s: %s %s", run_id, s.oprid, task.id, json.dumps(p["values"]))
         return Reply(
@@ -249,9 +251,32 @@ class Agent:
                 "task_id": task.id,
                 "title": task.title,
                 "component": task.component,
-                "steps": task.render(p["values"]),
+                "steps": steps,
             },
         )
+
+    def recover(self, s, run_id, failed_index, error):
+        """The recorded run stopped at a step that did not match the page: continue live from there.
+        Returns {run_id, goal} for the widget, or None."""
+        r = s.running
+        if not r or r["run_id"] != run_id or "steps" not in r:
+            return None
+        try:
+            i = int(failed_index)
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= i < len(r["steps"]):
+            return None
+        task = r["task"]
+        run = livemode.recovery_run(task, task.summary_rows(r["values"]), r["steps"], i, error)
+        s.live = run
+        s.running = {"run_id": run.run_id, "task_id": f"{task.id} (finished live)"}
+        s.messages.append({"role": "user", "content": (
+            f"[event] Run {run_id} of {task.id} stopped at step {i + 1} because the page did not match "
+            f"({json.dumps(str(error)[:300])}). You are finishing it live as run {run.run_id}; the user approves the save. "
+            "Afterwards the widget offers teachers to update the task from this run.")})
+        log.info("run %s of %s recovering live as %s at step %s: %s", run_id, task.id, run.run_id, i + 1, error)
+        return {"run_id": run.run_id, "goal": f"Finish {task.title}", "recovering": task.id}
 
     def live_step(self, s, run_id, snapshot, result=None, answer=None, approved=None, declined=None):
         """Next live-mode action for the widget (see live.py)."""

@@ -143,5 +143,56 @@ class LiveTest(unittest.TestCase):
                                 headers=other).status_code, 404)
 
 
+class RecoveryTest(unittest.TestCase):
+    """A recorded task hits a page that changed: it is finished live from the failed step."""
+
+    def confirmed_run(self, *more):
+        llm = FakeLLM(
+            response(tool("start_task", {"task_id": "create_user_profile"}),
+                     tool("set_fields", {"fields": [{"name": "user_id", "value": "VELU"},
+                                                    {"name": "description", "value": "Velu A"}]}, id="b"),
+                     tool("request_confirmation", {}, id="c")),
+            response(text("Please confirm.")), *more)
+        agent, s = Agent(llm, TASKS), Session(id="s", oprid="PS")
+        run_id = agent.chat(s, "create user VELU, Velu A").confirm["run_id"]
+        steps = agent.decide(s, run_id, True).action["steps"]
+        return llm, agent, s, run_id, steps
+
+    def test_finishes_live_from_the_failed_step(self):
+        llm, agent, s, run_id, steps = self.confirmed_run(
+            response(act(("set", "PSOPRDEFN_SYMBOLICID", "SYSADM1"))),
+            response(text("Created VELU; the Description field had moved, I found it.")))
+        failed = next(i for i, st in enumerate(steps) if st.get("field", {}).get("label") == "Description")
+        live = agent.recover(s, run_id, failed, 'Could not find "Description" on the page')
+        self.assertEqual((live["goal"], live["recovering"]), ("Finish Create User Profile", "create_user_profile"))
+        self.assertEqual(s.live.max_rounds, 20)                              # your limit for a recovery
+        self.assertEqual(s.live.title, "Create User Profile")                # cards show the task, not the brief
+        hist = "\n".join(s.live.history)
+        self.assertIn(f"recorded step {failed + 1} FAILED: set Description", hist)
+        self.assertIn("recorded step 2 done: set User ID", hist)
+        self.assertIn("still to do (adapt it): click Save", hist)
+        self.assertIn("(password: use type_secret)", hist)                   # secrets never written out
+        self.assertIn("- User ID: VELU", s.live.details)
+        a = agent.live_step(s, live["run_id"], PAGE)
+        self.assertEqual(a["type"], "do")
+        r = agent.report(s, live["run_id"], "success", "Saved")
+        self.assertEqual(r.messages, ["Created VELU; the Description field had moved, I found it."])
+        self.assertIn("stopped at step", str(llm.calls[-1]))                 # the chat knows what happened
+
+    def test_only_the_running_task_can_be_recovered(self):
+        llm, agent, s, run_id, steps = self.confirmed_run()
+        self.assertIsNone(agent.recover(s, "other", 3, "x"))
+        self.assertIsNone(agent.recover(s, run_id, 999, "x"))
+        self.assertIsNotNone(agent.recover(s, run_id, 3, "x"))
+        self.assertIsNone(agent.recover(s, run_id, 3, "x"))                 # once
+
+    def test_api_refuses_without_a_run(self):
+        c = TestClient(create_app(Agent(FakeLLM(response(text("hi"))), TASKS), "k", []))
+        h = {"Authorization": f"Bearer {auth.make_token('k', 'PS')}"}
+        sid = c.post("/api/chat", json={"message": "hi"}, headers=h).json()["session_id"]
+        r = c.post("/api/live/recover", json={"session_id": sid, "run_id": "x", "failed_index": 1}, headers=h)
+        self.assertEqual(r.status_code, 409)
+
+
 if __name__ == "__main__":
     unittest.main()

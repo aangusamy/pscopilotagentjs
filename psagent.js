@@ -22,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-10-24.4';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-10-24.5';   /* shown as PSAgent.version and in the console: check after uploading */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
@@ -68,6 +68,10 @@
   ];
   /* PeopleSoft draws message boxes in the TOP window (#pt_modals), also for pages inside a frame */
   var MODAL_SELECTORS = ['#pt_modals #alertmsg', '#pt_modals .popupText'];
+
+  /* The page is not what the recording expects (field, button or tab missing, no response):
+     a recorded task can be finished live from there. PeopleSoft's own messages are not this. */
+  function mismatch(msg) { var e = new Error(msg); e.mismatch = true; return e; }
 
   function isInput(el) {
     return !!el && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName) && el.type !== 'hidden';
@@ -174,7 +178,7 @@
   }
 
   function setValue(el, value, name) {
-    if (el.disabled || el.readOnly) throw new Error(name + ' is read-only on this page');
+    if (el.disabled || el.readOnly) throw mismatch(name + ' is read-only on this page');
     var v = String(value == null ? '' : value);
     if (el.tagName === 'SELECT') {
       var opts = el.options, idx = -1, i;
@@ -338,7 +342,7 @@
         var busy = navigating || !d || d.readyState !== 'complete' || d.URL === 'about:blank' || isProcessing(d)
           || requestsBusy(frame.contentWindow) || modalBusy(frame);
         if (!busy && Date.now() - quietSince >= RUN.settleMs) { if (obs) obs.disconnect(); return resolve(d); }
-        if (Date.now() - start > timeout) { if (obs) obs.disconnect(); return reject(new Error('PeopleSoft did not finish processing in time')); }
+        if (Date.now() - start > timeout) { if (obs) obs.disconnect(); return reject(mismatch('PeopleSoft did not finish processing in time')); }
         setTimeout(poll, RUN.pollMs);
       })();
     });
@@ -365,7 +369,7 @@
       if (el) return Promise.resolve(el);
       var msg = psMessage(frame.contentDocument);
       if (msg) return Promise.reject(new Error(msg));
-      if (Date.now() - start > RUN.stepTimeout) return Promise.reject(new Error(notFound));
+      if (Date.now() - start > RUN.stepTimeout) return Promise.reject(mismatch(notFound));
       return sleep(RUN.pollMs * 2).then(check);
     })();
   }
@@ -419,17 +423,17 @@
         var doc = frame.contentDocument, add = mode !== 'find';
         var btn = findButton(doc, add ? { id: 'PTS_CFG_CL_WRK_PTS_ADD_BTN', text: 'Add' } : { id: 'PTS_CFG_CL_WRK_PTS_SRCH_BTN', text: 'Search' })
           || findButton(doc, { id: '#ICSearch' });
-        if (!btn || !visible(btn)) throw new Error('Could not find the ' + (add ? 'Add' : 'Search') + ' button on the search page');
+        if (!btn || !visible(btn)) throw mismatch('Could not find the ' + (add ? 'Add' : 'Search') + ' button on the search page');
         return act(frame, function () { btn.click(); });
       }).then(function (doc) {
         if (!isSearchPage(doc)) return checkOpened(doc, step);          /* opened (the only match, or the new record) */
         var msg = psMessage(doc), want = step.pick || (keys[0] && keys[0].value);
         var exists = !!msg && /already exists/i.test(msg);
-        if (mode === 'add' || (mode === 'add_or_open' && !exists)) throw new Error(msg || 'PeopleSoft stayed on the search page');
+        if (mode === 'add' || (mode === 'add_or_open' && !exists)) throw msg ? new Error(msg) : mismatch('PeopleSoft stayed on the search page');
         var row = want != null && resultRow(doc, want);
         if (!row) throw new Error(msg || 'No search result is "' + want + '"');
         return act(frame, function () { row.click(); }).then(function (d) {
-          if (isSearchPage(d)) throw new Error(psMessage(d) || 'The search result "' + want + '" did not open');
+          if (isSearchPage(d)) throw psMessage(d) ? new Error(psMessage(d)) : mismatch('The search result "' + want + '" did not open');
         });
       });
     });
@@ -531,7 +535,7 @@
       /* Active tab is rendered as plain text, not a link */
       var all = doc.querySelectorAll('[id^="PSTAB"],[id^="ICTAB"],[class*="TAB"] span,[class*="TAB"] td,[role="tab"]');
       for (i = 0; i < all.length; i++) if (norm(all[i].textContent) === want) return Promise.resolve();
-      return Promise.reject(new Error('Could not find the "' + step.label + '" tab'));
+      return Promise.reject(mismatch('Could not find the "' + step.label + '" tab'));
     },
     grid: function (frame, step) {
       var values = step.values || [], row = 0, k = 0;
@@ -560,7 +564,7 @@
       if (saved && visible(saved)) return Promise.resolve('Saved');
       var bad = errorFields(doc);
       if (bad.length) return Promise.reject(new Error('PeopleSoft marked these fields as invalid: ' + bad.join(', ')));
-      return Promise.reject(new Error('No PeopleSoft error appeared, but the "Saved" confirmation was not seen. Please check the page.'));
+      return Promise.reject(mismatch('No PeopleSoft error appeared, but the "Saved" confirmation was not seen. Please check the page.'));
     }
   };
 
@@ -580,7 +584,7 @@
     var prev = findField(frame.contentDocument, spec, row - 1);
     var tr = prev && closest(prev, 'TR');
     var btn = tr && tr.querySelector('[id*="$new$"]');
-    if (!btn) return Promise.reject(new Error('Could not add a row for ' + fieldName(spec)));
+    if (!btn) return Promise.reject(mismatch('Could not add a row for ' + fieldName(spec)));
     return act(frame, function () { btn.click(); }).then(function () { return waitForField(frame, spec, row); });
   }
 
@@ -588,9 +592,9 @@
   function runAction(action, secrets, ws) {
     var steps = action.steps || [], i = 0, frame = ws.frame, done = null;
     dismissModal();   /* a message box left over from earlier would be mistaken for this run's */
-    function fail(message, raw) {
+    function fail(message, raw, isMismatch) {
       dismissModal();
-      return { status: 'error', message: message, failed_step: describe(raw || {}) };
+      return { status: 'error', message: message, failed_step: describe(raw || {}), failed_index: i, mismatch: !!isMismatch };
     }
     function next() {
       if (ws.stopped) return Promise.resolve({ status: 'stopped', message: 'Stopped by the user', failed_step: describe(steps[i] || {}) });
@@ -615,7 +619,7 @@
         i++;
         return next();
       }, function (err) {
-        return fail((err && err.message) || String(err), raw);
+        return fail((err && err.message) || String(err), raw, err && err.mismatch);
       });
     }
     return next();
@@ -1137,6 +1141,7 @@
       '.psa-ic.ok{background:var(--psa-ok);}.psa-ic.ok:before{content:"\\2713";}',
       '.psa-ic.err{background:var(--psa-err);}.psa-ic.err:before{content:"!";}',
       '.psa-ic.ask{background:var(--psa-warn);}.psa-ic.ask:before{content:"?";}',
+      '.psa-ic.live{background:var(--psa-brand2);}.psa-ic.live:before{content:"\\21BB";}',
       /* composer */
       '#psa-form{flex:0 0 auto;display:flex!important;align-items:flex-end;gap:6px;margin:6px 12px 4px!important;padding:6px!important;height:auto!important;min-height:0!important;border:1px solid var(--psa-line);border-radius:16px;background:#fff;box-shadow:0 2px 10px rgba(15,23,42,.05);}',
       '#psa-form:focus-within{border-color:#a5b4fc;box-shadow:0 0 0 4px rgba(99,102,241,.12);}',
@@ -1696,6 +1701,7 @@
       var secrets = pendingSecrets[action.run_id] || {};
       delete pendingSecrets[action.run_id];
       var ws = openWorkspace('Agent: ' + action.title), feed = activity(action.title), cur = null;
+      var lrec = startLiveRecorder(ws.frame, action.title);   /* if the page changed, the recovered run can update the task */
       ws.onStep = function (n, total, text) {
         if (cur) cur.end(true);
         cur = feed.add(text);
@@ -1705,9 +1711,11 @@
       return runAction(action, secrets, ws).catch(function (e) {
         return { status: 'error', message: 'The agent hit an unexpected problem: ' + ((e && e.message) || e) };
       }).then(function (res) {
+        if (cur) cur.end(res.status === 'success', res.status === 'success' ? null : res.message);
+        if (res.status === 'error' && res.mismatch && !ws.stopped) return recoverLive(action, res, ws, feed, lrec, secrets);
+        lrec.stop();
         secrets = null;
         ws.done();
-        if (cur) cur.end(res.status === 'success', res.status === 'success' ? null : res.message);
         feed.finish(res.status);
         if (res.status === 'success') ws.status('Done: ' + action.title);
         else if (res.status === 'stopped') ws.status('Stopped', true);
@@ -1719,6 +1727,31 @@
       });
     }
 
+    /* The recorded steps no longer match the page: Claude finishes the task live from that step,
+       in the same workspace, with the password from the confirm card. Save waits for approval again. */
+    function recoverLive(action, res, ws, feed, lrec, secrets) {
+      feed.add('Step ' + (res.failed_index + 1) + ' did not match the page: working out the rest live', 'live');
+      ws.status('Working out the rest live from step ' + (res.failed_index + 1));
+      var t = typing('The page changed: working it out live...');
+      return api('/api/live/recover', { session_id: state.sessionId, run_id: action.run_id, failed_index: res.failed_index, error: res.message })
+        .then(function (r) {
+          t.remove();
+          var known = {};
+          for (var k in secrets) known[norm(String(k).replace(/_/g, ' '))] = secrets[k];
+          return runLive(r.live, { ws: ws, feed: feed, recorder: lrec, secrets: known,
+            update: canTeach && action.task_id ? { title: action.title, task_id: action.task_id } : null });
+        }, function (e) {
+          t.remove();
+          lrec.stop();
+          ws.done();
+          feed.finish('error');
+          ws.status('Stopped at "' + res.failed_step + '": ' + res.message, true);
+          setStatus('error');
+          addMsg('bot', '⚠️ Stopped at **' + res.failed_step + '**: ' + res.message + '\n\n(I could not switch to working it out live: ' + e.message + ')');
+          return report(action.run_id, res);
+        });
+    }
+
     function report(runId, res) {
       var t = typing();
       return api('/api/result', { session_id: state.sessionId, run_id: runId, status: res.status, message: res.message, failed_step: res.failed_step })
@@ -1728,9 +1761,10 @@
 
     /* Live mode: Claude looks at the workspace page, picks the next move, the widget does it, repeat.
        Saves and submits wait for the user's approval; passwords are typed by the user here. */
-    function runLive(live) {
-      var ws = openWorkspace('Agent: ' + live.goal), feed = activity(live.goal), userCtx = pageContext();
-      var lrec = startLiveRecorder(ws.frame, live.goal), payload = {}, secrets = {};
+    function runLive(live, opts) {
+      opts = opts || {};                               /* recovery: same workspace, feed, recording and password */
+      var ws = opts.ws || openWorkspace('Agent: ' + live.goal), feed = opts.feed || activity(live.goal), userCtx = pageContext();
+      var lrec = opts.recorder || startLiveRecorder(ws.frame, live.goal), payload = {}, secrets = opts.secrets || {};
       setStatus('working', 'Working on: ' + live.goal);
 
       function loop() {
@@ -1829,15 +1863,22 @@
         ws.status(status === 'success' ? 'Done: ' + live.goal : 'Stopped: ' + summary, status !== 'success');
         setStatus(status === 'success' ? 'idle' : 'error');
         return report(live.run_id, { status: status, message: summary }).then(function () {
-          var rec = lrec.rec;
+          var rec = lrec.rec, up = opts.update;
           if (status !== 'success' || !canTeach || !rec.component || !rec.steps.some(isAction)) return;
-          var c = card('<h4>Make this a task?</h4><small>I worked this out step by step. Saved as a task, I can do it again in one go, '
-            + 'with new values each time.</small><div class="psa-actions"><button type="button" class="psa-ok">Save as a task</button>'
-            + '<button type="button" class="psa-no">No thanks</button></div>');
+          if (opts.ws && !up) return;
+          var c = card(up
+            ? '<h4>Update the task?</h4><small>The page has changed since <b>' + esc(up.title) + '</b> was recorded; I worked out the '
+              + 'difference live. Update the task with this run so next time is quick again.</small>'
+              + '<div class="psa-actions"><button type="button" class="psa-ok">Review the update</button><button type="button" class="psa-no">Not now</button></div>'
+            : '<h4>Make this a task?</h4><small>I worked this out step by step. Saved as a task, I can do it again in one go, '
+              + 'with new values each time.</small><div class="psa-actions"><button type="button" class="psa-ok">Save as a task</button>'
+              + '<button type="button" class="psa-no">No thanks</button></div>');
           c.querySelector('.psa-no').addEventListener('click', function () { disable(c); });
           c.querySelector('.psa-ok').addEventListener('click', function () {
             disable(c);
-            reviewRecording({ title: live.goal, component: rec.component, query: rec.query || {}, steps: rec.steps });
+            var recording = { title: up ? up.title : live.goal, component: rec.component, query: rec.query || {}, steps: rec.steps };
+            if (up) recording.task_id = up.task_id;
+            reviewRecording(recording);
           });
         });
       }

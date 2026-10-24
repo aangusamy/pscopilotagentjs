@@ -26,6 +26,7 @@ from .llm import LLMError
 log = logging.getLogger("psagent")
 
 MAX_ROUNDS = 60          # model decisions per live run
+RECOVERY_ROUNDS = 20     # when finishing a recorded task whose page no longer matched
 MAX_RETRIES = 2          # invalid tool use re-asked within one round
 HISTORY_KEEP = 40        # most recent history lines sent to the model
 
@@ -138,13 +139,67 @@ class LiveRun:
     details: str = ""
     history: list = field(default_factory=list)
     rounds: int = 0
+    max_rounds: int = MAX_ROUNDS
+    title: str = ""                    # what the user sees on cards (the goal, or the task being finished)
     pending: dict | None = None        # {id, step, text} commit awaiting the user's approval
     awaiting: str | None = None        # "answer" | "approval" | "secret" | "do"
     done: bool = False
 
 
-def new_run(goal, details=""):
-    return LiveRun(run_id="live-" + uuid.uuid4().hex[:10], goal=str(goal)[:500], details=str(details)[:2000])
+def new_run(goal, details="", max_rounds=MAX_ROUNDS):
+    return LiveRun(run_id="live-" + uuid.uuid4().hex[:10], goal=str(goal)[:500], details=str(details)[:4000],
+                   max_rounds=max_rounds)
+
+
+def recovery_run(task, values_rows, steps, failed_index, error):
+    """A recorded task stopped because the page did not match: finish it live from that point.
+    Claude gets the confirmed values, what was done, the failed step and the rest of the recording."""
+    i = failed_index
+    details = ("The user confirmed these values on a summary card:\n"
+               + "\n".join(f"- {r['label']}: {r['value']}" for r in values_rows)
+               + "\nPassword fields: use type_secret (the user's password is filled in for you).")
+    run = new_run(f"Finish the task '{task.title}' on the page in front of you. A recorded procedure did the "
+                  f"first {i} steps, then step {i + 1} did not match the page (it may have changed). Do the rest, "
+                  "adapting the remaining recorded steps to what you see; do not redo finished steps.",
+                  details, max_rounds=RECOVERY_ROUNDS)
+    run.title = task.title
+    run.history = ([f"recorded step {n + 1} done: {describe_step(st)}" for n, st in enumerate(steps[:i])]
+                   + [f"recorded step {i + 1} FAILED: {describe_step(steps[i])}: {str(error)[:300]}"]
+                   + [f"recorded step {n + 1} still to do (adapt it): {describe_step(st)}"
+                      for n, st in enumerate(steps[i + 1:], start=i + 1)])
+    return run
+
+
+def describe_step(st):
+    """A playbook step in words, with secrets masked."""
+    def val(v):
+        v = ", ".join(v) if isinstance(v, list) else str(v)
+        return "(password: use type_secret)" if "{{secret:" in v else repr(v)
+    f = st.get("field") or {}
+    name = f.get("label") or f.get("column") or f.get("id")
+    where = " on the pop-up" if st.get("popup") else ""
+    kind = st.get("do")
+    if kind == "set":
+        return f"set {name} ({f.get('id')}){where} = {val(st.get('value'))}"
+    if kind == "grid":
+        return f"fill the {name} grid rows with {val(st.get('values'))}"
+    if kind == "click":
+        b = st.get("button") or {}
+        return f"click {b.get('text') or b.get('id')}{where}"
+    if kind == "tab":
+        return f"open the {st.get('label')} tab"
+    if kind == "open":
+        keys = ", ".join(f"{(k['field'].get('label') or k['field']['id'])}={k['value']!r}" for k in st.get("keys") or [])
+        return f"open the record on the search page ({st.get('mode')}): {keys}"
+    if kind == "navigate":
+        return "open the component" + (f" with {st.get('query')}" if st.get("query") else "")
+    if kind == "wait":
+        return f"wait for {name}"
+    if kind == "expect_saved":
+        return "check that PeopleSoft shows Saved"
+    if kind == "expect_process":
+        return "check that the process request was accepted"
+    return str(kind)
 
 
 def _elements(snapshot):
@@ -202,9 +257,9 @@ class LiveOperator:
 
         elements = _elements(snapshot)
         for _ in range(MAX_RETRIES + 1):
-            if run.rounds >= MAX_ROUNDS:
+            if run.rounds >= run.max_rounds:
                 run.done = True
-                return {"type": "fail", "summary": f"I stopped after {MAX_ROUNDS} steps without finishing."}
+                return {"type": "fail", "summary": f"I stopped after {run.max_rounds} steps without finishing."}
             run.rounds += 1
             try:
                 # Forced tool choice is not available with every model: the prompt asks for one tool call,
@@ -266,7 +321,7 @@ class LiveOperator:
             run.pending = {"id": uuid.uuid4().hex[:10], "text": text, "step": _click(el)}
             run.awaiting = "approval"
             run.history.append(f"you asked the user to approve: {text}")
-            return {"type": "confirm", "confirm_id": run.pending["id"], "title": run.goal[:120],
+            return {"type": "confirm", "confirm_id": run.pending["id"], "title": (run.title or run.goal)[:120],
                     "button": el.get("text") or el["id"], "rows": rows}, None
         if name == "act":
             acts = args.get("actions") or []

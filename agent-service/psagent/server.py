@@ -4,6 +4,7 @@ POST /api/chat     {session_id?, message, page?}          -> reply
 POST /api/confirm  {session_id, run_id, approved}         -> reply (+ action when approved)
 POST /api/result   {session_id, run_id, status, message?, failed_step?} -> reply
 POST /api/live/step {session_id, run_id, snapshot, result?, answer?, approved?, declined?} -> {action}
+POST /api/live/recover {session_id, run_id, failed_index, error}  -> {live}  (recorded run hit a changed page)
 GET  /api/me                                              -> {oprid, can_teach, tasks}
 POST /api/recordings/draft {recording}                    -> {draft}       (teachers)
 POST /api/recordings/save  {recording, draft, overwrite?} -> {task_id, ...} (teachers)
@@ -141,6 +142,26 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
         action = await run_in_threadpool(work)
         return JSONResponse({"action": action})
 
+    async def live_recover(request):
+        oprid = oprid_of(request)
+        if not oprid:
+            return bad("unauthorized", 401)
+        data = await body(request)
+        if data is None or not data.get("run_id"):
+            return bad("run_id is required")
+        s = store.get(data.get("session_id"), oprid)
+        if s is None:
+            return bad("unknown session", 404)
+
+        def work():
+            with s.lock:
+                return agent.recover(s, str(data["run_id"]), data.get("failed_index"), str(data.get("error") or ""))
+
+        live = await run_in_threadpool(work)
+        if live is None:
+            return bad("no recorded run to recover", 409)
+        return JSONResponse({"live": live})
+
     async def me(request):
         oprid = oprid_of(request)
         if not oprid:
@@ -201,6 +222,7 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
             Route("/api/confirm", confirm, methods=["POST"]),
             Route("/api/result", result, methods=["POST"]),
             Route("/api/live/step", live_step, methods=["POST"]),
+            Route("/api/live/recover", live_recover, methods=["POST"]),
             Route("/api/me", me),
             Route("/api/recordings/draft", draft, methods=["POST"]),
             Route("/api/recordings/save", save, methods=["POST"]),
