@@ -22,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-10-24.6';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-10-24.7';   /* shown as PSAgent.version and in the console: check after uploading */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
@@ -1170,6 +1170,15 @@
       '.psa-card input.psa-unsure{background:#fffbeb!important;border-color:#f59e0b!important;}',
       '.psa-card input.psa-miss{background:#fef2f2!important;border-color:#f87171!important;}',
       '.psa-legend{font-size:11px;color:var(--psa-sub);}.psa-legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin:0 4px 0 8px;vertical-align:-1px;}',
+      /* troubleshooting diagnosis */
+      '.psa-diag-top{display:flex;align-items:center;gap:10px;margin:2px 0 8px;}',
+      '.psa-badge{display:inline-block;padding:3px 10px;border-radius:999px;font-weight:700;font-size:12px;}',
+      '.psa-diag-sum{margin:0 0 10px;font-size:14px;line-height:1.5;}',
+      '.psa-diag-sec{margin:8px 0;font-size:13px;}.psa-diag-sec>b{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--psa-sub);margin-bottom:3px;}',
+      '.psa-diag-sec ol,.psa-card details ul{margin:2px 0;padding-left:20px;}.psa-diag-sec li,.psa-card details li{margin:2px 0;}',
+      '.psa-card pre.psa-code{margin:4px 0;padding:10px 12px;max-height:260px;overflow:auto;background:#0f172a;color:#e2e8f0;border-radius:10px;font:12px/1.5 Consolas,"Courier New",monospace;white-space:pre-wrap;word-break:break-word;}',
+      '.psa-card code.psa-where{display:inline-block;padding:2px 8px;background:#eef2ff;color:#3730a3;border-radius:6px;font:12px Consolas,monospace;}',
+      '.psa-q{margin:6px 0;font-size:12px;}',
       /* workspace: where the agent works, next to the panel */
       '#psa-ws{position:fixed;top:12px;left:12px;right:12px;bottom:12px;display:none;flex-direction:column;background:#fff;border-radius:18px;overflow:hidden;z-index:2147483644;box-shadow:0 24px 64px rgba(15,23,42,.28),0 0 0 2px rgba(79,70,229,.45);font-size:13px;}',
       'body.psa-docked #psa-ws{right:464px;}body.psa-docked.psa-widebody #psa-ws{right:744px;}',
@@ -1320,6 +1329,7 @@
       var tiles = [];
       if (ctx.error) tiles.push({ t: 'Help with this error', s: ctx.error, q: 'Help me with this error' });
       ((me && me.tasks) || []).slice(0, 6).forEach(function (t) { tiles.push({ t: t.title, s: t.example, q: t.example }); });
+      if (me && me.troubleshoot) tiles.push({ t: 'Troubleshoot a process', s: 'Why did my last process fail?', q: 'Why did my last process fail?' });
       if (ctx.component && !isFrameworkPage(ctx)) tiles.push({ t: 'Explain this page', s: ctx.title || ctx.component, q: 'What is this page for and how do I use it?' });
       tiles.push({ t: 'Something new', s: 'Describe it and I will work it out on screen', q: '', cls: ' psa-new' });
       html += '<div class="psa-sec">I can</div><div class="psa-grid">' + tiles.map(function (x) {
@@ -1447,6 +1457,7 @@
       if (r.action) return runAndReport(r.action);
       if (r.live) return runLive(r.live);
       if (r.batch_action) return runBatch(r.batch_action);
+      if (r.troubleshoot) return runTroubleshoot(r.troubleshoot);
     }
 
     function call(path, payload) {
@@ -1917,6 +1928,77 @@
       return next();
     }
 
+    /* Troubleshoot a failed process: read its posted log files in the user's session, then the
+       investigator takes one step per call (each shown in the feed) until the diagnosis is ready. */
+    function runTroubleshoot(t) {
+      var feed = activity('Troubleshooting process ' + t.instance), logs = [], first = true;
+      setStatus('working', 'Investigating process ' + t.instance);
+      var reads = (t.logs || []).map(function (lf) {
+        var item = feed.add('Reading log file ' + lf.name);
+        return fetch(lf.path, { credentials: 'same-origin' }).then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          if (/html/i.test(r.headers.get('content-type') || '') && !/\.html?$/i.test(lf.name)) throw new Error('not readable (sign-on page)');
+          return r.text();
+        }).then(function (text) { item.end(true); logs.push({ name: lf.name, text: text.slice(0, 60000) }); },
+                function (e) { item.end(false, e.message); });
+      });
+      function next() {
+        var looking = feed.add('Deciding what to check next', 'think');
+        setStatus('thinking', 'Investigating process ' + t.instance + '...');
+        var body = { session_id: state.sessionId, run_id: t.run_id };
+        if (first) { body.logs = logs; first = false; }
+        return api('/api/troubleshoot/step', body).then(function (r) {
+          looking.remove();
+          (r.steps || []).forEach(function (text) { feed.add(text).end(true); });
+          if (!r.done) { setStatus('working', 'Investigating process ' + t.instance); return next(); }
+          feed.finish(r.diagnosis ? 'success' : 'error');
+          setStatus(r.diagnosis ? 'idle' : 'error');
+          if (r.diagnosis) showDiagnosis(r.diagnosis);
+          else addMsg('bot', '⚠️ ' + (r.error || 'I could not finish the investigation.'));
+        }, function (e) {
+          looking.remove();
+          feed.finish('error');
+          setStatus('error');
+          addMsg('bot', '⚠️ I lost contact with the agent service: ' + e.message, false);
+        });
+      }
+      return Promise.all(reads).then(next);
+    }
+
+    var CATEGORY = {
+      data: ['Data issue', '#92400e', '#fef3c7'], code: ['Code issue', '#5b21b6', '#ede9fe'],
+      setup: ['Setup issue', '#075985', '#e0f2fe'], security: ['Security issue', '#9f1239', '#ffe4e6'],
+      environment: ['Environment issue', '#065f46', '#d1fae5'], unknown: ['Not conclusive', '#334155', '#f1f5f9']
+    };
+    function showDiagnosis(d) {
+      var cat = CATEGORY[d.category] || CATEGORY.unknown;
+      var list = function (items, tag) { return '<' + tag + '>' + (items || []).map(function (x) { return '<li>' + md(x) + '</li>'; }).join('') + '</' + tag + '>'; };
+      var c = card('<h4>Process ' + esc(d.instance) + ': what went wrong</h4>'
+        + '<div class="psa-diag-top"><span class="psa-badge" style="color:' + cat[1] + ';background:' + cat[2] + '">' + cat[0] + '</span>'
+        + '<small>Confidence: ' + esc(d.confidence || '?') + '</small></div>'
+        + '<p class="psa-diag-sum">' + md(d.summary || '') + '</p>'
+        + (d.where ? '<div class="psa-diag-sec"><b>Where</b><code class="psa-where">' + esc(d.where) + '</code></div>' : '')
+        + '<div class="psa-diag-sec"><b>Root cause</b>' + md(d.root_cause || '') + '</div>'
+        + ((d.evidence || []).length ? '<details open><summary>Evidence</summary>' + list(d.evidence, 'ul') + '</details>' : '')
+        + '<div class="psa-diag-sec"><b>How to fix</b>' + list(d.fix_steps, 'ol') + '</div>'
+        + (d.code_fix ? '<div class="psa-diag-sec"><b>Suggested code</b><pre class="psa-code">' + esc(d.code_fix) + '</pre></div>' : '')
+        + (d.rerun ? '<div class="psa-diag-sec"><b>Then</b>' + md(d.rerun) + '</div>' : '')
+        + ((d.queries || []).length ? '<details><summary>' + d.queries.length + ' read-only ' + (d.queries.length === 1 ? 'query' : 'queries') + ' I ran</summary>'
+          + d.queries.map(function (q) { return '<div class="psa-q"><b>' + esc(q.purpose) + '</b> (' + q.rows + ' rows)<pre class="psa-code">' + esc(q.sql) + '</pre></div>'; }).join('')
+          + '</details>' : '')
+        + '<div class="psa-actions"><button type="button" class="psa-no" data-copy>Copy report</button></div>');
+      c.classList.add('psa-diag');
+      c.querySelector('[data-copy]').addEventListener('click', function (e) {
+        var text = ['Process ' + d.instance + ' (' + cat[0] + ', confidence ' + d.confidence + ')', d.summary, '', 'Where: ' + (d.where || '-'),
+          'Root cause: ' + d.root_cause, '', 'Evidence:'].concat((d.evidence || []).map(function (x) { return '- ' + x; }), ['', 'Fix:'],
+          (d.fix_steps || []).map(function (x, i) { return (i + 1) + '. ' + x; }), d.code_fix ? ['', 'Suggested code:', d.code_fix] : [],
+          d.rerun ? ['', 'Then: ' + d.rerun] : []).join('\n');
+        var btn = e.target;
+        (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(function () { btn.textContent = 'Copied'; },
+          function () { btn.textContent = 'Copy not allowed here'; });
+      });
+    }
+
     function report(runId, res) {
       var t = typing();
       return api('/api/result', { session_id: state.sessionId, run_id: runId, status: res.status, message: res.message, failed_step: res.failed_step })
@@ -2078,7 +2160,9 @@
           addMsg('bot', 'Sorry, the agent is not available right now: ' + e.message + '.', false);
         });
       }
-      setTimeout(function () { input.focus(); }, 100);
+      /* Focus the message box, unless the person is already typing somewhere in the panel
+         (a password on a card must never end up in the chat box) */
+      setTimeout(function () { if (!panel.contains(document.activeElement)) input.focus(); }, 100);
     }
     function close() {
       panel.classList.remove('psa-open');

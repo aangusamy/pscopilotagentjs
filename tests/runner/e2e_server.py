@@ -26,6 +26,7 @@ from fakes import FakeLLM, response, text, tool  # noqa: E402
 from psagent.agent import Agent  # noqa: E402
 from psagent.server import create_app  # noqa: E402
 from psagent.tasks import load_tasks  # noqa: E402
+from test_troubleshoot import FakeDB  # noqa: E402  (rows from the real instance 557060)
 
 TASKS_DIR = Path(tempfile.mkdtemp(prefix="psagent-tasks-"))
 shutil.copytree(ROOT / "agent-service" / "tests" / "fixtures" / "tasks", TASKS_DIR, dirs_exist_ok=True)
@@ -128,9 +129,25 @@ llm = FakeLLM(
     ]}, id="d1"), tool("request_confirmation", {}, id="d2")),
     response(text("I found **2 people** on the form. Please check the table; one description is missing.")),
     response(text("Both users were created from the form: **DOCA1** and **DOCB2**.")),
+    # troubleshooting: the user's last failed process (557060, AEMINITEST divides by zero)
+    response(tool("troubleshoot_process", {"instance": "", "question": "why did my last process fail?"}, id="t1")),
+    response(text("I'm looking into process **557060** now.")),
+    response(tool("get_process", {"instance": "557060"}, id="t2")),
+    response(tool("get_peoplecode", {"program": "AEMINITEST", "section": "MAIN", "step": "Step02"}, id="t3")),
+    response(tool("finish", {
+        "category": "code", "confidence": "high",
+        "summary": "AEMINITEST stops because line 5 of Step02 always divides by zero.",
+        "where": "AEMINITEST.MAIN.Step02 (PeopleCode) - statement 3, line 5",
+        "root_cause": "`&test = 1 / 0;` divides by zero on every run, before the validation logic.",
+        "evidence": ["Message log: Decimal division by zero occurred. (180,109) ... Step02.OnExecute PCPC:108 Statement:3",
+                     "PeopleCode line 5 [stmt 3]: &test = 1 / 0;", "Earlier runs 557051-557053 of the same program succeeded"],
+        "fix_steps": ["Open AEMINITEST in App Designer, Step02 PeopleCode.", "Delete line 5 (&test = 1 / 0;) and save.",
+                      "Rerun the process."],
+        "code_fix": "Local number &nTest = 0;\nLocal string &sName = \"PSIQ\";\n\n&nTest = &nTest + 1;",
+        "rerun": "Run AEMINITEST again from Request AE (or ask me to run it)."}, id="t4")),
     drafts=[DRAFT, DRAFT_PROCESS],
 )
-app = create_app(Agent(llm, TASKS), secret="", allowed_origins=[], dev_oprid="TESTER",
+app = create_app(Agent(llm, TASKS, FakeDB()), secret="", allowed_origins=[], dev_oprid="TESTER",
                  teachers={"*"}, tasks_dir=str(TASKS_DIR))
 bodies = []
 
@@ -206,6 +223,11 @@ app.router.routes.extend([
     Route("/psc/ps/EMPLOYEE/HRMS/c/{name}", component),
     Route("/psp/ps/EMPLOYEE/HRMS/c/{name}", portal),
     Route("/psagent.js", lambda r: FileResponse(ROOT / "psagent.js", media_type="text/javascript")),
+    # the report repository, as PeopleSoft serves a posted log file
+    Route("/psreports/ps/85515/AE_AEMINITEST_557060.stdout", lambda r: Response(
+        "PSAESRV started service request at 16.40.55 2026-10-24\n\nDecimal division by zero occurred. (180,109) "
+        "AEMINITEST.MAIN.GBL.default.1900-01-01.Step02.OnExecute  PCPC:108  Statement:3\n\nProcess 557060 ABENDED at Step "
+        "AEMINITEST.MAIN.Step02 (PeopleCode) -- RC = 8 (108,524)\n", media_type="text/plain")),
     Route("/__test/action", action),
     Route("/__test/bodies", lambda r: JSONResponse(bodies)),
     Route("/__test/task_file", lambda r: Response((TASKS_DIR / (r.query_params["id"] + ".yaml")).read_text())),

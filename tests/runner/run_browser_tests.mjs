@@ -377,6 +377,25 @@ test('documents: attach a form, review the people in one table, fix a row, creat
   assert.ok(!bodies.join('').includes('D0c!pw'), 'password reached the agent service');
 });
 
+test('troubleshoot: "why did my last process fail?" -> log file, message log and code -> diagnosis card', async page => {
+  await page.click('#psa-fab');
+  await page.locator('.psa-tile', { hasText: 'Troubleshoot a process' }).click();     // from the welcome screen
+  const card = page.locator('.psa-card.psa-diag');
+  await card.waitFor({ timeout: 60000 });
+  const text = await card.innerText();
+  for (const s of ['Process 557060: what went wrong', 'Code issue', 'Confidence: high', 'AEMINITEST.MAIN.Step02 (PeopleCode) - statement 3, line 5',
+    'Delete line 5', 'Earlier runs 557051-557053'])
+    assert.ok(text.includes(s), s + ' missing in\n' + text);
+  assert.match(await card.locator('pre.psa-code').innerText(), /&nTest = &nTest \+ 1;/);   // the suggested code
+  const feed = await page.locator('.psa-feed').last().innerText();
+  for (const s of ['Troubleshooting process 557060', 'Reading log file AE_AEMINITEST_557060.stdout',
+    'Read process 557060: status, message log, earlier runs', 'Read PeopleCode AEMINITEST.MAIN.Step02', 'Diagnosis ready'])
+    assert.ok(feed.includes(s), s + ' missing in\n' + feed);
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b.includes('"run_id":"tbl-'));
+  assert.match(JSON.parse(bodies[0]).logs[0].text, /ABENDED at Step AEMINITEST\.MAIN\.Step02/);   // log read in the browser, sent once
+  assert.ok(!JSON.parse(bodies[1]).logs);
+});
+
 let failed = 0;
 try {
   await waitForServer();
@@ -394,7 +413,7 @@ try {
     } catch (e) {
       failed++;
       console.log(`FAIL - ${t.name}\n${e.stack}`);
-      await page.screenshot({ path: path.join(here, 'failure.png') });
+      await page.screenshot({ path: path.join(os.tmpdir(), 'psa-failure-' + tests.indexOf(t) + '.png') });
     }
     await page.close();
   }

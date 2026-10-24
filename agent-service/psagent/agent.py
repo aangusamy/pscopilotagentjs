@@ -16,6 +16,8 @@ import uuid
 from dataclasses import dataclass, field
 
 from . import live as livemode
+from .db import QueryError
+from .troubleshoot import Troubleshooter
 from .llm import LLMError
 
 log = logging.getLogger("psagent")
@@ -60,7 +62,9 @@ reading each page and deciding the next move, and the user approves anything \
 that saves or submits. Also call work_live (not start_task) when the user asks \
 you to do it live, figure it out yourself, or not use the recorded task. Gather the values the user already gave into its \
 details; you can ask for more during the run. For questions (not actions), \
-just answer. Users allowed to teach can also add tasks: when a user wants to \
+just answer. When the user asks why a process failed or to troubleshoot a \
+process instance (or "my last failed process"), call troubleshoot_process: it \
+investigates the message log, log files, code and data and shows a diagnosis. Users allowed to teach can also add tasks: when a user wants to \
 teach or record a new task, call offer_recording. They then do the task \
 once by hand while the widget records it, review the template and save it. New \
 or updated tasks are announced to you in system messages during the conversation.
@@ -190,6 +194,16 @@ def build_tools():
             ["goal", "details"],
         ),
         _strict(
+            "troubleshoot_process",
+            "Investigate a failed Process Scheduler request: message log, log files, program code and data "
+            "(read-only), then show the user a diagnosis with the fix.",
+            {
+                "instance": {"type": "string", "description": "Process instance number, or empty for the user's latest failed process"},
+                "question": {"type": "string", "description": "What the user wants to know, in their words"},
+            },
+            ["instance", "question"],
+        ),
+        _strict(
             "offer_recording",
             "Show the Record card so the user can teach a new task by doing it once by hand.",
             {"title": {"type": "string", "description": "Short task title starting with a verb, e.g. 'Create Requisition'"}},
@@ -220,10 +234,12 @@ class Reply:
     live: dict | None = None
     batch: dict | None = None          # review table for several items
     batch_action: dict | None = None   # confirmed batch: one run per row
+    troubleshoot: dict | None = None   # investigation started: the widget drives it step by step
 
     def to_dict(self):
         return {"messages": self.messages, "confirm": self.confirm, "action": self.action, "record": self.record,
-                "live": self.live, "batch": self.batch, "batch_action": self.batch_action}
+                "live": self.live, "batch": self.batch, "batch_action": self.batch_action,
+                "troubleshoot": self.troubleshoot}
 
 
 @dataclass
@@ -238,6 +254,7 @@ class Session:
     live: livemode.LiveRun | None = None  # live run in progress
     unsure: dict = field(default_factory=dict)   # field name -> note, for the active task
     batch: dict | None = None                    # {task, items: [{label, values, unsure}]} being prepared
+    investigation: object | None = None          # troubleshoot.Investigation in progress
     can_teach: bool = False
     system: str | None = None  # frozen at the first turn so the prompt prefix never changes
     known: dict | None = None  # task_id -> signature the model has been told about
@@ -272,9 +289,10 @@ class SessionStore:
 
 
 class Agent:
-    def __init__(self, llm, tasks):
+    def __init__(self, llm, tasks, db=None, troubleshoot_effort="medium"):
         self.llm = llm
         self.operator = livemode.LiveOperator(llm)
+        self.troubleshooter = Troubleshooter(llm, db, troubleshoot_effort) if db is not None else None
         self.tasks = dict(tasks)
         self.tools = build_tools()
         self._tasks_lock = threading.Lock()
@@ -438,6 +456,23 @@ class Agent:
         log.info("live %s for %s: %s", run_id, s.oprid, json.dumps(action)[:500])
         return action
 
+    def troubleshoot_step(self, s, run_id, logs=None):
+        """One step of an investigation (see troubleshoot.py); the diagnosis is remembered in the chat."""
+        inv = s.investigation
+        if not inv or inv.run_id != run_id or not self.troubleshooter:
+            return {"steps": [], "done": True, "diagnosis": None, "error": "This investigation is no longer active."}
+        out = self.troubleshooter.step(inv, s.oprid, logs)
+        if out.get("done"):
+            s.investigation = None
+            d = out.get("diagnosis")
+            note = (f"[troubleshoot result] process {inv.instance}: " + json.dumps(
+                {k: d[k] for k in ("category", "confidence", "summary", "where", "root_cause", "fix_steps", "code_fix", "rerun")})
+                if d else f"[troubleshoot result] process {inv.instance}: {out.get('error') or 'no diagnosis'}")
+            s.messages.append({"role": "user", "content": note[:6000]})
+            log.info("troubleshoot %s of %s for %s: %s", inv.run_id, inv.instance, s.oprid,
+                     (d or {}).get("summary") or out.get("error"))
+        return out
+
     def report(self, s, run_id, status, message, failed_step=None):
         if not s.running or s.running["run_id"] != run_id:
             return Reply(messages=["I don't have a run with that ID in progress."])
@@ -570,6 +605,24 @@ class Agent:
             return {"started": True, "run_id": run.run_id,
                     "note": "You are now working on screen; the result arrives as an [automation result]. "
                             "Tell the user in one short sentence that you are on it."}, False
+
+        if name == "troubleshoot_process":
+            if not self.troubleshooter:
+                return {"error": "troubleshooting needs read-only database access; an administrator sets PSAGENT_DB_* "
+                                 "in the agent service settings"}, True
+            try:
+                instance = self.troubleshooter.find_instance(s.oprid, args.get("instance"))
+            except QueryError as e:
+                return {"error": f"could not read the process requests: {e}"}, True
+            if not instance:
+                return {"error": "no failed process found for this user; ask for the process instance number"}, True
+            inv = self.troubleshooter.start(s.oprid, instance, args.get("question") or "")
+            s.investigation = inv
+            reply.troubleshoot = {"run_id": inv.run_id, "instance": instance,
+                                  "logs": self.troubleshooter.log_files(instance)}
+            return {"started": True, "instance": instance,
+                    "note": "The investigation runs now and the user sees each step and the diagnosis card. "
+                            "Tell them in one short sentence that you are looking into it."}, False
 
         if name == "offer_recording":
             if not s.can_teach:

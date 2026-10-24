@@ -21,7 +21,7 @@ class ClaudeLLM:
         self.effort = effort
         self.max_tokens = max_tokens
 
-    def create(self, system, messages, tools, tool_choice=None, cache="conversation"):
+    def create(self, system, messages, tools, tool_choice=None, cache="conversation", effort=None):
         """cache="conversation": cache everything up to the last message (the chat grows append-only).
         cache="prefix": cache only tools + system (live mode sends a new page snapshot every call)."""
         a = self._anthropic
@@ -36,7 +36,7 @@ class ClaudeLLM:
                 tools=tools,
                 messages=messages,
                 **({"tool_choice": tool_choice} if tool_choice else {}),
-                output_config={"effort": self.effort},
+                output_config={"effort": effort or self.effort},
                 **caching,
                 # On a safety-classifier decline, retry server-side on Anthropic's recommended model.
                 betas=["server-side-fallback-2026-07-01"],

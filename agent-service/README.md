@@ -102,6 +102,56 @@ The pilot is an access request form → user profiles. The same pipeline takes a
 task: a supplier invoice → voucher in Financials only needs the voucher task and
 its lookups (vendor, PO).
 
+## Troubleshooting failed processes
+
+Ask *"why did process 557060 fail?"* or *"why did my last process fail?"* (also a
+tile on the welcome screen). The agent investigates like a PeopleSoft admin and
+shows each step in the activity feed:
+
+1. the posted log files (stdout, .log, .trc), read in your browser session, the
+   same links as View Log/Trace in Process Monitor;
+2. the request, its message log (catalog text with parameters), parameters and
+   earlier runs of the same process;
+3. the failing code: Application Engine sections, steps and SQL, and the
+   PeopleCode of a step with statement numbers matching PeopleSoft's
+   "Statement:n";
+4. read-only queries to prove a data problem;
+5. a diagnosis card: category (data, code, setup, security, environment),
+   confidence, where, root cause, evidence, fix steps, suggested code, how to
+   rerun, and every query it ran. *Copy report* puts it on the clipboard.
+
+It needs read-only database access, set in `.env`:
+
+```
+PSAGENT_DB_DSN=dbhost:1521/SERVICE      # e.g. 192.168.56.103:1521/HR92U052
+PSAGENT_DB_USER=PSAGENT_RO
+PSAGENT_DB_PASSWORD=...
+PSAGENT_DB_SCHEMA=SYSADM                # owner of the PeopleSoft tables
+PSAGENT_TROUBLESHOOT_EFFORT=medium      # Claude effort for investigations
+```
+
+Read-only is enforced three ways, so it holds even with a privileged account:
+every statement must be one SELECT/WITH (no DML, DDL, PL/SQL, FOR UPDATE or
+database links), every session runs `SET TRANSACTION READ ONLY`, and every query
+is rolled back. Results are capped at 200 rows and 20 seconds; national IDs,
+birth dates, pay rates, bank details and password hashes come back as `***`;
+every query is logged with the user and its purpose. Use a SELECT-only account
+in production:
+
+```sql
+CREATE USER PSAGENT_RO IDENTIFIED BY "...";
+GRANT CREATE SESSION TO PSAGENT_RO;
+BEGIN
+  FOR t IN (SELECT object_name FROM dba_objects WHERE owner = 'SYSADM' AND object_type IN ('TABLE', 'VIEW')) LOOP
+    EXECUTE IMMEDIATE 'GRANT SELECT ON SYSADM."' || t.object_name || '" TO PSAGENT_RO';
+  END LOOP;
+END;
+/
+```
+
+The driver is `python-oracledb` in thin mode: nothing to install on the database
+server. A typical investigation takes 20-60 seconds and costs a few tens of cents.
+
 ## The chat panel
 
 The widget is a panel docked on the right, with the workspace beside it:
@@ -276,8 +326,8 @@ of asking for them. That is the natural next step.
 ## Tests
 
 ```bash
-cd agent-service && python3 -m unittest discover -s tests -t tests       # 77 unit tests, scripted LLM
-cd .. && node tests/runner/run_browser_tests.mjs                          # 11 browser tests (Playwright)
+cd agent-service && python3 -m unittest discover -s tests -t tests       # 84 unit tests, scripted LLM
+cd .. && node tests/runner/run_browser_tests.mjs                          # 12 browser tests (Playwright)
 ```
 
 The browser tests run the real widget and the real service (with a scripted

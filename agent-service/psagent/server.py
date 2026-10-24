@@ -3,6 +3,7 @@
 POST /api/chat     {session_id?, message, page?, attachment?{name, media_type, data}} -> reply
 POST /api/confirm  {session_id, run_id, approved, rows?}  -> reply (+ action / batch_action when approved)
 POST /api/batch/result {session_id, batch_id, results}    -> reply
+POST /api/troubleshoot/step {session_id, run_id, logs?}   -> {steps, done, diagnosis}
 POST /api/result   {session_id, run_id, status, message?, failed_step?} -> reply
 POST /api/live/step {session_id, run_id, snapshot, result?, answer?, approved?, declined?} -> {action}
 POST /api/live/recover {session_id, run_id, failed_index, error}  -> {live}  (recorded run hit a changed page)
@@ -128,6 +129,25 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
         reply = await run_in_threadpool(work)
         return JSONResponse({"session_id": s.id, **reply.to_dict()})
 
+    async def troubleshoot_step(request):
+        oprid = oprid_of(request)
+        if not oprid:
+            return bad("unauthorized", 401)
+        data = await body(request)
+        if data is None or not data.get("run_id"):
+            return bad("run_id is required")
+        s = store.get(data.get("session_id"), oprid)
+        if s is None:
+            return bad("unknown session", 404)
+        logs = [{"name": str(x.get("name"))[:120], "text": str(x.get("text") or "")[:60000]}
+                for x in (data.get("logs") or []) if isinstance(x, dict)][:6]
+
+        def work():
+            with s.lock:
+                return agent.troubleshoot_step(s, str(data["run_id"]), logs)
+
+        return JSONResponse(await run_in_threadpool(work))
+
     async def batch_result(request):
         oprid = oprid_of(request)
         if not oprid:
@@ -195,7 +215,8 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
         if not oprid:
             return bad("unauthorized", 401)
         tasks = [{"id": t.id, "title": t.title, "example": (t.examples or [t.title])[0]} for t in agent.tasks.values()]
-        return JSONResponse({"oprid": oprid, "can_teach": can_teach(oprid), "tasks": tasks})
+        return JSONResponse({"oprid": oprid, "can_teach": can_teach(oprid), "tasks": tasks,
+                             "troubleshoot": agent.troubleshooter is not None})
 
     async def draft(request):
         oprid = oprid_of(request)
@@ -250,6 +271,7 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
             Route("/api/confirm", confirm, methods=["POST"]),
             Route("/api/result", result, methods=["POST"]),
             Route("/api/batch/result", batch_result, methods=["POST"]),
+            Route("/api/troubleshoot/step", troubleshoot_step, methods=["POST"]),
             Route("/api/live/step", live_step, methods=["POST"]),
             Route("/api/live/recover", live_recover, methods=["POST"]),
             Route("/api/me", me),
@@ -306,4 +328,12 @@ def app_from_env():
         model=os.environ.get("PSAGENT_MODEL", "claude-opus-5-5"),
         effort=os.environ.get("PSAGENT_EFFORT", "low"),
     )
-    return create_app(Agent(llm, load_tasks(tasks_dir)), secret, origins, dev_oprid, teachers, tasks_dir)
+    db = None
+    try:
+        from .db import from_env  # noqa: PLC0415
+        db = from_env(os.environ)
+    except ImportError:
+        log.warning("python-oracledb is not installed: troubleshooting is off (pip install oracledb)")
+    log.info("Troubleshooting database (PSAGENT_DB_*): %s", db.label if db else "not configured: troubleshooting is off")
+    agent = Agent(llm, load_tasks(tasks_dir), db, os.environ.get("PSAGENT_TROUBLESHOOT_EFFORT", "medium"))
+    return create_app(agent, secret, origins, dev_oprid, teachers, tasks_dir)
