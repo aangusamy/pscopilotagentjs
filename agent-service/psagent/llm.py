@@ -21,7 +21,7 @@ class ClaudeLLM:
         self.effort = effort
         self.max_tokens = max_tokens
 
-    def create(self, system, messages, tools):
+    def create(self, system, messages, tools, tool_choice=None):
         a = self._anthropic
         try:
             resp = self.client.beta.messages.create(
@@ -30,6 +30,7 @@ class ClaudeLLM:
                 system=system,
                 tools=tools,
                 messages=messages,
+                **({"tool_choice": tool_choice} if tool_choice else {}),
                 output_config={"effort": self.effort},
                 cache_control={"type": "ephemeral"},
                 # On a safety-classifier decline, retry server-side on Anthropic's recommended model.

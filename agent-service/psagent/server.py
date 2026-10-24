@@ -3,7 +3,8 @@
 POST /api/chat     {session_id?, message, page?}          -> reply
 POST /api/confirm  {session_id, run_id, approved}         -> reply (+ action when approved)
 POST /api/result   {session_id, run_id, status, message?, failed_step?} -> reply
-GET  /api/me                                              -> {oprid, can_teach}
+POST /api/live/step {session_id, run_id, snapshot, result?, answer?, approved?, declined?} -> {action}
+GET  /api/me                                              -> {oprid, can_teach, tasks}
 POST /api/recordings/draft {recording}                    -> {draft}       (teachers)
 POST /api/recordings/save  {recording, draft, overwrite?} -> {task_id, ...} (teachers)
 GET  /health
@@ -117,11 +118,35 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
         reply = await run_in_threadpool(work)
         return JSONResponse({"session_id": s.id, **reply.to_dict()})
 
+    async def live_step(request):
+        oprid = oprid_of(request)
+        if not oprid:
+            return bad("unauthorized", 401)
+        data = await body(request)
+        if data is None or not data.get("run_id"):
+            return bad("run_id is required")
+        s = store.get(data.get("session_id"), oprid)
+        if s is None:
+            return bad("unknown session", 404)
+
+        def work():
+            with s.lock:
+                return agent.live_step(
+                    s, str(data["run_id"]), data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {},
+                    data.get("result") if isinstance(data.get("result"), dict) else None,
+                    str(data["answer"])[:2000] if data.get("answer") is not None else None,
+                    str(data.get("approved") or "") or None, data.get("declined") is True,
+                )
+
+        action = await run_in_threadpool(work)
+        return JSONResponse({"action": action})
+
     async def me(request):
         oprid = oprid_of(request)
         if not oprid:
             return bad("unauthorized", 401)
-        return JSONResponse({"oprid": oprid, "can_teach": can_teach(oprid)})
+        tasks = [{"id": t.id, "title": t.title, "example": (t.examples or [t.title])[0]} for t in agent.tasks.values()]
+        return JSONResponse({"oprid": oprid, "can_teach": can_teach(oprid), "tasks": tasks})
 
     async def draft(request):
         oprid = oprid_of(request)
@@ -175,6 +200,7 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
             Route("/api/chat", chat, methods=["POST"]),
             Route("/api/confirm", confirm, methods=["POST"]),
             Route("/api/result", result, methods=["POST"]),
+            Route("/api/live/step", live_step, methods=["POST"]),
             Route("/api/me", me),
             Route("/api/recordings/draft", draft, methods=["POST"]),
             Route("/api/recordings/save", save, methods=["POST"]),

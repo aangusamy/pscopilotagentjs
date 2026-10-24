@@ -404,7 +404,9 @@ class RecordingApiTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_only_teachers(self):
-        self.assertEqual(self.c.get("/api/me", headers=hdr("CLERK")).json(), {"oprid": "CLERK", "can_teach": False})
+        me = self.c.get("/api/me", headers=hdr("CLERK")).json()
+        self.assertEqual((me["oprid"], me["can_teach"]), ("CLERK", False))
+        self.assertEqual(me["tasks"][0]["id"], "create_user_profile")          # for the welcome screen
         self.assertTrue(self.c.get("/api/me", headers=hdr("TEACHER")).json()["can_teach"])
         r = self.c.post("/api/recordings/draft", json={"recording": RECORDING}, headers=hdr("CLERK"))
         self.assertEqual(r.status_code, 403)

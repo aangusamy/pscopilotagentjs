@@ -22,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-10-24.3';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-10-24.4';   /* shown as PSAgent.version and in the console: check after uploading */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
@@ -480,6 +480,8 @@
       case 'tab': return 'Open the ' + step.label + ' tab';
       case 'grid': return 'Fill ' + fieldName(step.field) + ' rows';
       case 'wait': return 'Wait for ' + fieldName(step.field);
+      case 'navigate': return step.component ? 'Open ' + step.component.menu + '.' + step.component.component : 'Open the page';
+      case 'pick': return 'Open ' + step.value;
       case 'open': return ({ add: 'Add ', find: 'Open ', add_or_open: 'Add or open ' }[step.mode] || 'Open ')
         + ((step.keys || []).map(function (k) { return k.value; }).join(' ') || 'the page');
       case 'expect_saved': return 'Check the save result';
@@ -641,7 +643,7 @@
         el: el,
         frame: el.querySelector('#psa-ws-frame'),
         stopped: false,
-        progress: function (n, total, text) { this.status('Step ' + n + '/' + total + ': ' + text); },
+        progress: function (n, total, text) { this.status('Step ' + n + '/' + total + ': ' + text); if (this.onStep) this.onStep(n, total, text); },
         status: function (text, isError) {
           var st = el.querySelector('#psa-ws-status');
           st.textContent = text;
@@ -659,6 +661,7 @@
     }
     workspace.stopped = false;
     workspace.onClose = null;
+    workspace.onStep = null;
     workspace.el.style.display = 'flex';
     workspace.el.querySelector('#psa-ws-stop').style.display = '';
     workspace.el.querySelector('#psa-ws-title').textContent = title;
@@ -874,6 +877,151 @@
   }
 
   /* ============================================================
+     LIVE MODE — Claude reads the page and decides each step (live.py)
+     ============================================================ */
+
+  var SNAP_LIMIT = { fields: 150, buttons: 80, options: 30, results: 30 };
+
+  /* What a person sees on the workspace page, as data for Claude: fields, buttons, tabs,
+     messages, the pop-up over it and search results. Ids of pop-up elements start with "popup:". */
+  function snapshotPage(frame, userCtx) {
+    var snap = { component: '', phase: 'none', fields: [], buttons: [], tabs: [], results: [], messages: [] };
+    if (userCtx && userCtx.component && !isFrameworkPage(userCtx)) {
+      snap.user_page = userCtx.menu + '.' + userCtx.component + '.' + (userCtx.market || 'GBL') + (userCtx.title ? ' (' + userCtx.title + ')' : '');
+    }
+    var doc = null, win = null;
+    try { doc = frame.contentDocument; win = frame.contentWindow; } catch (e) {}
+    if (!doc || !doc.body || doc.URL === 'about:blank') return snap;
+    var info = null;
+    try { info = parseComponentUrl(win.location.href); } catch (e) {}
+    if (info) snap.component = info.component.menu + '.' + info.component.component + '.' + info.component.market;
+    snap.title = String((win && (win.szCrefLabel || '')) || doc.title || '').trim().slice(0, 120);
+    snap.phase = isSearchPage(doc) ? 'search' : 'page';
+    collectElements(doc, '', snap);
+    modalDocs(frame).forEach(function (d) { collectElements(d, 'popup:', snap); });
+    var title = document.querySelector('#pt_modals [id^="ptModTitle_"]');
+    if (title && visible(title) && modalDocs(frame).length) snap.popup_title = title.textContent.trim().slice(0, 80);
+    [].forEach.call(doc.querySelectorAll('[id^="ICTAB_"],[id^="PSTAB"]'), function (t) {
+      var label = (t.textContent || '').replace(/\s+/g, ' ').trim();
+      if (label && visible(t) && label.length < 60) snap.tabs.push({ label: label, active: t.tagName !== 'A' });
+    });
+    resultRows(doc).slice(0, SNAP_LIMIT.results).forEach(function (r) { snap.results.push(rowCells(r).slice(0, 4)); });
+    var msg = psMessage(doc);
+    if (msg) snap.messages.push(msg.slice(0, 600));
+    var bad = errorFields(doc);
+    if (bad.length) snap.messages.push('Fields marked invalid: ' + bad.join(', '));
+    var box = modalMessage();                         /* a Yes/No question box: its buttons are choices */
+    if (box) {
+      var root = (box.el.closest && box.el.closest('[id^="ptMod_"]')) || document;
+      [].forEach.call(root.querySelectorAll('input[type="button"],button'), function (b) {
+        var t = (b.value || b.textContent || '').trim();
+        if (t && visible(b)) snap.buttons.push({ id: 'box:' + t, text: t });
+      });
+    }
+    var savedEl = doc.querySelector('#SAVED_win0');
+    if (savedEl && visible(savedEl)) snap.saved = true;
+    var n = processInstance(doc);
+    if (n) snap.process_instance = n;
+    return snap;
+  }
+
+  function collectElements(doc, prefix, snap) {
+    [].forEach.call(doc.querySelectorAll('input,select,textarea,button,a[id]'), function (el) {
+      if (!el.id || !visible(el) || /^(PT_|NEWWIN$|CUSTPAGE$|ICTAB_|PSTAB)|\$prompt|\$srt\d/.test(el.id)) return;
+      var isBtn = el.tagName === 'A' || el.tagName === 'BUTTON' || /^(button|submit|image)$/.test(el.type);
+      if (isBtn) {
+        if (snap.buttons.length >= SNAP_LIMIT.buttons) return;
+        var text = (el.tagName === 'INPUT' ? el.value : el.textContent || el.title || '').replace(/\s+/g, ' ').trim();
+        if (!text && /\$new\$/.test(el.id)) text = '+ (add row)';
+        if (!text && /\$delete\$/.test(el.id)) text = '- (delete row)';
+        if (text && text.length <= 60) snap.buttons.push({ id: prefix + el.id, text: text });
+        return;
+      }
+      if (!isInput(el) || snap.fields.length >= SNAP_LIMIT.fields) return;
+      var lab = doc.querySelector('label[for="' + el.id.replace(/["\\]/g, '\\$&') + '"]');
+      var f = { id: prefix + el.id, label: labelOf(doc, el) || columnOf(el) || '', type: kindOf(el) === 'text' && el.tagName === 'TEXTAREA' ? 'textarea' : kindOf(el),
+        value: valueOf(el).slice(0, 200) };
+      if (lab && /^\s*\*/.test(lab.textContent)) f.required = true;
+      if (el.disabled || el.readOnly) f.readonly = true;
+      if (el.tagName === 'SELECT') f.options = [].map.call(el.options, function (o) { return o.text.trim(); }).slice(0, SNAP_LIMIT.options);
+      var m = el.id.match(/\$(\d+)$/);
+      if (m) {
+        f.row = +m[1];
+        var col = columnOf(el);
+        if (col) f.column = col;
+        var rt = rowTexts(closest(el, 'TR'));
+        if (rt.length) f.row_text = rt.slice(0, 3).join(' · ');
+      }
+      snap.fields.push(f);
+    });
+  }
+
+  function pickResult(frame, value) {
+    var row = resultRow(frame.contentDocument, value);
+    if (!row) return Promise.reject(new Error('No search result is "' + value + '"'));
+    return act(frame, function () { row.click(); });
+  }
+
+  /* A button of a PeopleSoft question box (Yes / No), drawn in the top window */
+  function clickBox(frame, text) {
+    var want = norm(text);
+    var b = [].filter.call(document.querySelectorAll('#pt_modals input[type="button"],#pt_modals button'), function (x) {
+      return visible(x) && norm(x.value || x.textContent) === want;
+    })[0];
+    if (!b) return Promise.reject(new Error('The "' + text + '" button is no longer shown'));
+    return act(frame, function () { b.click(); });
+  }
+
+  /* Do the steps Claude chose, like a person; stop at the first problem and report it */
+  function runLiveSteps(frame, steps, onStep) {
+    var i = 0;
+    function next() {
+      if (i >= steps.length) return Promise.resolve({ ok: true });
+      var step = steps[i++], item = onStep ? onStep(describe(step)) : null, run;
+      try {
+        if (step['do'] === 'navigate') run = loadUrl(frame, componentUrl(step.component, step.query));
+        else if (step['do'] === 'pick') run = pickResult(frame, step.value);
+        else if (step['do'] === 'click' && /^box:/.test(step.button.id)) run = clickBox(frame, step.button.text || step.button.id.slice(4));
+        else run = STEPS[step['do']](frame, step, {});
+      } catch (e) { run = Promise.reject(e); }
+      return run.then(function () {
+        if (item) item.end(true);
+        var box = modalMessage();
+        if (box) {                                   /* PeopleSoft answered with a message box: Claude reads it next */
+          dismissModal();
+          return { ok: false, step: describe(step), error: box.text };
+        }
+        return next();
+      }, function (e) {
+        var msg = (e && e.message) || String(e);
+        if (item) item.end(false, msg);
+        dismissModal();
+        return { ok: false, step: describe(step), error: msg };
+      });
+    }
+    return next();
+  }
+
+  /* While Claude works, record it like a person doing the task: a successful live run can be saved as a task */
+  function startLiveRecorder(frame, title) {
+    var rec = { title: title, steps: [], component: null, query: {} };
+    var timer = setInterval(function () {
+      var doc, info = null;
+      try { doc = frame.contentDocument; info = doc && doc.readyState !== 'loading' && parseComponentUrl(frame.contentWindow.location.href); } catch (e) { return; }
+      if (!info || isFrameworkPage(info.component)) return;
+      if (!rec.component || rec.component.component !== info.component.component) {
+        rec.component = info.component; rec.query = info.query; rec.steps = [];    /* a task covers one component */
+      }
+      if (!doc._psaRec) attachRecorder(doc, rec, function () {});
+      modalFrames(frame).forEach(function (f) {
+        try { var d = f.contentDocument; if (d && d.body && d.readyState !== 'loading' && d.URL !== 'about:blank' && !d._psaRec) attachRecorder(d, rec, function () {}, true); } catch (e) {}
+      });
+      observe(rec, doc, frame);
+    }, 300);
+    return { rec: rec, stop: function () { clearInterval(timer); rec.stopped = true; } };
+  }
+
+  /* ============================================================
      PAGE CONTEXT — what the user is looking at
      ============================================================ */
 
@@ -904,69 +1052,143 @@
   function initWidget() {
     if (document.getElementById('psa-fab')) return;
 
-    var css = '#psa-fab{position:fixed;bottom:24px;right:24px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#003865,#0078d4);border:none;cursor:pointer;box-shadow:0 4px 16px rgba(0,56,101,.45);z-index:2147483647;display:flex;align-items:center;justify-content:center;padding:0;}'
-      + '#psa-panel{position:fixed;bottom:92px;right:24px;width:380px;height:580px!important;max-height:calc(100vh - 110px);border-radius:16px;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.22);border:1px solid #d0dce8;display:none;flex-direction:column;background:#fff;z-index:2147483645;font-family:Segoe UI,sans-serif;font-size:13px;color:#222;}'
-      + '#psa-panel.psa-open{display:flex;}'
-      + '#psa-hdr{flex:0 0 auto!important;background:linear-gradient(135deg,#003865,#0078d4);color:#fff;padding:12px 14px;display:flex;align-items:center;gap:8px;}'
-      + '#psa-hdr h3{margin:0;font-size:13px;font-weight:600;flex:1;}'
-      + '#psa-hdr button{background:rgba(255,255,255,.2);border:none;color:#fff;border-radius:6px;cursor:pointer;padding:4px 8px;font-size:12px;}'
-      + '#psa-log{flex:1 1 auto!important;min-height:0!important;height:auto!important;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px;background:#fafbfc;}'
-      + '.psa-msg{max-width:85%;padding:8px 11px;border-radius:12px;line-height:1.45;word-wrap:break-word;}'
-      + '.psa-bot{background:#f0f4f8;border:1px solid #d0dce8;align-self:flex-start;}'
-      + '.psa-user{background:#003865;color:#fff;align-self:flex-end;}'
-      + '.psa-msg ul{margin:4px 0;padding-left:18px;}'
-      + '.psa-chips{display:flex;flex-wrap:wrap;gap:6px;}'
-      + '.psa-chips button{border:1px solid #0078d4;background:#fff;color:#0078d4;border-radius:14px;padding:4px 10px;cursor:pointer;font-size:12px;}'
-      + '.psa-card{align-self:stretch;border:1px solid #0078d4;border-radius:10px;background:#fff;padding:10px 12px;}'
-      + '.psa-card h4{margin:0 0 6px;font-size:13px;}'
-      + '.psa-card table{width:100%;border-collapse:collapse;margin-bottom:8px;}'
-      + '.psa-card td{padding:3px 4px;border-bottom:1px solid #eef2f6;vertical-align:top;}'
-      + '.psa-card td:first-child{color:#555;width:45%;}'
-      + '.psa-card label{display:block;font-size:12px;margin:4px 0 2px;color:#444;}'
-      + '.psa-card input{width:100%;box-sizing:border-box;padding:5px 7px;border:1px solid #bbb;border-radius:5px;}'
-      + '.psa-card .psa-actions{display:flex;gap:8px;margin-top:10px;}'
-      + '.psa-card .psa-actions button{flex:1;padding:7px;border-radius:6px;border:1px solid #0078d4;cursor:pointer;font-size:12px;}'
-      + '.psa-ok{background:#0078d4;color:#fff;}.psa-ok:disabled{opacity:.5;cursor:default;}'
-      + '.psa-no{background:#fff;color:#0078d4;}'
-      + '.psa-typing{color:#888;font-style:italic;}'
-      + '.psa-card select{width:100%;font-size:12px;padding:3px;}'
-      + '.psa-card small{color:#777;display:block;}'
-      + '.psa-card details{margin:6px 0;font-size:12px;}'
-      + '.psa-card ol{margin:4px 0;padding-left:20px;max-height:140px;overflow-y:auto;}'
-      + '.psa-card .psa-check{display:flex;gap:6px;align-items:center;}'
-      + '.psa-card .psa-check input{width:auto;}'
-      /* PeopleSoft styles every form/textarea/button: pin the chat's layout with !important */
-      + '#psa-form{display:flex!important;flex:0 0 auto!important;height:auto!important;min-height:0!important;max-height:none!important;margin:0!important;gap:6px;padding:8px;border-top:1px solid #e0e0e0;background:#f8f9fa;align-items:stretch;}'
-      + '#psa-input{flex:1 1 auto!important;resize:none;height:40px!important;min-height:40px!important;max-height:40px!important;margin:0!important;padding:8px!important;border:1px solid #ccc;border-radius:8px;font:13px Segoe UI,sans-serif!important;box-sizing:border-box!important;}'
-      + '#psa-send{flex:0 0 auto!important;height:40px!important;min-height:0!important;margin:0!important;background:#0078d4!important;color:#fff!important;border:none;border-radius:8px;padding:0 14px!important;cursor:pointer;}'
-      + '#psa-ws{position:fixed;top:16px;left:16px;right:420px;bottom:16px;display:none;flex-direction:column;background:#fff;border:2px solid #0078d4;border-radius:12px;overflow:hidden;z-index:2147483644;box-shadow:0 8px 40px rgba(0,0,0,.25);font-family:Segoe UI,sans-serif;font-size:13px;}'
-      + '#psa-ws-hdr{display:flex;align-items:center;gap:10px;padding:8px 12px;background:#003865;color:#fff;}'
-      + '#psa-ws-status{flex:1;opacity:.9;}'
-      + '#psa-ws-status.psa-err{opacity:1;background:#c0392b;padding:2px 8px;border-radius:4px;}'
-      + '#psa-ws-hdr button{background:rgba(255,255,255,.2);border:none;color:#fff;border-radius:6px;cursor:pointer;padding:4px 10px;}'
-      + '#psa-ws-extra:not(:empty){padding:8px 12px;background:#fff8e1;border-bottom:1px solid #f0d58a;}'
-      + '#psa-ws-frame{flex:1;border:none;width:100%;}'
-      + '#psa-recbar{position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:2147483647;display:flex;align-items:center;gap:10px;'
-      + 'max-width:calc(100vw - 32px);padding:8px 12px;background:#b42318;color:#fff;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.3);font:13px Segoe UI,sans-serif;}'
-      + '#psa-recbar .psa-recdot{flex:0 0 auto;width:10px;height:10px;border-radius:50%;background:#fff;animation:psaBlink 1.2s infinite;}'
-      + '@keyframes psaBlink{50%{opacity:.25;}}'
-      + '#psa-recbar-status{opacity:.95;}'
-      + '#psa-recbar button{flex:0 0 auto;height:auto!important;margin:0!important;padding:4px 10px!important;border:none;border-radius:6px;cursor:pointer;font:600 12px Segoe UI,sans-serif;background:#fff!important;color:#b42318!important;}'
-      + '#psa-recbar button.psa-rec-cancel{background:rgba(255,255,255,.2)!important;color:#fff!important;}'
-      + '#psa-panel *:focus,#psa-ws *:focus,#psa-recbar *:focus{outline:3px solid #003865;outline-offset:2px;}'
+    var css = [
+      '#psa-panel,#psa-fab,#psa-ws,#psa-recbar{--psa-ink:#0f172a;--psa-sub:#64748b;--psa-line:#e6e8f0;--psa-soft:#f6f7fb;--psa-brand:#4f46e5;--psa-brand2:#0ea5e9;--psa-ok:#16a34a;--psa-warn:#d97706;--psa-err:#dc2626;font-family:"Segoe UI",system-ui,-apple-system,sans-serif;}',
+      /* launcher */
+      '#psa-fab{position:fixed;right:24px;bottom:24px;z-index:2147483646;display:flex;align-items:center;gap:10px;height:52px;padding:0 20px 0 7px!important;margin:0!important;border:none!important;border-radius:26px!important;background:#fff!important;color:var(--psa-ink)!important;box-shadow:0 12px 32px rgba(15,23,42,.2),0 0 0 1px rgba(79,70,229,.18);cursor:pointer;font:600 14px "Segoe UI",system-ui,sans-serif!important;transition:transform .15s,box-shadow .15s;}',
+      '#psa-fab:hover{transform:translateY(-2px);box-shadow:0 16px 40px rgba(79,70,229,.3),0 0 0 1px rgba(79,70,229,.35);}',
+      'body.psa-docked #psa-fab{display:none;}',
+      /* the agent: an avatar with eyes and a status light */
+      '.psa-av{position:relative;flex:0 0 auto;display:inline-block;width:38px;height:38px;border-radius:50%;background:radial-gradient(circle at 30% 25%,rgba(255,255,255,.55),transparent 42%),linear-gradient(135deg,var(--psa-brand),var(--psa-brand2));box-shadow:inset 0 -4px 10px rgba(0,0,0,.18);}',
+      '.psa-av i{position:absolute;top:38%;width:5px;height:10px;border-radius:3px;background:#fff;animation:psaBlink 5s infinite;}',
+      '.psa-av i:first-child{left:31%;}.psa-av i:last-child{right:31%;}',
+      '.psa-av:after{content:"";position:absolute;right:-1px;bottom:-1px;width:11px;height:11px;border-radius:50%;background:var(--psa-ok);border:2px solid #fff;}',
+      '[data-state="thinking"] .psa-av:after,[data-state="working"] .psa-av:after{background:var(--psa-brand2);animation:psaPulse 1s infinite;}',
+      '[data-state="waiting"] .psa-av:after{background:var(--psa-warn);}[data-state="error"] .psa-av:after{background:var(--psa-err);}',
+      '[data-state="thinking"] #psa-hdr .psa-av,[data-state="working"] #psa-hdr .psa-av{animation:psaGlow 1.6s ease-in-out infinite;}',
+      '[data-state="working"] .psa-av i{animation:psaLook 1.6s ease-in-out infinite;}',
+      '@keyframes psaBlink{0%,93%,100%{transform:scaleY(1)}96%{transform:scaleY(.1)}}',
+      '@keyframes psaLook{0%,100%{transform:translateX(-2px)}50%{transform:translateX(2px)}}',
+      '@keyframes psaPulse{50%{transform:scale(1.35);opacity:.6}}',
+      '@keyframes psaGlow{0%,100%{box-shadow:0 0 0 0 rgba(79,70,229,.35)}50%{box-shadow:0 0 0 7px rgba(79,70,229,0)}}',
+      '@keyframes psaIn{from{opacity:0;transform:translateX(18px)}to{opacity:1;transform:none}}',
+      '@keyframes psaSpin{to{transform:rotate(360deg)}}',
+      '@keyframes psaDot{0%,80%,100%{opacity:.25;transform:translateY(0)}40%{opacity:1;transform:translateY(-3px)}}',
+      /* docked panel */
+      '#psa-panel{position:fixed;top:12px;right:12px;bottom:12px;width:440px;max-width:calc(100vw - 24px);z-index:2147483645;display:none;flex-direction:column;background:#fff;border-radius:20px;box-shadow:0 24px 64px rgba(15,23,42,.24),0 0 0 1px rgba(15,23,42,.06);overflow:hidden;color:var(--psa-ink);font-size:14px;line-height:1.5;text-align:left;}',
+      '#psa-panel.psa-open{display:flex;animation:psaIn .22s ease-out;}#psa-panel.psa-wide{width:720px;}',
+      '#psa-panel *{box-sizing:border-box;}#psa-panel h2,#psa-panel h4,#psa-panel p,#psa-panel ol,#psa-panel ul{color:inherit;}',
+      '#psa-hdr{flex:0 0 auto;display:flex;align-items:center;gap:12px;padding:16px 14px 14px 16px;background:linear-gradient(180deg,#f3f1ff,#fff);border-bottom:1px solid var(--psa-line);}',
+      '#psa-hdr .psa-who{flex:1;min-width:0;}#psa-hdr .psa-name{font-weight:700;font-size:15px;letter-spacing:-.01em;}',
+      '#psa-status{font-size:12px;color:var(--psa-sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+      '.psa-ib{flex:0 0 auto;width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;gap:6px;border:none!important;border-radius:10px!important;background:transparent!important;color:var(--psa-sub)!important;cursor:pointer;padding:0!important;margin:0!important;box-shadow:none!important;}',
+      '.psa-ib:hover{background:#eef2ff!important;color:var(--psa-brand)!important;}',
+      '#psa-rec{width:auto;padding:0 10px!important;font:600 12px "Segoe UI",system-ui,sans-serif!important;color:#b42318!important;}',
+      '#psa-ctx{flex:0 0 auto;display:flex;align-items:center;gap:8px;margin:10px 14px 0;padding:8px 12px;border-radius:12px;background:var(--psa-soft);font-size:12px;color:var(--psa-sub);min-width:0;}',
+      '#psa-ctx[hidden]{display:none;}#psa-ctx span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}#psa-ctx b{color:var(--psa-ink);font-weight:600;}#psa-ctx .psa-e{color:var(--psa-err);}',
+      '#psa-log{flex:1 1 auto;min-height:0;overflow-y:auto;padding:16px 16px 8px;display:flex;flex-direction:column;gap:14px;}',
+      /* messages */
+      '.psa-msg{max-width:92%;line-height:1.55;word-wrap:break-word;}',
+      '.psa-bot{align-self:flex-start;position:relative;padding:3px 0 3px 38px;}',
+      '.psa-bot:before{content:"";position:absolute;left:0;top:1px;width:26px;height:26px;border-radius:50%;background:radial-gradient(circle at 30% 25%,rgba(255,255,255,.5),transparent 45%),linear-gradient(135deg,var(--psa-brand),var(--psa-brand2));}',
+      '.psa-user{align-self:flex-end;background:linear-gradient(135deg,var(--psa-brand),#6366f1);color:#fff;padding:9px 14px;border-radius:18px 18px 5px 18px;box-shadow:0 4px 14px rgba(79,70,229,.22);}',
+      '.psa-msg ul{margin:4px 0;padding-left:18px;}.psa-msg code{background:#eef2ff;color:#3730a3;border-radius:5px;padding:1px 5px;font-size:12px;}',
+      '.psa-dots span{display:inline-block;width:7px;height:7px;margin:8px 3px 0 0;border-radius:50%;background:var(--psa-brand);animation:psaDot 1.2s infinite;}',
+      '.psa-dots span:nth-child(2){animation-delay:.15s;}.psa-dots span:nth-child(3){animation-delay:.3s;}',
+      '.psa-chips{display:flex;flex-wrap:wrap;gap:6px;padding-left:38px;}',
+      '.psa-chips button{border:1px solid #c7d2fe!important;background:#fff!important;color:var(--psa-brand)!important;border-radius:999px!important;padding:5px 12px!important;margin:0!important;cursor:pointer;font:500 12px "Segoe UI",system-ui,sans-serif!important;}',
+      '.psa-chips button:hover{background:#eef2ff!important;}',
+      /* welcome */
+      '.psa-welcome h2{margin:4px 0 2px;font-size:24px;font-weight:700;letter-spacing:-.02em;background:linear-gradient(90deg,var(--psa-brand),var(--psa-brand2));-webkit-background-clip:text;background-clip:text;color:transparent!important;}',
+      '.psa-welcome p{margin:0 0 6px;color:var(--psa-sub);}',
+      '.psa-sec{font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--psa-sub);margin:16px 0 8px;}',
+      '.psa-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;}',
+      '.psa-tile{display:block;width:100%;text-align:left;border:1px solid var(--psa-line)!important;background:#fff!important;border-radius:14px!important;padding:11px 12px!important;margin:0!important;cursor:pointer;color:var(--psa-ink)!important;font:inherit!important;transition:border-color .15s,box-shadow .15s,transform .15s;}',
+      '.psa-tile:hover{border-color:#c7d2fe!important;box-shadow:0 8px 20px rgba(79,70,229,.12);transform:translateY(-1px);}',
+      '.psa-tile b{display:block;font-size:13px;}.psa-tile small{display:block;color:var(--psa-sub);font-size:12px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.psa-tile.psa-new{background:linear-gradient(135deg,#eef2ff,#ecfeff)!important;border-color:#c7d2fe!important;}',
+      '.psa-recent{display:flex;align-items:center;gap:10px;width:100%;text-align:left;border:none!important;background:transparent!important;padding:7px 10px!important;margin:0!important;border-radius:10px!important;cursor:pointer;color:var(--psa-ink)!important;font:inherit!important;}',
+      '.psa-recent:hover{background:var(--psa-soft)!important;}.psa-recent svg{flex:0 0 auto;color:var(--psa-sub);}.psa-recent span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      /* cards */
+      '.psa-card{align-self:stretch;border:1px solid var(--psa-line);border-radius:16px;background:#fff;padding:14px 16px;box-shadow:0 6px 20px rgba(15,23,42,.06);}',
+      '.psa-card h4{margin:0 0 8px;font-size:14px;font-weight:700;}',
+      '.psa-card table{width:100%;border-collapse:collapse;margin-bottom:8px;font-size:13px;}',
+      '.psa-card td{padding:5px 4px;border-bottom:1px solid #f0f2f7;vertical-align:top;}.psa-card td:first-child{color:var(--psa-sub);width:45%;}',
+      '.psa-card label{display:block;font-size:12px;margin:6px 0 3px;color:#475569;}',
+      '.psa-card input{width:100%;padding:7px 9px!important;border:1px solid #cbd5e1!important;border-radius:9px!important;font:13px "Segoe UI",system-ui,sans-serif!important;background:#fff!important;}',
+      '.psa-card input:focus{outline:none;border-color:#818cf8!important;box-shadow:0 0 0 3px rgba(99,102,241,.15);}',
+      '.psa-card .psa-actions{display:flex;gap:8px;margin-top:12px;}',
+      '.psa-card .psa-actions button{flex:1;padding:9px!important;margin:0!important;border-radius:10px!important;cursor:pointer;font:600 13px "Segoe UI",system-ui,sans-serif!important;}',
+      '.psa-ok{background:linear-gradient(135deg,var(--psa-brand),#6366f1)!important;color:#fff!important;border:none!important;}.psa-ok:disabled{opacity:.45;cursor:default!important;}',
+      '.psa-no{background:#fff!important;color:var(--psa-ink)!important;border:1px solid var(--psa-line)!important;}',
+      '.psa-card select{width:100%;font-size:12px;padding:5px;border:1px solid #cbd5e1;border-radius:8px;}',
+      '.psa-card small{color:var(--psa-sub);display:block;margin-top:4px;}',
+      '.psa-card details{margin:8px 0;font-size:12px;}.psa-card ol{margin:4px 0;padding-left:20px;max-height:160px;overflow-y:auto;}',
+      '.psa-card .psa-check{display:flex;gap:6px;align-items:center;}.psa-card .psa-check input{width:auto;}',
+      '.psa-card.psa-approve{border-color:#fcd34d;box-shadow:0 8px 24px rgba(217,119,6,.12);}',
+      /* activity feed: what the agent is doing, step by step */
+      '.psa-feed{align-self:stretch;border:1px solid var(--psa-line);border-radius:16px;background:var(--psa-soft);padding:10px 12px;font-size:13px;}',
+      '.psa-feed-h{display:flex;align-items:center;gap:8px;font-weight:600;}.psa-feed-h small{margin-left:auto;color:var(--psa-sub);font-weight:400;}',
+      '.psa-feed ol{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:5px;max-height:240px;overflow-y:auto;}',
+      '.psa-feed li{display:flex;gap:8px;align-items:flex-start;margin:0;}.psa-feed li em{color:var(--psa-err);font-style:normal;}',
+      '.psa-ic{flex:0 0 auto;width:16px;height:16px;margin-top:2px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font:700 10px/1 "Segoe UI",sans-serif;color:#fff;}',
+      '.psa-ic.run{border:2px solid #c7d2fe;border-top-color:var(--psa-brand);animation:psaSpin .8s linear infinite;}',
+      '.psa-ic.think{border:2px dotted var(--psa-brand2);animation:psaSpin 2s linear infinite;}',
+      '.psa-ic.ok{background:var(--psa-ok);}.psa-ic.ok:before{content:"\\2713";}',
+      '.psa-ic.err{background:var(--psa-err);}.psa-ic.err:before{content:"!";}',
+      '.psa-ic.ask{background:var(--psa-warn);}.psa-ic.ask:before{content:"?";}',
+      /* composer */
+      '#psa-form{flex:0 0 auto;display:flex!important;align-items:flex-end;gap:6px;margin:6px 12px 4px!important;padding:6px!important;height:auto!important;min-height:0!important;border:1px solid var(--psa-line);border-radius:16px;background:#fff;box-shadow:0 2px 10px rgba(15,23,42,.05);}',
+      '#psa-form:focus-within{border-color:#a5b4fc;box-shadow:0 0 0 4px rgba(99,102,241,.12);}',
+      '#psa-input{flex:1 1 auto!important;border:none!important;outline:none!important;resize:none!important;height:34px;min-height:34px!important;max-height:140px!important;padding:7px 4px!important;margin:0!important;font:14px/1.45 "Segoe UI",system-ui,sans-serif!important;background:transparent!important;color:var(--psa-ink)!important;box-shadow:none!important;}',
+      '#psa-send{flex:0 0 auto;width:34px!important;height:34px!important;min-height:0!important;border-radius:11px!important;border:none!important;background:linear-gradient(135deg,var(--psa-brand),#6366f1)!important;color:#fff!important;display:inline-flex;align-items:center;justify-content:center;padding:0!important;margin:0!important;cursor:pointer;}',
+      '#psa-send:disabled{opacity:.4;cursor:default;}',
+      '#psa-recentpop{position:absolute;left:12px;right:12px;bottom:92px;max-height:50%;overflow-y:auto;background:#fff;border:1px solid var(--psa-line);border-radius:14px;box-shadow:0 18px 40px rgba(15,23,42,.18);padding:6px;}',
+      '#psa-recentpop[hidden]{display:none;}',
+      '#psa-hint{flex:0 0 auto;padding:0 18px 10px;font-size:11px;color:#94a3b8;}',
+      /* workspace: where the agent works, next to the panel */
+      '#psa-ws{position:fixed;top:12px;left:12px;right:12px;bottom:12px;display:none;flex-direction:column;background:#fff;border-radius:18px;overflow:hidden;z-index:2147483644;box-shadow:0 24px 64px rgba(15,23,42,.28),0 0 0 2px rgba(79,70,229,.45);font-size:13px;}',
+      'body.psa-docked #psa-ws{right:464px;}body.psa-docked.psa-widebody #psa-ws{right:744px;}',
+      '#psa-ws-hdr{display:flex;align-items:center;gap:10px;padding:10px 14px;background:linear-gradient(90deg,#1e1b4b,#312e81);color:#fff;}',
+      '#psa-ws-status{flex:1;opacity:.9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+      '#psa-ws-status.psa-err{opacity:1;background:#b91c1c;padding:2px 10px;border-radius:999px;}',
+      '#psa-ws-hdr button{background:rgba(255,255,255,.14)!important;border:none!important;color:#fff!important;border-radius:9px!important;cursor:pointer;padding:5px 12px!important;margin:0!important;}',
+      '#psa-ws-extra:not(:empty){padding:8px 12px;background:#fff8e1;border-bottom:1px solid #f0d58a;}',
+      '#psa-ws-frame{flex:1;border:none;width:100%;}',
+      /* recording bar */
+      '#psa-recbar{position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:2147483647;display:flex;align-items:center;gap:10px;max-width:calc(100vw - 32px);padding:8px 10px 8px 14px;background:#b42318;color:#fff;border-radius:999px;box-shadow:0 8px 28px rgba(0,0,0,.3);font-size:13px;}',
+      '#psa-recbar .psa-recdot{flex:0 0 auto;width:10px;height:10px;border-radius:50%;background:#fff;animation:psaPulse 1.2s infinite;}',
+      '#psa-recbar-status{opacity:.95;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+      '#psa-recbar button{flex:0 0 auto;height:auto!important;margin:0!important;padding:5px 12px!important;border:none!important;border-radius:999px!important;cursor:pointer;font:600 12px "Segoe UI",system-ui,sans-serif!important;background:#fff!important;color:#b42318!important;}',
+      '#psa-recbar button.psa-rec-cancel{background:rgba(255,255,255,.2)!important;color:#fff!important;}',
+      '#psa-panel *:focus-visible,#psa-ws *:focus-visible,#psa-recbar *:focus-visible,#psa-fab:focus-visible{outline:3px solid #818cf8;outline-offset:2px;}',
       /* PeopleSoft pop-ups and message boxes (z-index 9999) must show above the agent's workspace */
-      + '#pt_modals [id^="ptMod_"],#pt_modals [id^="ptModTable_"]{z-index:2147483646!important;}';
+      '#pt_modals [id^="ptMod_"],#pt_modals [id^="ptModTable_"]{z-index:2147483646!important;}',
+      '@media (max-width:760px){#psa-panel,#psa-panel.psa-wide{width:auto;left:12px;}body.psa-docked #psa-ws{display:none!important;}}'
+    ].join('');
     var st = document.createElement('style');
     st.id = 'psa-styles';
     st.textContent = css;
     document.head.appendChild(st);
+
+    var SVG = function (d, w) { return '<svg width="' + (w || 18) + '" height="' + (w || 18) + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + d + '</svg>'; };
+    var ICON = {
+      compose: SVG('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>'),
+      wide: SVG('<path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/>'),
+      close: SVG('<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'),
+      clock: SVG('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>', 16),
+      send: SVG('<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>'),
+      page: SVG('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/>', 15),
+      rec: '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:#dc2626"></span>'
+    };
+    var AV = '<span class="psa-av" aria-hidden="true"><i></i><i></i></span>';
 
     var fab = document.createElement('button');
     fab.id = 'psa-fab';
     fab.type = 'button';
     fab.setAttribute('aria-label', 'Open PeopleSoft Agent');
     fab.setAttribute('aria-expanded', 'false');
-    fab.innerHTML = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" stroke="white" stroke-width="2" stroke-linejoin="round"/><circle cx="9" cy="10" r="1" fill="white"/><circle cx="12" cy="10" r="1" fill="white"/><circle cx="15" cy="10" r="1" fill="white"/></svg>';
+    fab.innerHTML = AV + '<span>Ask Agent</span>';
     document.body.appendChild(fab);
 
     var panel = document.createElement('div');
@@ -974,20 +1196,27 @@
     panel.setAttribute('role', 'dialog');
     panel.setAttribute('aria-label', 'PeopleSoft Agent');
     panel.innerHTML =
-      '<div id="psa-hdr"><h3>PeopleSoft Agent</h3>'
-      + '<button id="psa-rec" type="button" title="Teach me a new task by doing it once" style="display:none">&#9210; Record</button>'
-      + '<button id="psa-new" type="button" title="Start a new conversation">New</button>'
-      + '<button id="psa-close" type="button" aria-label="Close">&#x2715;</button></div>'
+      '<div id="psa-hdr">' + AV + '<div class="psa-who"><div class="psa-name">PeopleSoft Agent</div><div id="psa-status" aria-live="polite">Ready</div></div>'
+      + '<button id="psa-rec" class="psa-ib" type="button" title="Teach me a new task by doing it once" style="display:none">' + ICON.rec + 'Record</button>'
+      + '<button id="psa-new" class="psa-ib" type="button" title="New conversation" aria-label="New conversation">' + ICON.compose + '</button>'
+      + '<button id="psa-wide" class="psa-ib" type="button" title="Wider panel" aria-label="Wider panel">' + ICON.wide + '</button>'
+      + '<button id="psa-close" class="psa-ib" type="button" title="Close (Esc)" aria-label="Close">' + ICON.close + '</button></div>'
+      + '<div id="psa-ctx" hidden></div>'
       + '<div id="psa-log" role="log" aria-live="polite"></div>'
-      + '<form id="psa-form"><textarea id="psa-input" aria-label="Message" placeholder="Ask or tell me what to do..."></textarea>'
-      + '<button id="psa-send" type="submit">Send</button></form>';
+      + '<div id="psa-recentpop" role="listbox" aria-label="Recent questions" hidden></div>'
+      + '<form id="psa-form"><button id="psa-hist" class="psa-ib" type="button" title="Recent questions" aria-label="Recent questions">' + ICON.clock + '</button>'
+      + '<textarea id="psa-input" rows="1" aria-label="Message" placeholder="Ask anything, or tell me what to do..."></textarea>'
+      + '<button id="psa-send" type="submit" aria-label="Send">' + ICON.send + '</button></form>'
+      + '<div id="psa-hint">Enter to send · Shift+Enter for a new line · Ctrl+/ opens and closes me</div>';
     document.body.appendChild(panel);
-
     var logEl = panel.querySelector('#psa-log');
     var input = panel.querySelector('#psa-input');
     var state = loadState();
     var busy = false;
     var ready = false;   /* config loaded from the iScript */
+    var me = null, canTeach = false;   /* from /api/me: who is signed in, tasks for the welcome screen */
+    var liveWaiter = null;             /* a live run waiting for the user's answer in the chat */
+    var ctxTimer = null;
 
     function loadState() {
       try { return JSON.parse(sessionStorage.getItem(STORE_KEY)) || { sessionId: null, history: [] }; }
@@ -1035,19 +1264,113 @@
       logEl.appendChild(wrap);
     }
 
-    function greet() {
-      addMsg('bot', 'Hi **' + (cfg.fullname || cfg.oprid || 'there') + '**! I can do PeopleSoft tasks for you on screen, '
-        + 'asking for anything I need and showing you a summary before I save.\n\n- Create a user profile\n- Explain an error or page', false);
-      addChips(['Create a user profile', 'What is this page for?', 'Help with this error']);
+    /* Questions the user asked before, newest first (this browser, this user) */
+    function recentKey() { return 'psagent.recent.' + (cfg.oprid || ''); }
+    function recentList() { try { return JSON.parse(localStorage.getItem(recentKey())) || []; } catch (e) { return []; } }
+    function remember(q) {
+      try {
+        var list = recentList().filter(function (x) { return x !== q; });
+        list.unshift(q);
+        localStorage.setItem(recentKey(), JSON.stringify(list.slice(0, 12)));
+      } catch (e) {}
     }
 
-    function typing() {
+    function greet() {
+      var w = document.createElement('div');
+      w.className = 'psa-welcome';
+      /* the user profile description, when it looks like a name (some are dates or codes) */
+      var full = String(cfg.fullname || ''), ctx = pageContext(), recent = recentList();
+      var name = /[A-Za-z]{2}/.test(full) && !/\d{3}/.test(full) ? full.split(/\s+/)[0] : (cfg.oprid || '');
+      var html = '<h2>Hi' + (name ? ' ' + esc(name) : '') + ', what can I do?</h2>'
+        + '<p>Tell me in your own words. I work in PeopleSoft for you, ask when I am not sure, and check with you before anything is saved.</p>';
+      if (recent.length) {
+        html += '<div class="psa-sec">Recent</div>' + recent.slice(0, 4).map(function (q) {
+          return '<button type="button" class="psa-recent" data-q="' + esc(q) + '">' + ICON.clock + '<span>' + esc(q) + '</span></button>';
+        }).join('');
+      }
+      var tiles = [];
+      if (ctx.error) tiles.push({ t: 'Help with this error', s: ctx.error, q: 'Help me with this error' });
+      ((me && me.tasks) || []).slice(0, 6).forEach(function (t) { tiles.push({ t: t.title, s: t.example, q: t.example }); });
+      if (ctx.component && !isFrameworkPage(ctx)) tiles.push({ t: 'Explain this page', s: ctx.title || ctx.component, q: 'What is this page for and how do I use it?' });
+      tiles.push({ t: 'Something new', s: 'Describe it and I will work it out on screen', q: '', cls: ' psa-new' });
+      html += '<div class="psa-sec">I can</div><div class="psa-grid">' + tiles.map(function (x) {
+        return '<button type="button" class="psa-tile' + (x.cls || '') + '" data-q="' + esc(x.q) + '"><b>' + esc(x.t) + '</b><small>' + esc(x.s || '') + '</small></button>';
+      }).join('') + '</div>';
+      w.innerHTML = html;
+      w.addEventListener('click', function (e) {
+        var b = e.target.closest && e.target.closest('[data-q]');
+        if (!b) return;
+        var q = b.getAttribute('data-q');
+        if (q) send(q);
+        else { input.placeholder = 'e.g. Lock the account of user JSMITH and add the role Manager'; input.focus(); }
+      });
+      logEl.appendChild(w);
+    }
+
+    var STATE_TEXT = { idle: 'Ready', thinking: 'Thinking...', working: 'Working...', waiting: 'Waiting for you', error: 'Stopped: see the chat' };
+    function setStatus(st, text) {
+      panel.setAttribute('data-state', st);
+      fab.setAttribute('data-state', st);
+      panel.querySelector('#psa-status').textContent = text || STATE_TEXT[st] || '';
+    }
+
+    function typing(text) {
       var d = document.createElement('div');
       d.className = 'psa-msg psa-bot psa-typing';
-      d.textContent = 'Thinking...';
+      d.innerHTML = '<span class="psa-dots" aria-label="Thinking"><span></span><span></span><span></span></span>';
       logEl.appendChild(d);
       logEl.scrollTop = logEl.scrollHeight;
-      return d;
+      var before = panel.getAttribute('data-state');
+      setStatus('thinking', text);
+      return { remove: function () { d.remove(); if (panel.getAttribute('data-state') === 'thinking') setStatus(before === 'working' ? 'working' : 'idle'); } };
+    }
+
+    /* The agent's work log, like a terminal of what it is doing: one line per step */
+    function activity(title) {
+      var box = document.createElement('div');
+      box.className = 'psa-feed';
+      box.innerHTML = '<div class="psa-feed-h"><span class="psa-ic run"></span><span class="psa-feed-t"></span><small></small></div><ol></ol>';
+      box.querySelector('.psa-feed-t').textContent = title;
+      logEl.appendChild(box);
+      logEl.scrollTop = logEl.scrollHeight;
+      var list = box.querySelector('ol'), head = box.querySelector('.psa-feed-h .psa-ic'), t0 = Date.now();
+      function tick() { box.querySelector('.psa-feed-h small').textContent = Math.round((Date.now() - t0) / 1000) + 's'; }
+      var timer = setInterval(tick, 1000);
+      return {
+        add: function (text, kind) {
+          var li = document.createElement('li');
+          li.innerHTML = '<span class="psa-ic ' + (kind || 'run') + '"></span><span></span>';
+          li.lastChild.textContent = text;
+          list.appendChild(li);
+          list.scrollTop = list.scrollHeight;
+          logEl.scrollTop = logEl.scrollHeight;
+          return {
+            end: function (ok, note) {
+              li.firstChild.className = 'psa-ic ' + (ok ? 'ok' : 'err');
+              if (note) { var em = document.createElement('em'); em.textContent = ' ' + note; li.lastChild.appendChild(em); }
+            },
+            remove: function () { li.remove(); }
+          };
+        },
+        finish: function (status) { clearInterval(timer); tick(); head.className = 'psa-ic ' + (status === 'success' ? 'ok' : 'err'); }
+      };
+    }
+
+    function refreshContext() {
+      var c = pageContext(), el = panel.querySelector('#psa-ctx');
+      if (!c.component || isFrameworkPage(c)) { el.hidden = true; return; }
+      el.hidden = false;
+      el.innerHTML = ICON.page + '<span>You are on <b>' + esc(c.title || c.component) + '</b></span>'
+        + (c.error ? '<span class="psa-e">· ' + esc(c.error.slice(0, 90)) + '</span>' : '');
+    }
+
+    function showRecent() {
+      var pop = panel.querySelector('#psa-recentpop'), list = recentList();
+      if (!pop.hidden) { pop.hidden = true; return; }
+      pop.innerHTML = list.length ? list.map(function (q) {
+        return '<button type="button" class="psa-recent" role="option" data-q="' + esc(q) + '">' + ICON.clock + '<span>' + esc(q) + '</span></button>';
+      }).join('') : '<div style="padding:10px;color:#64748b;font-size:13px">Your questions will show up here.</div>';
+      pop.hidden = false;
     }
 
     function setBusy(b) {
@@ -1061,6 +1384,7 @@
       if (r.confirm) showConfirm(r.confirm);
       if (r.record) showRecordCard(r.record);
       if (r.action) return runAndReport(r.action);
+      if (r.live) return runLive(r.live);
     }
 
     function call(path, payload) {
@@ -1074,8 +1398,19 @@
 
     function send(text) {
       text = String(text || '').trim();
-      if (!text || busy) return;
+      if (!text) return;
+      panel.querySelector('#psa-recentpop').hidden = true;
+      if (liveWaiter) {                              /* the agent asked something during a live run */
+        var answer = liveWaiter;
+        liveWaiter = null;
+        addMsg('user', text);
+        answer(text);
+        return;
+      }
+      if (busy) return;
+      [].forEach.call(logEl.querySelectorAll('.psa-welcome'), function (w) { w.remove(); });
       addMsg('user', text);
+      remember(text);
       call('/api/chat', { session_id: state.sessionId, message: text, page: pageContext() });
     }
 
@@ -1284,9 +1619,12 @@
           + 'go to the page and do the task there.', false);
         return;
       }
-      var rec = { title: r.title, component: r.component, query: r.query || {}, steps: r.steps };
+      reviewRecording({ title: r.title, component: r.component, query: r.query || {}, steps: r.steps });
+    }
+
+    function reviewRecording(rec) {
       ensureConfig().then(function () {
-        var t = typing();
+        var t = typing('Turning it into a task...');
         return api('/api/recordings/draft', { recording: rec }).then(function (res) { t.remove(); showReviewCard(rec, res.draft); },
           function (e) { t.remove(); addMsg('bot', 'I could not build a template from that recording: ' + e.message, false); });
       });
@@ -1357,39 +1695,178 @@
     function runAndReport(action) {
       var secrets = pendingSecrets[action.run_id] || {};
       delete pendingSecrets[action.run_id];
-      var ws = openWorkspace('Agent: ' + action.title);
+      var ws = openWorkspace('Agent: ' + action.title), feed = activity(action.title), cur = null;
+      ws.onStep = function (n, total, text) {
+        if (cur) cur.end(true);
+        cur = feed.add(text);
+        setStatus('working', 'Step ' + n + ' of ' + total + ': ' + text);
+      };
+      setStatus('working');
       return runAction(action, secrets, ws).catch(function (e) {
         return { status: 'error', message: 'The agent hit an unexpected problem: ' + ((e && e.message) || e) };
       }).then(function (res) {
         secrets = null;
         ws.done();
+        if (cur) cur.end(res.status === 'success', res.status === 'success' ? null : res.message);
+        feed.finish(res.status);
         if (res.status === 'success') ws.status('Done: ' + action.title);
         else if (res.status === 'stopped') ws.status('Stopped', true);
         else ws.status('Stopped at "' + (res.failed_step || 'a step') + '": ' + res.message, true);
+        setStatus(res.status === 'success' ? 'idle' : 'error');
         /* Show PeopleSoft's own words right away; the agent's explanation follows */
         if (res.status === 'error') addMsg('bot', '⚠️ Stopped at **' + (res.failed_step || 'a step') + '**. PeopleSoft says:\n\n' + res.message);
-        var t = typing();
-        return api('/api/result', { session_id: state.sessionId, run_id: action.run_id, status: res.status, message: res.message, failed_step: res.failed_step })
-          .then(function (r) { t.remove(); return handleReply(r); },
-                function (e) { t.remove(); addMsg('bot', 'I could not report the result to the agent service: ' + e.message, false); });
+        return report(action.run_id, res);
       });
+    }
+
+    function report(runId, res) {
+      var t = typing();
+      return api('/api/result', { session_id: state.sessionId, run_id: runId, status: res.status, message: res.message, failed_step: res.failed_step })
+        .then(function (r) { t.remove(); return handleReply(r); },
+              function (e) { t.remove(); addMsg('bot', 'I could not report the result to the agent service: ' + e.message, false); });
+    }
+
+    /* Live mode: Claude looks at the workspace page, picks the next move, the widget does it, repeat.
+       Saves and submits wait for the user's approval; passwords are typed by the user here. */
+    function runLive(live) {
+      var ws = openWorkspace('Agent: ' + live.goal), feed = activity(live.goal), userCtx = pageContext();
+      var lrec = startLiveRecorder(ws.frame, live.goal), payload = {}, secrets = {};
+      setStatus('working', 'Working on: ' + live.goal);
+
+      function loop() {
+        if (ws.stopped) return finish('stopped', 'Stopped by the user');
+        var looking = feed.add('Looking at the page', 'think');
+        setStatus('thinking', 'Looking at the page...');
+        var body = { session_id: state.sessionId, run_id: live.run_id, snapshot: snapshotPage(ws.frame, userCtx) };
+        for (var k in payload) body[k] = payload[k];
+        payload = {};
+        return api('/api/live/step', body).then(function (r) { looking.remove(); return handle(r.action || {}); },
+          function (e) { looking.remove(); return finish('error', 'I lost contact with the agent service: ' + e.message); });
+      }
+
+      function handle(a) {
+        if (a.type === 'do') {
+          setStatus('working', a.note || 'Working...');
+          ws.status(a.note || describe(a.steps[0]));
+          return runLiveSteps(ws.frame, a.steps || [], function (text) { return feed.add(text); })
+            .then(function (res) { payload = { result: res }; return loop(); });
+        }
+        if (a.type === 'ask') {
+          feed.add('Asked you a question', 'ask').end(true);
+          addMsg('bot', a.question);
+          return waitForUser('Waiting for your answer').then(function (text) { payload = { answer: text }; return loop(); });
+        }
+        if (a.type === 'secret') {
+          return askSecret(a).then(function (res) { payload = { result: res }; return loop(); });
+        }
+        if (a.type === 'confirm') {
+          return askApproval(a).then(function (yes) {
+            feed.add((yes ? 'You approved: ' : 'You declined: ') + a.button, yes ? 'ok' : 'err');
+            payload = yes ? { approved: a.confirm_id } : { declined: true };
+            return loop();
+          });
+        }
+        if (a.type === 'done') return finish('success', a.summary || 'Done');
+        return finish('error', a.summary || 'The agent stopped.');
+      }
+
+      function waitForUser(status) {
+        setStatus('waiting', status);
+        setBusy(false);
+        input.focus();
+        return new Promise(function (resolve) { liveWaiter = resolve; }).then(function (text) { setBusy(true); return text; });
+      }
+
+      function askSecret(a) {
+        var label = a.field.label || 'Password', key = norm(label).replace(/^(confirm|re-?enter|repeat|verify|new)\s+/, '');
+        function type(value) {
+          var item = feed.add('Typing ' + label + ' (hidden)');
+          return STEPS.set(ws.frame, { 'do': 'set', field: a.field, value: value, popup: a.popup })
+            .then(function () { item.end(true); return { ok: true, note: 'the user typed ' + label }; },
+                  function (e) { item.end(false, e.message); return { ok: false, step: 'Set ' + label, error: e.message }; });
+        }
+        if (secrets[key]) return type(secrets[key]);   /* "Confirm Password": the one typed a moment ago */
+        setStatus('waiting', 'Waiting for you to type ' + label);
+        return new Promise(function (resolve) {
+          var c = card('<h4>' + esc(label) + '</h4><small>Type it here. It goes straight into PeopleSoft; I never see it.</small>'
+            + '<label>' + esc(label) + '<input type="password" autocomplete="new-password" data-s="1"></label>'
+            + '<div class="psa-actions"><button type="button" class="psa-ok" disabled>Type it in</button><button type="button" class="psa-no">Skip</button></div>');
+          var inp = c.querySelector('[data-s]'), ok = c.querySelector('.psa-ok');
+          inp.addEventListener('input', function () { ok.disabled = !inp.value; });
+          inp.addEventListener('keydown', function (e) { if (e.key === 'Enter' && inp.value) ok.click(); });
+          setTimeout(function () { inp.focus(); }, 50);
+          ok.addEventListener('click', function () {
+            var v = inp.value;
+            inp.value = '';
+            disable(c);
+            secrets[key] = v;
+            resolve(type(v));
+          });
+          c.querySelector('.psa-no').addEventListener('click', function () { disable(c); resolve({ ok: false, error: 'the user skipped typing ' + label }); });
+        });
+      }
+
+      function askApproval(a) {
+        setStatus('waiting', 'Waiting for your approval');
+        return new Promise(function (resolve) {
+          var rows = (a.rows || []).map(function (r) { return '<tr><td>' + esc(r.label) + '</td><td><strong>' + esc(r.value) + '</strong></td></tr>'; }).join('');
+          var c = card('<h4>Ready to ' + esc(String(a.button || 'save').toLowerCase()) + ': ' + esc(a.title) + '</h4>'
+            + (rows ? '<table>' + rows + '</table>' : '')
+            + '<small>I will click <b>' + esc(a.button) + '</b> in PeopleSoft only if you approve. You can check the workspace first.</small>'
+            + '<div class="psa-actions"><button type="button" class="psa-ok">Approve: ' + esc(a.button) + '</button><button type="button" class="psa-no">Not now</button></div>');
+          c.classList.add('psa-approve');
+          c.querySelector('.psa-ok').addEventListener('click', function () { disable(c); resolve(true); });
+          c.querySelector('.psa-no').addEventListener('click', function () { disable(c); resolve(false); });
+        });
+      }
+
+      function finish(status, summary) {
+        lrec.stop();
+        liveWaiter = null;
+        secrets = null;
+        ws.done();
+        feed.finish(status);
+        ws.status(status === 'success' ? 'Done: ' + live.goal : 'Stopped: ' + summary, status !== 'success');
+        setStatus(status === 'success' ? 'idle' : 'error');
+        return report(live.run_id, { status: status, message: summary }).then(function () {
+          var rec = lrec.rec;
+          if (status !== 'success' || !canTeach || !rec.component || !rec.steps.some(isAction)) return;
+          var c = card('<h4>Make this a task?</h4><small>I worked this out step by step. Saved as a task, I can do it again in one go, '
+            + 'with new values each time.</small><div class="psa-actions"><button type="button" class="psa-ok">Save as a task</button>'
+            + '<button type="button" class="psa-no">No thanks</button></div>');
+          c.querySelector('.psa-no').addEventListener('click', function () { disable(c); });
+          c.querySelector('.psa-ok').addEventListener('click', function () {
+            disable(c);
+            reviewRecording({ title: live.goal, component: rec.component, query: rec.query || {}, steps: rec.steps });
+          });
+        });
+      }
+
+      return loop();
     }
 
     function open() {
       panel.classList.add('psa-open');
+      document.body.classList.add('psa-docked');
       fab.setAttribute('aria-expanded', 'true');
+      refreshContext();
+      clearInterval(ctxTimer);
+      ctxTimer = setInterval(refreshContext, 3000);
       if (!ready) {                       /* first open, or the last attempt failed: (re)connect */
         logEl.innerHTML = '';
         ensureConfig().then(function () {
           ready = true;
-          apiGet('/api/me').then(function (me) {
-            if (me.can_teach) panel.querySelector('#psa-rec').style.display = '';
+          return apiGet('/api/me').then(function (m) {
+            me = m;
+            canTeach = !!m.can_teach;
+            if (canTeach) panel.querySelector('#psa-rec').style.display = '';
           }, function (e) {
             addMsg('bot', 'I cannot reach the agent service at ' + (cfg.agentUrl || '(no URL)') + ': ' + e.message
               + '. Check that it is running and that this PeopleSoft address is in PSAGENT_ALLOWED_ORIGINS.', false);
+          }).then(function () {
+            if (state.history.length) state.history.forEach(function (h) { addMsg(h.who, h.text, false); });
+            else greet();
           });
-          if (state.history.length) state.history.forEach(function (h) { addMsg(h.who, h.text, false); });
-          else greet();
         }, function (e) {
           console.warn('[PSAgent] config failed:', e);
           addMsg('bot', 'Sorry, the agent is not available right now: ' + e.message + '.', false);
@@ -1397,29 +1874,56 @@
       }
       setTimeout(function () { input.focus(); }, 100);
     }
-    function close() { panel.classList.remove('psa-open'); fab.setAttribute('aria-expanded', 'false'); fab.focus(); }
+    function close() {
+      panel.classList.remove('psa-open');
+      document.body.classList.remove('psa-docked');
+      fab.setAttribute('aria-expanded', 'false');
+      clearInterval(ctxTimer);
+      fab.focus();
+    }
+    function setWide(on) {
+      panel.classList.toggle('psa-wide', on);
+      document.body.classList.toggle('psa-widebody', on);
+      try { localStorage.setItem('psagent.wide', on ? '1' : ''); } catch (e) {}
+    }
+    try { if (localStorage.getItem('psagent.wide')) setWide(true); } catch (e) {}
+
+    function submit() {
+      var t = input.value;
+      if (!String(t).trim() || (busy && !liveWaiter)) return;
+      input.value = '';
+      grow();
+      send(t);
+    }
+    function grow() { input.style.height = 'auto'; input.style.height = Math.min(Math.max(input.scrollHeight, 34), 140) + 'px'; }
 
     fab.addEventListener('click', function () { panel.classList.contains('psa-open') ? close() : open(); });
     panel.querySelector('#psa-close').addEventListener('click', close);
+    panel.querySelector('#psa-wide').addEventListener('click', function () { setWide(!panel.classList.contains('psa-wide')); });
     panel.querySelector('#psa-rec').addEventListener('click', function () { showRecordCard({ title: '' }); });
+    panel.querySelector('#psa-hist').addEventListener('click', showRecent);
+    panel.querySelector('#psa-recentpop').addEventListener('click', function (e) {
+      var b = e.target.closest && e.target.closest('[data-q]');
+      if (b) send(b.getAttribute('data-q'));
+    });
     panel.querySelector('#psa-new').addEventListener('click', function () {
       state = { sessionId: null, history: [] };
       saveState();
       logEl.innerHTML = '';
+      setStatus('idle');
       greet();
     });
-    panel.querySelector('#psa-form').addEventListener('submit', function (e) {
-      e.preventDefault();
-      var t = input.value;
-      input.value = '';
-      send(t);
-    });
+    panel.querySelector('#psa-form').addEventListener('submit', function (e) { e.preventDefault(); submit(); });
+    input.addEventListener('input', grow);
     input.addEventListener('keydown', function (e) {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); panel.querySelector('#psa-send').click(); }
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+      if (e.key === 'ArrowUp' && !input.value) { var r = recentList()[0]; if (r) { e.preventDefault(); input.value = r; grow(); } }
     });
     document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape' && panel.classList.contains('psa-open')) close();
+      if ((e.ctrlKey || e.metaKey) && e.key === '/') { e.preventDefault(); panel.classList.contains('psa-open') ? close() : open(); }
+      else if (e.key === 'Escape' && panel.classList.contains('psa-open')) close();
     });
+    setStatus('idle');
 
     window.PSAgent.teach = function (component, query) {
       var comp = parsePage(component);
@@ -1481,6 +1985,8 @@
   window.PSAgent = {
     version: VERSION,
     inspect: inspect,
+    /* what live mode sends to Claude for the page in the workspace (or the page you are on) */
+    snapshot: function () { return snapshotPage(workspace && workspace.el.style.display !== 'none' ? workspace.frame : getContentFrameEl() || { contentDocument: document, contentWindow: window }); },
     run: function (action, secrets) { return runAction(action, secrets || {}, openWorkspace('Agent: ' + (action.title || 'test'))); }
   };
 

@@ -136,6 +136,7 @@ test('record in the real UI across page loads -> review -> save -> agent does it
   await f.locator('[id="#ICSave"]').click();
   await f.locator('#SAVED_win0').waitFor();
   assert.equal((await saved(page, '#ptifrmtgtframe')).OPRID, 'KUMAR');
+  await page.waitForFunction(() => /Saved/.test(document.querySelector('#psa-recbar').textContent));   // seen on the next check
   assert.match(await bar.innerText(), /14 steps on USERMAINT · Saved/);   // PeopleSoft's Saved was seen
   await page.click('#psa-recbar-finish');
   assert.equal(await bar.count(), 0);
@@ -257,6 +258,46 @@ test('runner: a process request counts as submitted when the page shows no insta
   assert.match(res.message, /Submitted to the Process Scheduler/);
   const run = await page.frameLocator('#psa-ws-frame').locator('body').evaluate(() => window.__mockRun);
   assert.deepEqual(run.SELECTED, ['AEMINITEST']);
+});
+
+test('live mode: no task fits, so the agent reads each page and decides; Save waits for approval', async page => {
+  await page.click('#psa-fab');
+  await page.locator('.psa-welcome').waitFor();                          // welcome screen with what I can do
+  await page.fill('#psa-input', 'create user LIVE1 with symbolic ID SYSADM1');
+  await page.press('#psa-input', 'Enter');
+  // the password is asked for on a local card, typed straight into PeopleSoft
+  const secret = page.locator('.psa-card', { hasText: 'New Password' });
+  await secret.waitFor({ timeout: 60000 });
+  await secret.locator('input[type="password"]').fill('L1ve!pw');
+  await secret.locator('.psa-ok').click();
+  // a question in the chat; the answer goes back to the live run
+  await page.locator('.psa-bot', { hasText: 'What description should LIVE1 have?' }).waitFor({ timeout: 60000 });
+  assert.match(await page.locator('#psa-status').innerText(), /Waiting for your answer/);
+  await page.fill('#psa-input', 'Live One');
+  await page.press('#psa-input', 'Enter');
+  // Save only after approval
+  const approve = page.locator('.psa-card', { hasText: 'Approve: Save' });
+  await approve.waitFor({ timeout: 60000 });
+  assert.equal(await saved(page), null);                                 // nothing saved before approval
+  assert.ok((await approve.innerText()).includes('Live One'));
+  await approve.locator('.psa-ok').click();
+  await page.locator('.psa-bot', { hasText: 'worked out live' }).waitFor({ timeout: 60000 });
+  assert.deepEqual(await saved(page), {
+    OPRID: 'LIVE1', DESCR: 'Live One', SYMBOLICID: 'SYSADM1', PWD: 'L1ve!pw', PWD2: 'L1ve!pw',
+    OPRCLASS: '', IDTYPE: 'NON', EMPLID: '', ROLES: [''],
+  });
+  const feed = await page.locator('.psa-feed').last().innerText();
+  for (const s of ['Open MAINTAIN_SECURITY.USERMAINT', 'Set User ID', 'Typing New Password (hidden)', 'Asked you a question', 'You approved: Save'])
+    assert.ok(feed.includes(s), s + ' missing in\n' + feed);
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).join('\n');
+  assert.ok(!bodies.includes('L1ve!pw'), 'password reached the agent service');
+  // what it worked out can become a task
+  const offer = page.locator('.psa-card', { hasText: 'Make this a task?' });
+  await offer.locator('.psa-ok').click();
+  const review = page.locator('.psa-card', { hasText: 'Review the recorded task' });
+  await review.waitFor();
+  assert.equal(await review.locator('[data-k="open_mode"]').inputValue(), 'add');
+  assert.match(await review.innerText(), /shows Saved/);
 });
 
 let failed = 0;

@@ -79,6 +79,30 @@ llm = FakeLLM(
     response(tool("start_task", {"task_id": "sync_portal_security"}), tool("request_confirmation", {}, id="c3")),
     response(text("Please confirm.")),
     response(text("Done. The portal security sync was submitted.")),
+    # live mode: no task fits, Claude works it out on the page
+    response(tool("work_live", {"goal": "Create user LIVE1", "details": "user LIVE1, symbolic ID SYSADM1"}, id="w1")),
+    response(text("On it: I'll work it out on screen.")),
+    *[response(tool(n, a, id=f"l{i}")) for i, (n, a) in enumerate([
+        ("act", {"note": "Opening User Profiles", "actions": [
+            {"kind": "open_page", "target": "MAINTAIN_SECURITY.USERMAINT.GBL", "value": ""}]}),
+        ("act", {"note": "Switching to Add", "actions": [
+            {"kind": "click", "target": "PTS_CFG_CL_WRK_PTS_PAGE_TOGGLE", "value": ""}]}),
+        ("act", {"note": "Adding LIVE1", "actions": [
+            {"kind": "set", "target": "PSOPRDEFN_SRCH_OPRID", "value": "LIVE1"},
+            {"kind": "click", "target": "PTS_CFG_CL_WRK_PTS_ADD_BTN", "value": ""}]}),
+        ("act", {"note": "Symbolic ID", "actions": [{"kind": "set", "target": "PSOPRDEFN_SYMBOLICID", "value": "SYSADM1"}]}),
+        ("type_secret", {"target": "PSUSRPRFL_WRK_PTPSWDCLEARTXTINPT", "label": "New Password"}),
+        ("type_secret", {"target": "PSUSRPRFL_WRK_PTPSWDCLEARTXTCONF", "label": "Confirm Password"}),
+        ("ask_user", {"question": "What description should LIVE1 have?"}),
+        ("act", {"note": "ID tab", "actions": [{"kind": "tab", "target": "ID", "value": ""}]}),
+        ("act", {"note": "Description", "actions": [
+            {"kind": "set", "target": "PSOPRDEFN_DVW_OPRDEFNDESC$0", "value": "Live One"}]}),
+        ("act", {"note": "Saving", "actions": [{"kind": "click", "target": "#ICSave", "value": ""}]}),   # refused
+        ("request_commit", {"target": "#ICSave", "summary": [{"label": "User ID", "value": "LIVE1"},
+                                                             {"label": "Description", "value": "Live One"}]}),
+        ("finish", {"success": True, "summary": "Created user LIVE1 (Live One) and PeopleSoft saved it."}),
+    ])],
+    response(text("Done: user **LIVE1** was created, worked out live.")),
     drafts=[DRAFT, DRAFT_PROCESS],
 )
 app = create_app(Agent(llm, TASKS), secret="", allowed_origins=[], dev_oprid="TESTER",

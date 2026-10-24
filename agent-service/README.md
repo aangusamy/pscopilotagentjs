@@ -35,6 +35,52 @@ Design points:
   a yes/no prompt. The page stays open in the workspace, and the agent explains
   the message and offers to fix the values.
 
+## Two ways to work: tasks and live mode
+
+**Tasks** (`tasks/*.yaml`, recorded or hand-written) are the fast, repeatable
+path: the agent collects the values, you confirm, the steps run in one go.
+
+**Live mode** is for everything else, like Claude Code works in a terminal:
+when no task fits, the agent calls `work_live` and then operates PeopleSoft one
+page at a time. Each round the widget sends a snapshot of the workspace page
+(fields with labels and values, buttons, tabs, messages, the pop-up, search
+results); Claude picks the next move (`act`, `ask_user`, `type_secret`,
+`request_commit`, `finish`); the widget does it and reports what happened.
+
+```
+ widget: snapshot of the page ──▶ /api/live/step ──▶ Claude chooses one move
+        ▲                                               │
+        └──────── does it, reports the result ◀─────────┘   until finish
+```
+
+Safety is enforced in `live.py`, not left to the model:
+
+* every target must be on the current page; read-only fields are refused;
+* Save, Submit, Post, Approve, Delete, Yes on a question and OK on the Process
+  Scheduler Request can only be clicked after **you approve** a card that
+  summarizes the change. The click is handed to the widget only against that
+  approval;
+* passwords are typed by you on a card in the browser (`type_secret`) and go
+  straight into PeopleSoft;
+* questions appear in the chat and your answer goes back into the run.
+
+While it works, the recorder watches the workspace. When a live run succeeds,
+teachers get **"Make this a task?"**: one click turns what Claude worked out into
+a reviewed, reusable task, so the next time is one step.
+
+## The chat panel
+
+The widget is a panel docked on the right, with the workspace beside it:
+
+* the agent's state is always visible (ready, thinking, working, waiting for
+  you), on its avatar and in the header;
+* an activity feed shows each step as it happens, with a tick or the error;
+* the welcome screen lists your recent questions, the tasks it knows, and
+  "Explain this page" or "Help with this error" for the page you are on;
+* the clock button (or the Up arrow in an empty box) brings back recent
+  questions; the arrows button makes the panel wider; **Ctrl+/** opens and
+  closes it.
+
 ## Run it
 
 ```bash
@@ -196,8 +242,8 @@ of asking for them. That is the natural next step.
 ## Tests
 
 ```bash
-cd agent-service && python3 -m unittest discover -s tests -t tests       # 60 unit tests, scripted LLM
-cd .. && node tests/runner/run_browser_tests.mjs                          # 8 browser tests (Playwright)
+cd agent-service && python3 -m unittest discover -s tests -t tests       # 68 unit tests, scripted LLM
+cd .. && node tests/runner/run_browser_tests.mjs                          # 9 browser tests (Playwright)
 ```
 
 The browser tests run the real widget and the real service (with a scripted

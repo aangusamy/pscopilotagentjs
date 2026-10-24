@@ -12,6 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from . import live as livemode
 from .llm import LLMError
 
 log = logging.getLogger("psagent")
@@ -45,10 +46,13 @@ Passwords and other secret fields are typed by the user on the confirmation \
 card and never reach you. Never ask for them in chat. If a user types a \
 password in chat, do not repeat it and tell them to enter it on the card instead.
 
-If the user asks for something that is not in the task list, say you cannot do \
-that yet and describe it as a step-by-step guide instead. Users allowed to teach \
-can add tasks: when a user wants to teach or record a new task, or asks you to \
-learn something you cannot do yet, call offer_recording. They then do the task \
+If the user asks you to do something on screen that no task in the list \
+covers, call work_live: you then operate PeopleSoft step by step yourself, \
+reading each page and deciding the next move, and the user approves anything \
+that saves or submits. Gather the values the user already gave into its \
+details; you can ask for more during the run. For questions (not actions), \
+just answer. Users allowed to teach can also add tasks: when a user wants to \
+teach or record a new task, call offer_recording. They then do the task \
 once by hand while the widget records it, review the template and save it. New \
 or updated tasks are announced to you in system messages during the conversation.
 
@@ -121,6 +125,16 @@ def build_tools():
             [],
         ),
         _strict(
+            "work_live",
+            "Do something on screen that no listed task covers, by operating PeopleSoft live, one page at "
+            "a time. The user approves every save or submit. Use only for actions the user asked for.",
+            {
+                "goal": {"type": "string", "description": "What to achieve, in one sentence"},
+                "details": {"type": "string", "description": "Every value and instruction the user gave"},
+            },
+            ["goal", "details"],
+        ),
+        _strict(
             "offer_recording",
             "Show the Record card so the user can teach a new task by doing it once by hand.",
             {"title": {"type": "string", "description": "Short task title starting with a verb, e.g. 'Create Requisition'"}},
@@ -148,9 +162,11 @@ class Reply:
     confirm: dict | None = None
     action: dict | None = None
     record: dict | None = None
+    live: dict | None = None
 
     def to_dict(self):
-        return {"messages": self.messages, "confirm": self.confirm, "action": self.action, "record": self.record}
+        return {"messages": self.messages, "confirm": self.confirm, "action": self.action, "record": self.record,
+                "live": self.live}
 
 
 @dataclass
@@ -162,6 +178,7 @@ class Session:
     values: dict = field(default_factory=dict)
     pending: dict | None = None  # {run_id, task_id, values} awaiting the user's click
     running: dict | None = None  # {run_id, task_id} handed to the widget
+    live: livemode.LiveRun | None = None  # live run in progress
     can_teach: bool = False
     system: str | None = None  # frozen at the first turn so the prompt prefix never changes
     known: dict | None = None  # task_id -> signature the model has been told about
@@ -198,6 +215,7 @@ class SessionStore:
 class Agent:
     def __init__(self, llm, tasks):
         self.llm = llm
+        self.operator = livemode.LiveOperator(llm)
         self.tasks = dict(tasks)
         self.tools = build_tools()
         self._tasks_lock = threading.Lock()
@@ -235,11 +253,24 @@ class Agent:
             },
         )
 
+    def live_step(self, s, run_id, snapshot, result=None, answer=None, approved=None, declined=None):
+        """Next live-mode action for the widget (see live.py)."""
+        run = s.live
+        if not run or run.run_id != run_id or run.done:
+            return {"type": "fail", "summary": "This live run is no longer active."}
+        action = self.operator.step(run, snapshot, result, answer, approved, declined)
+        log.info("live %s for %s: %s", run_id, s.oprid, json.dumps(action)[:500])
+        return action
+
     def report(self, s, run_id, status, message, failed_step=None):
         if not s.running or s.running["run_id"] != run_id:
             return Reply(messages=["I don't have a run with that ID in progress."])
         task_id = s.running["task_id"]
         s.running = None
+        if s.live and s.live.run_id == run_id:
+            history = s.live.history[-12:]
+            s.live = None
+            message = (message + "\nWhat you did: " + " | ".join(history))[:3000]
         log.info("run %s finished for %s: %s %s", run_id, s.oprid, status, message)
         if status == "success":
             s.task_id, s.values = None, {}
@@ -317,6 +348,19 @@ class Agent:
             s.task_id, s.values, s.pending = task.id, {}, None
             reply.confirm = None
             return task.describe(s.values), False
+
+        if name == "work_live":
+            goal = str(args.get("goal") or "").strip()
+            if not goal:
+                return {"error": "goal is required"}, True
+            run = livemode.new_run(goal, args.get("details") or "")
+            s.live, s.pending = run, None
+            s.running = {"run_id": run.run_id, "task_id": "live"}
+            reply.live = {"run_id": run.run_id, "goal": run.goal}
+            log.info("live run %s started by %s: %s | %s", run.run_id, s.oprid, run.goal, run.details)
+            return {"started": True, "run_id": run.run_id,
+                    "note": "You are now working on screen; the result arrives as an [automation result]. "
+                            "Tell the user in one short sentence that you are on it."}, False
 
         if name == "offer_recording":
             if not s.can_teach:
