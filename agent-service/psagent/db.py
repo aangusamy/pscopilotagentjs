@@ -17,7 +17,7 @@ log = logging.getLogger("psagent")
 
 MAX_ROWS = 200
 TIMEOUT_MS = 20000
-MAX_CELL = 2000  # characters per value (CLOBs are cut)
+MAX_CELL = 2000  # characters per value in ad-hoc query results (CLOBs are cut)
 
 # Columns whose values are never returned: national IDs, birth dates, pay, bank details, passwords
 _SENSITIVE = re.compile(
@@ -25,7 +25,7 @@ _SENSITIVE = re.compile(
     r"ANNUAL_RT|MONTHLY_RT|HOURLY_RT|DAILY_RT|COMPRATE|CHANGE_AMT|SALARY", re.I)
 _FORBIDDEN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|MERGE|UPSERT|DROP|ALTER|CREATE|TRUNCATE|RENAME|GRANT|REVOKE|COMMIT|ROLLBACK|SAVEPOINT|"
-    r"LOCK|EXECUTE|EXEC|CALL|BEGIN|DECLARE|PURGE|FLASHBACK|AUDIT|ANALYZE)\b|\bFOR\s+UPDATE\b|\bDBMS_(?!LOB\.SUBSTR)\w+|"
+    r"LOCK|EXECUTE|EXEC|CALL|BEGIN|DECLARE|PURGE|FLASHBACK|AUDIT|ANALYZE)\b|\bFOR\s+UPDATE\b|\bDBMS_(?!LOB\.(?:SUBSTR|INSTR|GETLENGTH)\b)\w+|"
     r"\bUTL_\w+|\bSYS\.|@\w", re.I)
 
 
@@ -60,7 +60,7 @@ def masked(name):
     return bool(_SENSITIVE.search(str(name)))
 
 
-def _cell(v):
+def _cell(v, max_cell=MAX_CELL):
     if v is None:
         return None
     if hasattr(v, "read"):  # LOB
@@ -70,7 +70,7 @@ def _cell(v):
     if isinstance(v, (int, float)):
         return v
     s = str(v)
-    return s if len(s) <= MAX_CELL else s[:MAX_CELL] + " …(cut)"
+    return s if len(s) <= max_cell else s[:max_cell] + " …(cut)"
 
 
 class ReadOnlyDB:
@@ -84,8 +84,8 @@ class ReadOnlyDB:
         self.schema = schema
         self.label = f"{user}@{dsn}"
 
-    def query(self, sql, params=None, max_rows=MAX_ROWS, who="", why=""):
-        """-> (columns, rows, truncated). Raises QueryError."""
+    def query(self, sql, params=None, max_rows=MAX_ROWS, who="", why="", max_cell=MAX_CELL):
+        """-> (columns, rows, truncated). Raises QueryError. max_cell: longer for reading program code."""
         sql = check_select(sql)
         log.info("db query by %s (%s): %s", who or "?", why[:120], " ".join(sql.split())[:500])
         try:
@@ -104,7 +104,7 @@ class ReadOnlyDB:
         except self._oracledb.Error as e:
             raise QueryError(str(e).splitlines()[0][:300]) from e
         hide = [masked(c) for c in cols]
-        rows = [[("***" if hide[i] and v is not None else _cell(v)) for i, v in enumerate(r)] for r in raw[:max_rows]]
+        rows = [[("***" if hide[i] and v is not None else _cell(v, max_cell)) for i, v in enumerate(r)] for r in raw[:max_rows]]
         return cols, rows, len(raw) > max_rows
 
 

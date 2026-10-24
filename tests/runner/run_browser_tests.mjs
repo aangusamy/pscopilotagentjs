@@ -389,10 +389,14 @@ test('troubleshoot: "why did my last process fail?" -> log file, message log and
   assert.match(await card.locator('pre.psa-code').innerText(), /&nTest = &nTest \+ 1;/);   // the suggested code
   const feed = await page.locator('.psa-feed').last().innerText();
   for (const s of ['Troubleshooting process 557060', 'Reading log file AE_AEMINITEST_557060.stdout',
+    'Reading the end of log file AE_AEMINITEST_557060.trc (232 MB)',
     'Read process 557060: status, message log, earlier runs', 'Read PeopleCode AEMINITEST.MAIN.Step02', 'Diagnosis ready'])
     assert.ok(feed.includes(s), s + ' missing in\n' + feed);
   const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b.includes('"run_id":"tbl-'));
-  assert.match(JSON.parse(bodies[0]).logs[0].text, /ABENDED at Step AEMINITEST\.MAIN\.Step02/);   // log read in the browser, sent once
+  const logs = JSON.parse(bodies[0]).logs, trc = logs.find(l => l.name.endsWith('.trc'));
+  assert.match(logs.find(l => l.name.endsWith('.stdout')).text, /ABENDED at Step AEMINITEST\.MAIN\.Step02/);   // log read in the browser, sent once
+  assert.match(trc.part, /^last 0\.1 MB of 232 MB$/);                    // big trace: only its end was fetched
+  assert.ok(trc.text.endsWith('(trace end)\n') && trc.text.length <= 61000, 'trace end kept, size capped');
   assert.ok(!JSON.parse(bodies[1]).logs);
 });
 

@@ -139,7 +139,7 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
         s = store.get(data.get("session_id"), oprid)
         if s is None:
             return bad("unknown session", 404)
-        logs = [{"name": str(x.get("name"))[:120], "text": str(x.get("text") or "")[:60000]}
+        logs = [{"name": str(x.get("name"))[:120], "text": str(x.get("text") or "")[:70000], "part": str(x.get("part") or "")[:60]}
                 for x in (data.get("logs") or []) if isinstance(x, dict)][:6]
 
         def work():

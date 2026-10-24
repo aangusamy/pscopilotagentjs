@@ -147,7 +147,30 @@ llm = FakeLLM(
         "rerun": "Run AEMINITEST again from Request AE (or ask me to run it)."}, id="t4")),
     drafts=[DRAFT, DRAFT_PROCESS],
 )
-app = create_app(Agent(llm, TASKS, FakeDB()), secret="", allowed_origins=[], dev_oprid="TESTER",
+class TraceDB(FakeDB):
+    """Also posts a 232 MB trace file (like the real PORTAL_CSS run): the widget must read only its end."""
+
+    def query(self, sql, params=None, **kw):
+        cols, rows, cut = super().query(sql, params, **kw)
+        if "FROM PS_CDM_LIST" in sql.upper():
+            rows = rows + [["http://ps:8000/psreports/ps", 85515, "AE_AEMINITEST_557060.trc", TRACE_SIZE]]
+        return cols, rows, cut
+
+
+TRACE_SIZE = 232 * 1048576
+
+
+def trace(request):
+    """Honors Range: bytes=-N like the PeopleSoft web server; never sends the whole 'file'."""
+    rng = request.headers.get("range", "")
+    if not rng.startswith("bytes=-"):
+        return Response("refusing to send 232 MB", status_code=500)
+    tail = ("-- 16.41.02 ... SQL trace lines ...\n" * 4000)[-(int(rng[7:]) - 60):] + "-- ABENDED at Step Step02 (trace end)\n"
+    return Response(tail, status_code=206, media_type="text/plain",
+                    headers={"Content-Range": f"bytes {TRACE_SIZE - len(tail)}-{TRACE_SIZE - 1}/{TRACE_SIZE}"})
+
+
+app = create_app(Agent(llm, TASKS, TraceDB()), secret="", allowed_origins=[], dev_oprid="TESTER",
                  teachers={"*"}, tasks_dir=str(TASKS_DIR))
 bodies = []
 
@@ -228,6 +251,7 @@ app.router.routes.extend([
         "PSAESRV started service request at 16.40.55 2026-10-24\n\nDecimal division by zero occurred. (180,109) "
         "AEMINITEST.MAIN.GBL.default.1900-01-01.Step02.OnExecute  PCPC:108  Statement:3\n\nProcess 557060 ABENDED at Step "
         "AEMINITEST.MAIN.Step02 (PeopleCode) -- RC = 8 (108,524)\n", media_type="text/plain")),
+    Route("/psreports/ps/85515/AE_AEMINITEST_557060.trc", trace),
     Route("/__test/action", action),
     Route("/__test/bodies", lambda r: JSONResponse(bodies)),
     Route("/__test/task_file", lambda r: Response((TASKS_DIR / (r.query_params["id"] + ".yaml")).read_text())),

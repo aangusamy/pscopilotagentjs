@@ -7,7 +7,9 @@ sees the progress:
   get_process      request, status, server, parameters, message log (catalog
                    text with its parameters filled in), earlier runs
   get_ae_program   sections, steps, actions and their SQL
-  get_peoplecode   the PeopleCode of a step, with line and statement numbers
+  get_peoplecode   the PeopleCode of an AE step, with line and statement numbers
+  search_code      which PeopleCode programs contain a text (function names, SQL)
+  read_code        any PeopleCode program by its key (function libraries, events)
   describe_record  fields and keys of a record
   query            a read-only SELECT (db.check_select, masking, limits)
   finish           the diagnosis: category, root cause, evidence, fix
@@ -28,7 +30,9 @@ from .llm import LLMError
 log = logging.getLogger("psagent")
 
 MAX_ROUNDS = 14
-MAX_RESULT = 24000  # characters of one tool result sent to Claude
+MAX_RESULT = 40000  # characters of one tool result sent to Claude
+CODE_CELL = 1_000_000  # PeopleCode text is read whole (it is shown in windows when long)
+CODE_WINDOW = 60       # lines shown around a statement in long programs
 MAX_LOG = 30000     # characters of one log file
 
 RUNSTATUS = {"1": "Cancel", "2": "Delete", "3": "Error", "4": "Hold", "5": "Queued", "6": "Initiated",
@@ -49,8 +53,13 @@ log files given with the request.
 2. Find the failing place. Application Engine messages name it, e.g. \
 "AEMINITEST.MAIN.GBL.default.1900-01-01.Step02.OnExecute PCPC:108 Statement:3" \
 = program AEMINITEST, section MAIN, step Step02, PeopleCode, statement 3; \
-"ABENDED at Step P.S.Step (SQL)" = the SQL action of that step. Read it with \
-get_peoplecode or get_ae_program.
+"... Name:doX ... Statement:127 Called from: ... Statement:364" = statement 127 \
+inside function doX, called at statement 364; "ABENDED at Step P.S.Step (SQL)" = \
+the SQL action of that step. Read it with get_peoplecode (focus on the \
+statement) or get_ae_program; find functions defined elsewhere with \
+search_code and read them with read_code. Delivered (Oracle) code is rarely \
+the bug by itself: look for what was different in this run (data, setup, \
+parameters, other processes running at the same time).
 3. If data may be involved, prove it with read-only queries (counts, the rows \
 that break the rule, keys). Use the PeopleSoft tables directly (PS_JOB, \
 PSPRCSRQST, ...). Masked values show as ***; do not try to get around masking.
@@ -58,7 +67,11 @@ PSPRCSRQST, ...). Masked values show as ***; do not try to get around masking.
 
 Categories: data (bad or missing rows), code (a bug in PeopleCode/SQL/SQR), \
 setup (configuration tables, run control or process definition), security \
-(permissions), environment (servers, queues, files, database).
+(permissions), environment (servers, queues, files, database, runs colliding). \
+If the same program and run control succeeded before and after, compare the \
+runs: overlapping_runs in get_process shows runs of the same process at the \
+same time, and the definition shows whether parallel runs are allowed \
+(MAXCONCURRENT 0 = unlimited) or mutually exclusive.
 
 The diagnosis must be specific: the exact program/section/step/statement or \
 table/row, the evidence (quote the log line, the code line, the query result), \
@@ -80,9 +93,17 @@ TOOLS = [
           {"instance": {"type": "string"}}, ["instance"]),
     _tool("get_ae_program", "An Application Engine program: sections, steps, actions and their SQL.",
           {"program": {"type": "string"}}, ["program"]),
-    _tool("get_peoplecode", "The PeopleCode of an Application Engine step, with line and statement numbers.",
-          {"program": {"type": "string"}, "section": {"type": "string"}, "step": {"type": "string"}},
-          ["program", "section", "step"]),
+    _tool("get_peoplecode", "The PeopleCode of an Application Engine step, with line and statement numbers. "
+          "Long programs come back as a window around focus_statement (use '' for the start).",
+          {"program": {"type": "string"}, "section": {"type": "string"}, "step": {"type": "string"},
+           "focus_statement": {"type": "string", "description": "Statement number to center on, or ''"}},
+          ["program", "section", "step", "focus_statement"]),
+    _tool("search_code", "Find PeopleCode programs containing a text, e.g. 'Function doSecuritySync' or a table name. "
+          "Returns program keys and the matching lines.",
+          {"text": {"type": "string"}}, ["text"]),
+    _tool("read_code", "Read a PeopleCode program by the key search_code returned, with line and statement numbers.",
+          {"key": {"type": "string"}, "focus_statement": {"type": "string", "description": "Statement number to center on, or ''"}},
+          ["key", "focus_statement"]),
     _tool("describe_record", "Fields (type, length, key) of a PeopleSoft record, e.g. JOB or PSA_COMPA_AET.",
           {"record": {"type": "string"}}, ["record"]),
     _tool("query", "Run one read-only SELECT on the PeopleSoft database (max 200 rows).",
@@ -190,8 +211,10 @@ class Troubleshooter:
         if inv.question:
             parts.append(f"The user asks: {inv.question}")
         for lf in logs[:6]:
-            text = str(lf.get("text") or "")[:MAX_LOG]
-            parts.append(f"<log_file name={json.dumps(str(lf.get('name'))[:120])}>\n{text}\n</log_file>")
+            text = _head_tail(str(lf.get("text") or ""), MAX_LOG)
+            part = str(lf.get("part") or "")[:60]
+            parts.append(f"<log_file name={json.dumps(str(lf.get('name'))[:120])}"
+                         + (f" part={json.dumps(part)}" if part else "") + f">\n{text}\n</log_file>")
         if not logs:
             parts.append("No posted log files could be read; use the message log.")
         return "\n\n".join(parts)
@@ -225,7 +248,16 @@ class Troubleshooter:
                 return f"Read Application Engine program {p}", self._ae_program(p, oprid), False
             if name == "get_peoplecode":
                 p, sec, st = _ident(args.get("program")), _ident(args.get("section"), False), _ident(args.get("step"), False)
-                return f"Read PeopleCode {p}.{sec}.{st}", self._peoplecode(p, sec, st, oprid), False
+                focus = str(args.get("focus_statement") or "").strip()
+                return (f"Read PeopleCode {p}.{sec}.{st}" + (f" around statement {focus}" if focus else ""),
+                        self._peoplecode(p, sec, st, oprid, focus), False)
+            if name == "search_code":
+                needle = str(args.get("text") or "").strip()[:100]
+                return f"Searched all PeopleCode for \"{needle}\"", self._search_code(needle, oprid), False
+            if name == "read_code":
+                key, focus = str(args.get("key") or "")[:300], str(args.get("focus_statement") or "").strip()
+                return (f"Read PeopleCode {key.replace('|', '.').strip('.')}" + (f" around statement {focus}" if focus else ""),
+                        self._read_code(key, focus, oprid), False)
             if name == "describe_record":
                 r = _ident(args.get("record"))
                 return f"Read record definition {r}", self._record(r, oprid), False
@@ -239,8 +271,8 @@ class Troubleshooter:
             return f"{name} refused or failed: {e}", f"error: {e}", True
         return f"Unknown tool {name}", f"unknown tool {name}", True
 
-    def _q(self, sql, params, oprid, why, max_rows=200):
-        cols, rows, _ = self.db.query(sql, params, max_rows=max_rows, who=oprid, why=why)
+    def _q(self, sql, params, oprid, why, max_rows=200, **kw):
+        cols, rows, _ = self.db.query(sql, params, max_rows=max_rows, who=oprid, why=why, **kw)
         return [dict(zip(cols, r)) for r in rows]
 
     def _process(self, n, oprid):
@@ -254,8 +286,15 @@ class Troubleshooter:
             return f"error: no process request {n}"
         r = rq[0]
         r["RUNSTATUS"] = f"{r['RUNSTATUS']} ({RUNSTATUS.get(str(r['RUNSTATUS']), '?')})"
-        defn = self._q("SELECT DESCR FROM PS_PRCSDEFN WHERE PRCSTYPE = :t AND PRCSNAME = :n",
-                       {"t": rq[0]["PRCSTYPE"], "n": rq[0]["PRCSNAME"]}, oprid, "process definition")
+        defn = self._q("SELECT DESCR, MAXCONCURRENT, RETRYCOUNT, RESTARTENABLED FROM PS_PRCSDEFN WHERE PRCSTYPE = :t "
+                       "AND PRCSNAME = :n", {"t": rq[0]["PRCSTYPE"], "n": rq[0]["PRCSNAME"]}, oprid, "process definition")
+        exclusive = self._q("SELECT PRCSTYPE_1, PRCSNAME_1 FROM PS_PRCSMUTUALEXCL WHERE PRCSTYPE = :t AND PRCSNAME = :n",
+                            {"t": rq[0]["PRCSTYPE"], "n": rq[0]["PRCSNAME"]}, oprid, "mutually exclusive processes")
+        overlap = self._q("SELECT PRCSINSTANCE, RUNSTATUS, RUNCNTLID, OPRID, BEGINDTTM, ENDDTTM FROM PSPRCSRQST "
+                          "WHERE PRCSNAME = :n AND PRCSINSTANCE <> :i AND BEGINDTTM IS NOT NULL "
+                          "AND BEGINDTTM < (SELECT NVL(ENDDTTM, SYSDATE) FROM PSPRCSRQST WHERE PRCSINSTANCE = :i) "
+                          "AND NVL(ENDDTTM, SYSDATE) > (SELECT BEGINDTTM FROM PSPRCSRQST WHERE PRCSINSTANCE = :i) "
+                          "ORDER BY BEGINDTTM", {"n": rq[0]["PRCSNAME"], "i": i}, oprid, "runs at the same time")
         parms = self._q("SELECT PARMLIST, ORIGPARMLIST FROM PSPRCSPARMS WHERE PRCSINSTANCE = :i", {"i": i}, oprid,
                         "parameters")
         msgs = self._q("SELECT L.MESSAGE_SEQ, L.MESSAGE_SET_NBR, L.MESSAGE_NBR, L.MESSAGE_SEVERITY, L.DTTM_STAMP_SEC, "
@@ -274,17 +313,18 @@ class Troubleshooter:
             log_lines.append({"seq": m["MESSAGE_SEQ"], "msg": f"({m['MESSAGE_SET_NBR']},{m['MESSAGE_NBR']})",
                               "severity": m.get("MESSAGE_SEVERITY"), "text": text, "parameters": ps,
                               "time": m.get("DTTM_STAMP_SEC")})
-        earlier = self._q("SELECT PRCSINSTANCE, RUNSTATUS, RUNCNTLID, OPRID, ENDDTTM FROM (SELECT PRCSINSTANCE, RUNSTATUS, "
-                          "RUNCNTLID, OPRID, ENDDTTM FROM PSPRCSRQST WHERE PRCSNAME = :n AND PRCSINSTANCE <> :i "
-                          "ORDER BY PRCSINSTANCE DESC) WHERE ROWNUM <= 6", {"n": rq[0]["PRCSNAME"], "i": i}, oprid,
-                          "earlier runs")
-        for e in earlier:
+        earlier = self._q("SELECT PRCSINSTANCE, RUNSTATUS, RUNCNTLID, OPRID, BEGINDTTM, ENDDTTM FROM (SELECT PRCSINSTANCE, "
+                          "RUNSTATUS, RUNCNTLID, OPRID, BEGINDTTM, ENDDTTM FROM PSPRCSRQST WHERE PRCSNAME = :n "
+                          "AND PRCSINSTANCE <> :i ORDER BY PRCSINSTANCE DESC) WHERE ROWNUM <= 8",
+                          {"n": rq[0]["PRCSNAME"], "i": i}, oprid, "earlier runs")
+        for e in earlier + overlap:
             e["RUNSTATUS"] = f"{e['RUNSTATUS']} ({RUNSTATUS.get(str(e['RUNSTATUS']), '?')})"
         for p in parms:   # the password parameter is never shown
             for k in p:
                 p[k] = re.sub(r"(-CP\s+)\S+", r"\1***", str(p[k] or ""))
-        return json.dumps({"request": r, "definition": defn[0]["DESCR"] if defn else None, "parameters": parms,
-                           "message_log": log_lines, "earlier_runs": earlier}, default=str)
+        return json.dumps({"request": r, "definition": defn[0] if defn else None, "mutually_exclusive_with": exclusive,
+                           "parameters": parms, "message_log": log_lines, "earlier_runs": earlier,
+                           "overlapping_runs": overlap}, default=str)
 
     def _ae_program(self, p, oprid):
         appl = self._q("SELECT AE_APPLID, DESCR FROM PSAEAPPLDEFN WHERE AE_APPLID = :p", {"p": p}, oprid, "AE program")
@@ -303,17 +343,43 @@ class Troubleshooter:
                 a.pop("SQLTEXT", None)
         return json.dumps({"program": appl[0], "state_records": state, "actions": acts}, default=str)
 
-    def _peoplecode(self, p, sec, st, oprid):
+    def _peoplecode(self, p, sec, st, oprid, focus=""):
         rows = self._q("SELECT OBJECTVALUE3 MARKET, PROGSEQ, PCTEXT FROM PSPCMTXT WHERE OBJECTVALUE1 = :p "
                        "AND OBJECTVALUE2 = :s AND OBJECTVALUE6 = :t ORDER BY PROGSEQ", {"p": p, "s": sec, "t": st},
-                       oprid, "PeopleCode text")
+                       oprid, "PeopleCode text", max_cell=CODE_CELL)
         if not rows:
             return f"error: no PeopleCode for {p}.{sec}.{st}"
-        text = "".join(str(r["PCTEXT"] or "") for r in rows)
-        return json.dumps({"program": f"{p}.{sec}.{rows[0]['MARKET']}.{st}.OnExecute",
-                           "code_with_numbers": numbered(text),
-                           "note": "Statement numbers count PeopleCode statements as PeopleSoft reports them "
-                                   "(declarations and assignments each count); check them against nested blocks."})
+        return _code_result(f"{p}.{sec}.{rows[0]['MARKET']}.{st}.OnExecute",
+                            "".join(str(r["PCTEXT"] or "") for r in rows), focus)
+
+    def _search_code(self, needle, oprid):
+        if len(needle) < 3:
+            return "error: search for at least 3 characters"
+        rows = self._q("SELECT OBJECTVALUE1, OBJECTVALUE2, OBJECTVALUE3, OBJECTVALUE4, OBJECTVALUE5, OBJECTVALUE6, "
+                       "OBJECTVALUE7, PROGSEQ, PCTEXT FROM PSPCMTXT WHERE DBMS_LOB.INSTR(UPPER(PCTEXT), UPPER(:t)) > 0 "
+                       "AND ROWNUM <= 15", {"t": needle}, oprid, "search PeopleCode", max_cell=CODE_CELL)
+        found = {}
+        for r in rows:
+            key = "|".join(str(r[f"OBJECTVALUE{k}"] or "").strip() for k in range(1, 8)).rstrip("|")
+            lines = str(r["PCTEXT"] or "").splitlines()
+            hits = [n for n, line in enumerate(lines) if needle.lower() in line.lower()][:5]
+            snippets = ["\n".join(f"{m + 1:>5} {lines[m]}" for m in range(max(0, n - 2), min(len(lines), n + 3))) for n in hits]
+            found.setdefault(key, []).extend(snippets)
+        return json.dumps({"text": needle, "programs": [{"key": k, "matches": v[:5]} for k, v in found.items()],
+                           "note": "Keys are the program's object values joined by |; pass one to read_code. "
+                                   "Line numbers here are within one stored piece of the program."})
+
+    def _read_code(self, key, focus, oprid):
+        parts = [x.strip() for x in key.split("|")][:7]
+        if not parts or not parts[0]:
+            return "error: give a key from search_code"
+        where = " AND ".join(f"NVL(TRIM(OBJECTVALUE{k}), ' ') = :v{k}" for k in range(1, len(parts) + 1))
+        params = {f"v{k}": (v or " ") for k, v in enumerate(parts, 1)}
+        rows = self._q(f"SELECT PROGSEQ, PCTEXT FROM PSPCMTXT WHERE {where} ORDER BY PROGSEQ", params, oprid,
+                       "read PeopleCode", max_cell=CODE_CELL)
+        if not rows:
+            return f"error: no PeopleCode with key {key}"
+        return _code_result(key.replace("|", "."), "".join(str(r["PCTEXT"] or "") for r in rows), focus)
 
     def _record(self, r, oprid):
         rows = self._q("SELECT F.FIELDNAME, D.FIELDTYPE, D.LENGTH, D.DECIMALPOS, BITAND(F.USEEDIT, 1) KEY "
@@ -327,6 +393,34 @@ class Troubleshooter:
             x["FIELDTYPE"] = types.get(x["FIELDTYPE"], x["FIELDTYPE"])
             x["KEY"] = bool(x["KEY"])
         return json.dumps({"record": r, "table": f"PS_{r}", "fields": rows}, default=str)
+
+
+def _head_tail(text, n):
+    """Long logs: the start (what ran) and most of the end (where it failed)."""
+    if len(text) <= n:
+        return text
+    return text[: n // 4] + "\n…(middle of the file left out)…\n" + text[-(n * 3 // 4):]
+
+
+def _code_result(name, text, focus=""):
+    """Numbered code, whole when short, else a window around the focus statement, plus where functions start."""
+    lines = numbered(text).splitlines()
+    functions = [{"name": m.group(1), "line": n + 1} for n, line in enumerate(lines)
+                 if (m := re.search(r"(?i)^\s*\d+\s+(?:\[stmt \d+\]\s*)?Function\s+(\w+)", line))]
+    out = {"program": name, "lines": len(lines), "functions": functions,
+           "note": "Statement numbers count PeopleCode statements as PeopleSoft reports them (declarations and "
+                   "assignments each count); they can drift in nested blocks, so check the code around them."}
+    body = "\n".join(lines)
+    if len(body) <= MAX_RESULT - 2000 and not focus:
+        out["code_with_numbers"] = body
+        return json.dumps(out)
+    at = 0
+    if focus.isdigit():
+        at = next((n for n, line in enumerate(lines) if f"[stmt {focus}]" in line), 0)
+    lo, hi = max(0, at - CODE_WINDOW // 2), min(len(lines), at + CODE_WINDOW)
+    out["showing_lines"] = f"{lo + 1}-{hi} of {len(lines)}"
+    out["code_with_numbers"] = "\n".join(lines[lo:hi])
+    return json.dumps(out)
 
 
 def _ident(v, upper=True):

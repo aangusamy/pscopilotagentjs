@@ -22,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-10-24.7';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-10-24.8';   /* shown as PSAgent.version and in the console: check after uploading */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
@@ -1930,17 +1930,45 @@
 
     /* Troubleshoot a failed process: read its posted log files in the user's session, then the
        investigator takes one step per call (each shown in the feed) until the diagnosis is ready. */
+    var BIG_LOG = 2000000, LOG_PART = 150000, LOG_SEND = 60000;
+    function mb(n) { return (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + ' MB'; }
+    function headTail(text, n) {
+      return text.length <= n ? text : text.slice(0, n / 4) + '\n…(middle of the file left out)…\n' + text.slice(-n * 3 / 4);
+    }
+    /* A log file as {text, part}. Big files (traces can be hundreds of MB): only the end, where the
+       error usually is, or the start when the web server ignores Range. */
+    function readLog(lf) {
+      var size = +lf.size || 0, big = size > BIG_LOG;
+      return fetch(lf.path, { credentials: 'same-origin', headers: big ? { Range: 'bytes=-' + LOG_PART } : {} }).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        if (/html/i.test(r.headers.get('content-type') || '') && !/\.html?$/i.test(lf.name)) throw new Error('not readable (sign-on page)');
+        if (!big) return r.text().then(function (text) { return { text: text, part: '' }; });
+        if (r.status === 206) return r.text().then(function (text) { return { text: text, part: 'last ' + mb(text.length) + ' of ' + mb(size) }; });
+        var reader = r.body && r.body.getReader(), dec = new TextDecoder(), text = '';
+        if (!reader) throw new Error('too large to read (' + mb(size) + ')');
+        function more() {
+          return reader.read().then(function (c) {
+            if (!c.done) text += dec.decode(c.value, { stream: true });
+            if (c.done || text.length >= LOG_PART) {
+              try { reader.cancel(); } catch (e) {}
+              return { text: text.slice(0, LOG_PART), part: 'first ' + mb(Math.min(text.length, LOG_PART)) + ' of ' + mb(size) };
+            }
+            return more();
+          });
+        }
+        return more();
+      });
+    }
+
     function runTroubleshoot(t) {
       var feed = activity('Troubleshooting process ' + t.instance), logs = [], first = true;
       setStatus('working', 'Investigating process ' + t.instance);
       var reads = (t.logs || []).map(function (lf) {
-        var item = feed.add('Reading log file ' + lf.name);
-        return fetch(lf.path, { credentials: 'same-origin' }).then(function (r) {
-          if (!r.ok) throw new Error('HTTP ' + r.status);
-          if (/html/i.test(r.headers.get('content-type') || '') && !/\.html?$/i.test(lf.name)) throw new Error('not readable (sign-on page)');
-          return r.text();
-        }).then(function (text) { item.end(true); logs.push({ name: lf.name, text: text.slice(0, 60000) }); },
-                function (e) { item.end(false, e.message); });
+        var item = feed.add((+lf.size > BIG_LOG ? 'Reading the end of log file ' + lf.name + ' (' + mb(+lf.size) + ')' : 'Reading log file ' + lf.name));
+        return readLog(lf).then(function (got) {
+          item.end(true);
+          logs.push({ name: lf.name, text: headTail(got.text, LOG_SEND), part: got.part });
+        }, function (e) { item.end(false, e.message); });
       });
       function next() {
         var looking = feed.add('Deciding what to check next', 'think');

@@ -32,11 +32,14 @@ class FakeDB:
 
     def __init__(self):
         self.queries = []
+        self.overlap = []
 
-    def query(self, sql, params=None, max_rows=200, who="", why=""):
+    def query(self, sql, params=None, max_rows=200, who="", why="", max_cell=2000):
         check_select(sql)                       # every query the tools build must pass the read-only check
         self.queries.append((" ".join(sql.split()), params, why))
         s = sql.upper()
+        if "NVL(ENDDTTM, SYSDATE) >" in s:     # runs of the same process at the same time
+            return ["PRCSINSTANCE", "RUNSTATUS", "RUNCNTLID", "OPRID", "BEGINDTTM", "ENDDTTM"], self.overlap, False
         if "FROM PSPRCSRQST WHERE OPRID" in s:
             return ["PRCSINSTANCE"], [[557060]], False
         if "FROM PS_CDM_LIST" in s:
@@ -47,7 +50,9 @@ class FakeDB:
             return (["PRCSINSTANCE", "PRCSTYPE", "PRCSNAME", "RUNSTATUS", "OPRID"],
                     [[557060, "Application Engine", "AEMINITEST", "10", "PS"]], False)
         if "FROM PS_PRCSDEFN" in s:
-            return ["DESCR"], [["Simple AE test program"]], False
+            return ["DESCR", "MAXCONCURRENT", "RETRYCOUNT", "RESTARTENABLED"], [["Simple AE test program", 0, 0, "0"]], False
+        if "FROM PS_PRCSMUTUALEXCL" in s:
+            return ["PRCSTYPE_1", "PRCSNAME_1"], [], False
         if "FROM PSPRCSPARMS" in s:
             return ["PARMLIST", "ORIGPARMLIST"], [['-CT ORACLE -CO "PS" -CP secret123 -I 557060', ' ']], False
         if "FROM PS_MESSAGE_LOG L" in s:
@@ -60,7 +65,14 @@ class FakeDB:
                      [1, 2, "  PCPC:108  Statement:3"],
                      [2, 1, "557060"], [2, 2, "AEMINITEST"], [2, 3, "MAIN"], [2, 4, "Step02"], [2, 5, "PeopleCode"], [2, 6, "8"]], False)
         if "FROM PSPRCSRQST WHERE PRCSNAME" in s:
-            return ["PRCSINSTANCE", "RUNSTATUS", "RUNCNTLID", "OPRID", "ENDDTTM"], [[557053, "9", "AELHSB46", "PS", None]], False
+            return (["PRCSINSTANCE", "RUNSTATUS", "RUNCNTLID", "OPRID", "BEGINDTTM", "ENDDTTM"],
+                    [[557053, "9", "AELHSB46", "PS", None, None]], False)
+        if "DBMS_LOB.INSTR" in s:
+            return (["OBJECTVALUE1", "OBJECTVALUE2", "OBJECTVALUE3", "OBJECTVALUE4", "OBJECTVALUE5", "OBJECTVALUE6",
+                     "OBJECTVALUE7", "PROGSEQ", "PCTEXT"],
+                    [["AEMINITEST", "MAIN", "GBL", "default", "1900-01-01", "Step02", "OnExecute", 0, AEMINITEST_PC]], False)
+        if "FROM PSPCMTXT WHERE NVL(TRIM(OBJECTVALUE1)" in s:
+            return ["PROGSEQ", "PCTEXT"], ([[0, AEMINITEST_PC]] if params.get("v1") == "AEMINITEST" else []), False
         if "FROM PSPCMTXT" in s:
             if params != {"p": "AEMINITEST", "s": "MAIN", "t": "Step02"}:   # names as stored: steps keep their case
                 return ["MARKET", "PROGSEQ", "PCTEXT"], [], False
@@ -146,6 +158,36 @@ class TroubleshootTest(unittest.TestCase):
         self.assertIn("[troubleshoot result] process 557060", s.messages[-1]["content"])   # follow-ups know it
         self.assertIsNone(s.investigation)
         self.assertTrue(all(q[0].upper().startswith(("SELECT", "WITH")) for q in db.queries))
+
+    def test_delivered_code_and_overlapping_runs(self):
+        db = FakeDB()
+        db.overlap = [[557059, "9", "AELHSB46", "PS", "2026-10-23 20:41:04", "2026-10-23 20:44:21"]]
+        t = Agent(investigating_llm(), TASKS, db).troubleshooter
+        p = json.loads(t._process("557060", "PS"))
+        self.assertEqual(p["overlapping_runs"][0]["PRCSINSTANCE"], 557059)
+        self.assertEqual(p["overlapping_runs"][0]["RUNSTATUS"], "9 (Success)")
+        self.assertEqual(p["definition"]["MAXCONCURRENT"], 0)
+        found = json.loads(t._search_code("1 / 0", "PS"))
+        key = found["programs"][0]["key"]
+        self.assertEqual(key, "AEMINITEST|MAIN|GBL|default|1900-01-01|Step02|OnExecute")
+        self.assertIn("&test = 1 / 0;", found["programs"][0]["matches"][0])
+        code = json.loads(t._read_code(key, "3", "PS"))
+        self.assertIn("[stmt 3] &test = 1 / 0;", code["code_with_numbers"])
+        self.assertIn("showing_lines", code)                           # a focus statement gives a window
+        self.assertIn("error", t._read_code("NOSUCH|X", "", "PS"))
+        self.assertIn("error", t._search_code("ab", "PS"))
+
+    def test_long_code_and_logs(self):
+        from psagent.troubleshoot import _code_result, _head_tail
+        long = "\n".join(f"&x{i} = {i};" for i in range(5000)) + "\nFunction later()\nEnd-Function;"
+        r = json.loads(_code_result("BIG", long, "4000"))
+        self.assertEqual(r["lines"], 5002)
+        self.assertIn("[stmt 4000] &x3999 = 3999;", r["code_with_numbers"])
+        self.assertLess(len(r["code_with_numbers"].splitlines()), 100)
+        self.assertEqual(r["functions"], [{"name": "later", "line": 5001}])
+        log = "START " + "x" * 100000 + " ABENDED at Step"
+        cut = _head_tail(log, 30000)
+        self.assertTrue(cut.startswith("START") and cut.endswith("ABENDED at Step") and len(cut) < 30100)
 
     def test_refused_query_goes_back_to_claude(self):
         llm = FakeLLM(response(tool("troubleshoot_process", {"instance": "557060", "question": ""})), response(text("ok")),
