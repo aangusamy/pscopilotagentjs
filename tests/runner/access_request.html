@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>IT Access Request</title>
+<!-- TEST FIXTURE: a made-up access request form, printed to PDF by the tests and the
+     real-system check. People, IDs and company are fictitious. -->
+<style>
+  body { font-family: Arial, sans-serif; font-size: 12px; color: #222; margin: 36px; }
+  .head { display: flex; justify-content: space-between; border-bottom: 3px solid #1f4e79; padding-bottom: 8px; }
+  .logo { font-size: 20px; font-weight: bold; color: #1f4e79; }
+  h1 { font-size: 16px; margin: 18px 0 6px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  th, td { border: 1px solid #999; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #e8eef5; }
+  .meta td { border: none; padding: 2px 8px 2px 0; }
+  .hand { font-family: "Segoe Print", "Comic Sans MS", cursive; color: #1a3d8f; }
+  .sign { margin-top: 28px; display: flex; gap: 60px; }
+  .sign div { border-top: 1px solid #555; width: 200px; padding-top: 4px; font-size: 11px; }
+  .note { margin-top: 16px; font-size: 11px; color: #555; }
+</style>
+</head>
+<body>
+  <div class="head"><div class="logo">Northwind Health Partners</div><div>Form IT-07 · rev. 2026</div></div>
+  <h1>PeopleSoft Access Request: New Joiners</h1>
+  <table class="meta">
+    <tr><td><b>Requested by:</b></td><td>Laura Brennan, HR Operations</td><td><b>Date:</b></td><td>21 October 2026</td></tr>
+    <tr><td><b>Start date:</b></td><td>3 November 2026</td><td><b>Cost centre:</b></td><td>HR-1040</td></tr>
+  </table>
+  <table>
+    <tr><th>#</th><th>Full name</th><th>Proposed user ID</th><th>Department</th><th>Access needed</th></tr>
+    <tr><td>1</td><td>Anita Desai</td><td>ADESAI</td><td>Payroll</td><td>PeopleSoft User</td></tr>
+    <tr><td>2</td><td>Mark Chen</td><td>MCHEN</td><td>Benefits</td><td>PeopleSoft User</td></tr>
+    <tr><td>3</td><td>Priya Nair</td><td class="hand">(IT to assign)</td><td>Compensation</td><td class="hand">needs manager access</td></tr>
+  </table>
+  <p class="note">All new users: standard symbolic ID and the default permission lists for HR staff.
+    Initial passwords are set by IT and must be changed at first sign-in. Do not write passwords on this form.</p>
+  <div class="sign"><div>Requester signature</div><div>Approved: HR Director</div></div>
+</body>
+</html>

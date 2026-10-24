@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import os from 'node:os';
 import assert from 'node:assert/strict';
 
 const require = createRequire(import.meta.url);
@@ -331,6 +332,49 @@ test('recovery: the recorded task meets a changed page and is finished live; Sav
   await review.waitFor();
   assert.match(await review.innerText(), /Replace the existing task\s*create_user_profile/);
   assert.match(await review.innerText(), /Long Description/);              // the field as it is now
+});
+
+test('documents: attach a form, review the people in one table, fix a row, create them one by one', async page => {
+  // the form as a PDF, like a scanned or exported request
+  const pdfPath = path.join(os.tmpdir(), 'access-request.pdf');
+  const printer = await page.context().browser().newPage();
+  await printer.goto('file://' + path.join(here, 'access_request.html').replace(/\\/g, '/'));
+  await printer.pdf({ path: pdfPath, format: 'A4' });
+  await printer.close();
+
+  await page.click('#psa-fab');
+  await page.setInputFiles('#psa-file', pdfPath);
+  await page.locator('.psa-file', { hasText: 'access-request.pdf' }).waitFor();
+  await page.fill('#psa-input', 'create these users');
+  await page.press('#psa-input', 'Enter');
+  assert.equal(await page.locator('#psa-files .psa-file').count(), 0);     // sent with the message
+  const table = page.locator('.psa-card', { hasText: '2 found, please review' });
+  await table.waitFor({ timeout: 30000 });
+  assert.ok(await table.locator('a', { hasText: 'access-request.pdf' }).count(), 'document link on the card');
+  const desc = table.locator('tr[data-i="1"] [data-col="description"]');
+  assert.equal(await desc.getAttribute('class'), 'psa-miss');               // needed
+  const role = table.locator('tr[data-i="1"] [data-col="roles"]');
+  assert.equal(await role.getAttribute('class'), 'psa-unsure');             // please check
+  assert.match(await role.getAttribute('title'), /needs manager access/);
+  assert.equal(await table.locator('.psa-ok').isDisabled(), true);          // password first
+  await desc.fill('Mark Chen');
+  await table.locator('[data-secret="password"]').fill('D0c!pw');
+  await table.locator('[data-confirm="password"]').fill('D0c!pw');
+  assert.equal(await table.locator('.psa-ok').innerText(), 'Create 2');
+  await table.locator('.psa-ok').click();
+  await page.locator('.psa-bot', { hasText: 'Both users were created from the form' }).waitFor({ timeout: 90000 });
+  assert.equal((await saved(page)).OPRID, 'DOCB2');                         // the last one in the workspace
+  assert.equal((await saved(page)).DESCR, 'Mark Chen');                     // the value fixed in the table
+  const feed = await page.locator('.psa-feed').last().innerText();
+  assert.match(feed, /DOCA1 - Anita Desai \(1 of 2\)/);
+  assert.match(feed, /DOCB2 - Mark Chen \(2 of 2\)/);
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b);
+  const chat = JSON.parse(bodies.find(b => b.includes('"attachment"')));
+  assert.equal(chat.attachment.media_type, 'application/pdf');
+  assert.ok(Buffer.from(chat.attachment.data, 'base64').toString('latin1').startsWith('%PDF'));
+  const results = JSON.parse(bodies.find(b => b.includes('"batch_id"') && b.includes('"results"')));
+  assert.deepEqual(results.results.map(r => r.status), ['success', 'success']);
+  assert.ok(!bodies.join('').includes('D0c!pw'), 'password reached the agent service');
 });
 
 let failed = 0;

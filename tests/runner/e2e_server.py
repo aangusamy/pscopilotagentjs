@@ -119,6 +119,15 @@ llm = FakeLLM(
         ("finish", {"success": True, "summary": "Created RECOV; Description is now Long Description on the ID tab."}),
     ])],
     response(text("Done: **RECOV** created. The Description field had moved, so I finished it live.")),
+    # documents: an access request form with two people; the second has no description and a role in words
+    response(tool("prepare_batch", {"task_id": "create_user_profile", "items": [
+        {"label": "DOCA1 - Anita Desai", "fields": [{"name": "user_id", "value": "DOCA1"}, {"name": "description", "value": "Anita Desai"},
+                                                    {"name": "roles", "value": "EMPLOYEE"}], "unsure": []},
+        {"label": "DOCB2 - Mark Chen", "fields": [{"name": "user_id", "value": "DOCB2"}, {"name": "roles", "value": "Manager"}],
+         "unsure": [{"name": "roles", "note": "form says 'needs manager access'"}]},
+    ]}, id="d1"), tool("request_confirmation", {}, id="d2")),
+    response(text("I found **2 people** on the form. Please check the table; one description is missing.")),
+    response(text("Both users were created from the form: **DOCA1** and **DOCB2**.")),
     drafts=[DRAFT, DRAFT_PROCESS],
 )
 app = create_app(Agent(llm, TASKS), secret="", allowed_origins=[], dev_oprid="TESTER",

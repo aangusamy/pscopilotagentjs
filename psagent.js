@@ -22,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-10-24.5';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-10-24.6';   /* shown as PSAgent.version and in the console: check after uploading */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
@@ -1151,6 +1151,25 @@
       '#psa-recentpop{position:absolute;left:12px;right:12px;bottom:92px;max-height:50%;overflow-y:auto;background:#fff;border:1px solid var(--psa-line);border-radius:14px;box-shadow:0 18px 40px rgba(15,23,42,.18);padding:6px;}',
       '#psa-recentpop[hidden]{display:none;}',
       '#psa-hint{flex:0 0 auto;padding:0 18px 10px;font-size:11px;color:#94a3b8;}',
+      /* documents: attached file, drop target, preview, review table */
+      '#psa-files{flex:0 0 auto;display:flex;flex-wrap:wrap;gap:6px;margin:4px 14px 0;}#psa-files[hidden]{display:none;}',
+      '.psa-file{display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:4px 6px 4px 10px;border:1px solid #c7d2fe;background:#eef2ff;border-radius:999px;font-size:12px;color:#3730a3;}',
+      '.psa-file span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.psa-file button{border:none!important;background:transparent!important;color:#6366f1!important;cursor:pointer;padding:0 4px!important;margin:0!important;font-size:14px;line-height:1;}',
+      '#psa-panel.psa-drop{box-shadow:0 0 0 4px #818cf8,0 24px 64px rgba(15,23,42,.24);}',
+      '.psa-doc{display:flex;align-items:center;gap:10px;margin:2px 0 10px;font-size:12px;}',
+      '.psa-doc img{max-height:72px;max-width:120px;border:1px solid var(--psa-line);border-radius:8px;}',
+      '.psa-doc a{color:var(--psa-brand);font-weight:600;text-decoration:none;}',
+      '.psa-card tr.psa-unsure-row td{background:#fffbeb;}.psa-card .psa-note{display:block;color:#b45309;font-size:11px;font-weight:400;}',
+      '.psa-tablewrap{overflow-x:auto;margin:6px 0 4px;}',
+      '.psa-card table.psa-batch{border-collapse:separate;border-spacing:3px;}',
+      '.psa-batch th{font-size:11px;font-weight:600;text-align:left;color:var(--psa-sub);padding:2px 4px;white-space:nowrap;}',
+      '.psa-card .psa-batch td,.psa-card .psa-batch td:first-child{padding:0;border:none;width:auto;}',
+      '.psa-card .psa-batch input{min-width:96px;padding:5px 7px!important;font-size:12px!important;}',
+      '.psa-card .psa-batch input[type="checkbox"]{min-width:0;width:16px;height:16px;}',
+      '.psa-card input.psa-unsure{background:#fffbeb!important;border-color:#f59e0b!important;}',
+      '.psa-card input.psa-miss{background:#fef2f2!important;border-color:#f87171!important;}',
+      '.psa-legend{font-size:11px;color:var(--psa-sub);}.psa-legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin:0 4px 0 8px;vertical-align:-1px;}',
       /* workspace: where the agent works, next to the panel */
       '#psa-ws{position:fixed;top:12px;left:12px;right:12px;bottom:12px;display:none;flex-direction:column;background:#fff;border-radius:18px;overflow:hidden;z-index:2147483644;box-shadow:0 24px 64px rgba(15,23,42,.28),0 0 0 2px rgba(79,70,229,.45);font-size:13px;}',
       'body.psa-docked #psa-ws{right:464px;}body.psa-docked.psa-widebody #psa-ws{right:744px;}',
@@ -1182,6 +1201,7 @@
       wide: SVG('<path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/>'),
       close: SVG('<path d="M18 6 6 18"/><path d="m6 6 12 12"/>'),
       clock: SVG('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>', 16),
+      clip: SVG('<path d="m21.4 11-9.2 9.2a6 6 0 0 1-8.5-8.5l8.6-8.6a4 4 0 1 1 5.7 5.7l-8.6 8.6a2 2 0 1 1-2.8-2.8l8.5-8.5"/>'),
       send: SVG('<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>'),
       page: SVG('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/>', 15),
       rec: '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:#dc2626"></span>'
@@ -1209,10 +1229,13 @@
       + '<div id="psa-ctx" hidden></div>'
       + '<div id="psa-log" role="log" aria-live="polite"></div>'
       + '<div id="psa-recentpop" role="listbox" aria-label="Recent questions" hidden></div>'
+      + '<div id="psa-files" hidden></div>'
       + '<form id="psa-form"><button id="psa-hist" class="psa-ib" type="button" title="Recent questions" aria-label="Recent questions">' + ICON.clock + '</button>'
+      + '<button id="psa-attach" class="psa-ib" type="button" title="Attach a PDF or image (or drop it here)" aria-label="Attach a document">' + ICON.clip + '</button>'
+      + '<input id="psa-file" type="file" accept="application/pdf,image/png,image/jpeg,image/gif,image/webp" hidden>'
       + '<textarea id="psa-input" rows="1" aria-label="Message" placeholder="Ask anything, or tell me what to do..."></textarea>'
       + '<button id="psa-send" type="submit" aria-label="Send">' + ICON.send + '</button></form>'
-      + '<div id="psa-hint">Enter to send · Shift+Enter for a new line · Ctrl+/ opens and closes me</div>';
+      + '<div id="psa-hint">Enter to send · Shift+Enter for a new line · attach or drop a PDF/image · Ctrl+/ opens and closes me</div>';
     document.body.appendChild(panel);
     var logEl = panel.querySelector('#psa-log');
     var input = panel.querySelector('#psa-input');
@@ -1221,6 +1244,7 @@
     var ready = false;   /* config loaded from the iScript */
     var me = null, canTeach = false;   /* from /api/me: who is signed in, tasks for the welcome screen */
     var liveWaiter = null;             /* a live run waiting for the user's answer in the chat */
+    var attached = null, lastDoc = null; /* file to send with the next message; the one the cards refer to */
     var ctxTimer = null;
 
     function loadState() {
@@ -1383,13 +1407,46 @@
       panel.querySelector('#psa-send').disabled = b;
     }
 
+    /* ---- Documents: read in the browser, sent with the next message, kept only in memory ---- */
+    var DOC_LIMIT = { 'application/pdf': 10, 'image/png': 5, 'image/jpeg': 5, 'image/gif': 5, 'image/webp': 5 };   /* MB */
+    function takeFile(file) {
+      if (!file) return;
+      var mb = DOC_LIMIT[file.type];
+      if (!mb) { addMsg('bot', 'I can read **PDF** and **image** files (PNG, JPEG, GIF, WebP). "' + file.name + '" is not one of those.', false); return; }
+      if (file.size > mb * 1024 * 1024) { addMsg('bot', '"' + file.name + '" is too large: up to ' + mb + ' MB for this type.', false); return; }
+      var reader = new FileReader();
+      reader.onload = function () {
+        attached = { name: file.name, media_type: file.type, size: file.size, data: String(reader.result).split(',')[1],
+          url: URL.createObjectURL(file) };
+        showChip();
+        input.placeholder = 'What should I do with it? (or just send)';
+        input.focus();
+      };
+      reader.readAsDataURL(file);
+    }
+    function showChip() {
+      var box = panel.querySelector('#psa-files');
+      box.hidden = !attached;
+      box.innerHTML = attached ? '<span class="psa-file">' + ICON.page + '<span>' + esc(attached.name) + ' · '
+        + Math.max(1, Math.round(attached.size / 1024)) + ' KB</span><button type="button" aria-label="Remove attachment">&times;</button></span>' : '';
+      var x = box.querySelector('button');
+      if (x) x.addEventListener('click', function () { attached = null; showChip(); });
+    }
+    function docPreview() {
+      if (!lastDoc) return '';
+      return '<div class="psa-doc">' + (/^image\//.test(lastDoc.media_type) ? '<img src="' + lastDoc.url + '" alt="">' : ICON.page)
+        + '<span>From <a href="' + lastDoc.url + '" target="_blank" rel="noopener">' + esc(lastDoc.name) + '</a> (opens the document)</span></div>';
+    }
+
     function handleReply(r) {
       if (r.session_id) { state.sessionId = r.session_id; saveState(); }
       (r.messages || []).forEach(function (m) { addMsg('bot', m); });
       if (r.confirm) showConfirm(r.confirm);
       if (r.record) showRecordCard(r.record);
+      if (r.batch) showBatch(r.batch);
       if (r.action) return runAndReport(r.action);
       if (r.live) return runLive(r.live);
+      if (r.batch_action) return runBatch(r.batch_action);
     }
 
     function call(path, payload) {
@@ -1403,7 +1460,7 @@
 
     function send(text) {
       text = String(text || '').trim();
-      if (!text) return;
+      if (!text && !(attached && !liveWaiter)) return;
       panel.querySelector('#psa-recentpop').hidden = true;
       if (liveWaiter) {                              /* the agent asked something during a live run */
         var answer = liveWaiter;
@@ -1414,20 +1471,28 @@
       }
       if (busy) return;
       [].forEach.call(logEl.querySelectorAll('.psa-welcome'), function (w) { w.remove(); });
-      addMsg('user', text);
-      remember(text);
-      call('/api/chat', { session_id: state.sessionId, message: text, page: pageContext() });
+      var att = attached;
+      attached = null;
+      showChip();
+      addMsg('user', (text || 'Here is a document.') + (att ? '\n📎 ' + att.name : ''));
+      if (text) remember(text);
+      var body = { session_id: state.sessionId, message: text, page: pageContext() };
+      if (att) { lastDoc = att; body.attachment = { name: att.name, media_type: att.media_type, data: att.data }; }
+      call('/api/chat', body);
     }
 
     function showConfirm(c) {
       var card = document.createElement('div');
       card.className = 'psa-card';
-      var rows = (c.rows || []).map(function (r) { return '<tr><td>' + esc(r.label) + '</td><td><strong>' + esc(r.value) + '</strong></td></tr>'; }).join('');
+      var rows = (c.rows || []).map(function (r) {
+        return '<tr' + (r.unsure != null ? ' class="psa-unsure-row"' : '') + '><td>' + esc(r.label) + '</td><td><strong>' + esc(r.value) + '</strong>'
+          + (r.unsure != null ? '<span class="psa-note">⚠ Please check: ' + esc(r.unsure) + '</span>' : '') + '</td></tr>';
+      }).join('');
       var secrets = (c.secrets || []).map(function (s) {
         return '<label>' + esc(s.label) + '<input type="password" autocomplete="new-password" data-secret="' + esc(s.name) + '"></label>'
           + '<label>Confirm ' + esc(s.label) + '<input type="password" autocomplete="new-password" data-confirm="' + esc(s.name) + '"></label>';
       }).join('');
-      card.innerHTML = '<h4>' + esc(c.title) + ': please review</h4><table>' + rows + '</table>' + secrets
+      card.innerHTML = '<h4>' + esc(c.title) + ': please review</h4>' + docPreview() + '<table>' + rows + '</table>' + secrets
         + '<div class="psa-actions"><button type="button" class="psa-ok">Confirm</button><button type="button" class="psa-no">Cancel</button></div>';
       logEl.appendChild(card);
       logEl.scrollTop = logEl.scrollHeight;
@@ -1752,6 +1817,106 @@
         });
     }
 
+    /* Several items from one document: one table to check, fix or untick, then one run per row */
+    function showBatch(b) {
+      if (!panel.classList.contains('psa-wide')) setWide(true);
+      var cols = b.columns || [];
+      var head = '<tr><th title="Include"></th>' + cols.map(function (c) { return '<th>' + esc(c.label) + (c.required ? ' *' : '') + '</th>'; }).join('') + '</tr>';
+      var body = (b.rows || []).map(function (r, i) {
+        return '<tr data-i="' + i + '"><td><input type="checkbox" data-inc checked aria-label="Include ' + esc(r.label) + '"></td>'
+          + cols.map(function (c) {
+            var note = (r.unsure || {})[c.name], miss = (r.missing || []).indexOf(c.name) >= 0;
+            return '<td><input data-col="' + esc(c.name) + '" value="' + esc(r.values[c.name] || '') + '" aria-label="' + esc(c.label) + ' for ' + esc(r.label) + '"'
+              + (miss ? ' class="psa-miss" placeholder="needed"' : note != null ? ' class="psa-unsure" title="Please check: ' + esc(note) + '"' : '') + '></td>';
+          }).join('') + '</tr>';
+      }).join('');
+      var secrets = (b.secrets || []).map(function (s) {
+        return '<label>' + esc(s.label) + ' (used for every row)<input type="password" autocomplete="new-password" data-secret="' + esc(s.name) + '"></label>'
+          + '<label>Confirm ' + esc(s.label) + '<input type="password" autocomplete="new-password" data-confirm="' + esc(s.name) + '"></label>';
+      }).join('');
+      var c = card('<h4>' + esc(b.title) + ': ' + b.rows.length + ' found, please review</h4>' + docPreview()
+        + '<div class="psa-tablewrap"><table class="psa-batch">' + head + body + '</table></div>'
+        + '<div class="psa-legend"><i style="background:#fde68a"></i>please check (hover for why)<i style="background:#fecaca"></i>needed · untick a row to skip it</div>'
+        + secrets
+        + '<div class="psa-actions"><button type="button" class="psa-ok">Create</button><button type="button" class="psa-no">Cancel</button></div>');
+      var ok = c.querySelector('.psa-ok');
+      function picked() { return [].filter.call(c.querySelectorAll('[data-inc]'), function (x) { return x.checked; }).length; }
+      function secretValues() {
+        var out = {}, valid = true;
+        c.querySelectorAll('[data-secret]').forEach(function (inp) {
+          var conf = c.querySelector('[data-confirm="' + inp.getAttribute('data-secret') + '"]');
+          if (!inp.value || inp.value !== conf.value) valid = false;
+          out[inp.getAttribute('data-secret')] = inp.value;
+        });
+        return valid ? out : null;
+      }
+      function refresh() {
+        var n = picked();
+        ok.textContent = 'Create ' + n;
+        ok.disabled = !n || !secretValues();
+      }
+      c.querySelectorAll('input').forEach(function (x) {
+        x.addEventListener('input', function () { if (x.classList.contains('psa-miss') && x.value) x.classList.remove('psa-miss'); refresh(); });
+        x.addEventListener('change', refresh);
+      });
+      refresh();
+      function close() { c.querySelectorAll('input,button').forEach(function (x) { x.disabled = true; }); c.querySelectorAll('input[type="password"]').forEach(function (x) { x.value = ''; }); }
+      ok.addEventListener('click', function () {
+        var sv = secretValues();
+        if (!sv) return;
+        var rows = [].map.call(c.querySelectorAll('tr[data-i]'), function (tr) {
+          var i = +tr.getAttribute('data-i'), row = b.rows[i], values = {};
+          tr.querySelectorAll('[data-col]').forEach(function (inp) {
+            var name = inp.getAttribute('data-col');
+            if (inp.value !== (row.values[name] || '')) values[name] = inp.value;
+          });
+          return { index: i, include: tr.querySelector('[data-inc]').checked, values: values };
+        });
+        close();
+        pendingSecrets[b.batch_id] = sv;
+        call('/api/confirm', { session_id: state.sessionId, run_id: b.batch_id, approved: true, rows: rows });
+      });
+      c.querySelector('.psa-no').addEventListener('click', function () {
+        close();
+        call('/api/confirm', { session_id: state.sessionId, run_id: b.batch_id, approved: false });
+      });
+    }
+
+    function runBatch(ba) {
+      var secrets = pendingSecrets[ba.batch_id] || {};
+      delete pendingSecrets[ba.batch_id];
+      for (var k in pendingSecrets) if (/^batch-/.test(k)) delete pendingSecrets[k];   /* from tables shown again after a fix */
+      var items = ba.items || [], ws = openWorkspace('Agent: ' + ba.title), results = [], i = 0;
+      var feed = activity(ba.title + ' · ' + items.length + (items.length === 1 ? ' entry' : ' entries'));
+      setStatus('working');
+      function next() {
+        if (i >= items.length || ws.stopped) return finish();
+        var it = items[i++], line = feed.add(it.label + ' (' + i + ' of ' + items.length + ')');
+        ws.onStep = function (n, total, text) { setStatus('working', it.label + ' · step ' + n + ' of ' + total + ': ' + text); };
+        return runAction({ run_id: it.run_id, title: ba.title, component: ba.component, steps: it.steps }, secrets, ws)
+          .catch(function (e) { return { status: 'error', message: (e && e.message) || String(e) }; })
+          .then(function (res) {
+            line.end(res.status === 'success', res.status === 'success' ? null : res.message);
+            results.push({ label: it.label, status: res.status, message: res.message, failed_step: res.failed_step });
+            return next();
+          });
+      }
+      function finish() {
+        for (; i < items.length; i++) results.push({ label: items[i].label, status: 'stopped', message: 'Not started: stopped by the user' });
+        secrets = null;
+        ws.done();
+        var ok = results.filter(function (r) { return r.status === 'success'; }).length;
+        feed.finish(ok === results.length ? 'success' : 'error');
+        ws.status(ok + ' of ' + results.length + ' done', ok !== results.length);
+        setStatus(ok === results.length ? 'idle' : 'error');
+        var t = typing();
+        return api('/api/batch/result', { session_id: state.sessionId, batch_id: ba.batch_id, results: results })
+          .then(function (r) { t.remove(); return handleReply(r); },
+                function (e) { t.remove(); addMsg('bot', 'I could not report the results to the agent service: ' + e.message, false); });
+      }
+      return next();
+    }
+
     function report(runId, res) {
       var t = typing();
       return api('/api/result', { session_id: state.sessionId, run_id: runId, status: res.status, message: res.message, failed_step: res.failed_step })
@@ -1931,7 +2096,7 @@
 
     function submit() {
       var t = input.value;
-      if (!String(t).trim() || (busy && !liveWaiter)) return;
+      if ((!String(t).trim() && !attached) || (busy && !liveWaiter)) return;
       input.value = '';
       grow();
       send(t);
@@ -1943,6 +2108,15 @@
     panel.querySelector('#psa-wide').addEventListener('click', function () { setWide(!panel.classList.contains('psa-wide')); });
     panel.querySelector('#psa-rec').addEventListener('click', function () { showRecordCard({ title: '' }); });
     panel.querySelector('#psa-hist').addEventListener('click', showRecent);
+    panel.querySelector('#psa-attach').addEventListener('click', function () { panel.querySelector('#psa-file').click(); });
+    panel.querySelector('#psa-file').addEventListener('change', function (e) { takeFile(e.target.files[0]); e.target.value = ''; });
+    panel.addEventListener('dragover', function (e) { e.preventDefault(); panel.classList.add('psa-drop'); });
+    panel.addEventListener('dragleave', function (e) { if (e.target === panel) panel.classList.remove('psa-drop'); });
+    panel.addEventListener('drop', function (e) {
+      e.preventDefault();
+      panel.classList.remove('psa-drop');
+      if (e.dataTransfer && e.dataTransfer.files.length) takeFile(e.dataTransfer.files[0]);
+    });
     panel.querySelector('#psa-recentpop').addEventListener('click', function (e) {
       var b = e.target.closest && e.target.closest('[data-q]');
       if (b) send(b.getAttribute('data-q'));

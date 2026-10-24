@@ -79,6 +79,29 @@ While it works, the recorder watches the workspace. When a live run succeeds,
 teachers get **"Make this a task?"**: one click turns what Claude worked out into
 a reviewed, reusable task, so the next time is one step.
 
+## Documents
+
+Attach a **PDF or image** with the paperclip (or drop it on the panel), say
+what to do (*"create these users"*), and send. Claude reads the document and
+fills the matching task with exactly what it says; values that are unclear,
+handwritten or not an exact PeopleSoft value are flagged.
+
+* One item: the usual confirmation card, flagged values highlighted, with a
+  link to the document.
+* Several items (e.g. a list of new joiners): **one review table**. Yellow cells
+  need a look (hover for why), red cells are missing; edit any cell, untick rows
+  to skip, type one password for all rows, click *Create N*. The service checks
+  the edited values again, then the widget runs one row after another and the
+  agent reports each result.
+
+Files go to the agent service and Claude only. They are kept in memory for the
+conversation, never written to disk, and sessions expire after 8 hours. Limits:
+PDF 10 MB, images 5 MB (PNG, JPEG, GIF, WebP).
+
+The pilot is an access request form → user profiles. The same pipeline takes any
+task: a supplier invoice → voucher in Financials only needs the voucher task and
+its lookups (vendor, PO).
+
 ## The chat panel
 
 The widget is a panel docked on the right, with the workspace beside it:
@@ -253,8 +276,8 @@ of asking for them. That is the natural next step.
 ## Tests
 
 ```bash
-cd agent-service && python3 -m unittest discover -s tests -t tests       # 71 unit tests, scripted LLM
-cd .. && node tests/runner/run_browser_tests.mjs                          # 10 browser tests (Playwright)
+cd agent-service && python3 -m unittest discover -s tests -t tests       # 77 unit tests, scripted LLM
+cd .. && node tests/runner/run_browser_tests.mjs                          # 11 browser tests (Playwright)
 ```
 
 The browser tests run the real widget and the real service (with a scripted

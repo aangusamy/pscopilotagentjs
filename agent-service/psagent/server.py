@@ -1,7 +1,8 @@
 """HTTP API used by the psagent.js widget.
 
-POST /api/chat     {session_id?, message, page?}          -> reply
-POST /api/confirm  {session_id, run_id, approved}         -> reply (+ action when approved)
+POST /api/chat     {session_id?, message, page?, attachment?{name, media_type, data}} -> reply
+POST /api/confirm  {session_id, run_id, approved, rows?}  -> reply (+ action / batch_action when approved)
+POST /api/batch/result {session_id, batch_id, results}    -> reply
 POST /api/result   {session_id, run_id, status, message?, failed_step?} -> reply
 POST /api/live/step {session_id, run_id, snapshot, result?, answer?, approved?, declined?} -> {action}
 POST /api/live/recover {session_id, run_id, failed_index, error}  -> {live}  (recorded run hit a changed page)
@@ -26,7 +27,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from . import auth, recorder
-from .agent import Agent, SessionStore
+from .agent import Agent, SessionStore, check_attachment
 from .tasks import TaskError, load_tasks, parse_task
 
 log = logging.getLogger("psagent")
@@ -67,15 +68,21 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
         if not oprid:
             return bad("unauthorized", 401)
         data = await body(request)
-        if data is None or not str(data.get("message", "")).strip():
+        attachment = None
+        if data is not None and data.get("attachment") is not None:
+            attachment, err = check_attachment(data["attachment"])
+            if err:
+                return bad(err)
+        if data is None or not (str(data.get("message", "")).strip() or attachment):
             return bad("message is required")
         s = store.get_or_create(data.get("session_id"), oprid)
         s.can_teach = can_teach(oprid)
         page = data.get("page") if isinstance(data.get("page"), dict) else None
+        text = str(data.get("message") or "").strip()[:4000] or "Here is a document."
 
         def work():
             with s.lock:
-                return agent.chat(s, str(data["message"])[:4000], page)
+                return agent.chat(s, text, page, attachment)
 
         reply = await run_in_threadpool(work)
         return JSONResponse({"session_id": s.id, **reply.to_dict()})
@@ -91,9 +98,11 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
         if s is None:
             return bad("unknown session", 404)
 
+        rows = data.get("rows") if isinstance(data.get("rows"), list) else None
+
         def work():
             with s.lock:
-                return agent.decide(s, str(data["run_id"]), data.get("approved") is True)
+                return agent.decide(s, str(data["run_id"]), data.get("approved") is True, rows)
 
         reply = await run_in_threadpool(work)
         return JSONResponse({"session_id": s.id, **reply.to_dict()})
@@ -115,6 +124,25 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
                     s, str(data["run_id"]), data["status"],
                     str(data.get("message") or ""), str(data.get("failed_step") or "") or None,
                 )
+
+        reply = await run_in_threadpool(work)
+        return JSONResponse({"session_id": s.id, **reply.to_dict()})
+
+    async def batch_result(request):
+        oprid = oprid_of(request)
+        if not oprid:
+            return bad("unauthorized", 401)
+        data = await body(request)
+        if data is None or not data.get("batch_id") or not isinstance(data.get("results"), list):
+            return bad("batch_id and results are required")
+        s = store.get(data.get("session_id"), oprid)
+        if s is None:
+            return bad("unknown session", 404)
+        results = [x for x in data["results"] if isinstance(x, dict) and x.get("status") in _STATUSES]
+
+        def work():
+            with s.lock:
+                return agent.report_batch(s, str(data["batch_id"]), results)
 
         reply = await run_in_threadpool(work)
         return JSONResponse({"session_id": s.id, **reply.to_dict()})
@@ -221,6 +249,7 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
             Route("/api/chat", chat, methods=["POST"]),
             Route("/api/confirm", confirm, methods=["POST"]),
             Route("/api/result", result, methods=["POST"]),
+            Route("/api/batch/result", batch_result, methods=["POST"]),
             Route("/api/live/step", live_step, methods=["POST"]),
             Route("/api/live/recover", live_recover, methods=["POST"]),
             Route("/api/me", me),
