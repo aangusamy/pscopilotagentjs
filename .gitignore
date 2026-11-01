@@ -1,8 +1,20 @@
+# Python and test leftovers
 __pycache__/
 *.pyc
+.pytest_cache/
 tests/runner/failure.png
+
+# Office lock files (a workbook open in Excel)
+~$*
+
+# Secrets: service settings, test sign-ons, SSH keys
 .env
 .env.new
+agent-service/env
+agent-service/.e2e.env
+*.ppk
+
+# What the service writes while it runs (on the VM, not in git)
 agent-service/monitors/state.json
 agent-service/monitors/incidents/
 agent-service/runbooks/runs/
@@ -11,8 +23,3 @@ agent-service/regression/counter.txt
 agent-service/regression/state.json
 agent-service/audit/
 agent-service/ci_loads/
-
-# Secrets kept out of git: the VM key, the VM settings copy, test sign-ons
-*.ppk
-agent-service/env
-agent-service/.e2e.env
