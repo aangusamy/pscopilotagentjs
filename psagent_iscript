@@ -2,10 +2,18 @@
    Record: WEBLIB_PSAGENT   Field: ISCRIPT1   Event: FieldFormula
    Grant the WEBLIB to the users' permission lists (Web Libraries).
 
-   Returns the agent service URL and a token that proves who the user is.
-   Token = OPRID.YYYYMMDD.HashSHA256(secret|OPRID|YYYYMMDD), valid for the day.
-   The secret never leaves the app server. Set the same value as
-   PSAGENT_SHARED_SECRET on the agent service. HashSHA256 needs PeopleTools 8.54+. */
+   Returns the agent service URL and a token that proves who the user is and
+   which agent roles they have. Agent roles are ordinary PeopleSoft roles:
+     PSAGENT_USER     chat, tasks, runbooks, troubleshoot processes
+     PSAGENT_MONITOR  also set up monitors and see every overnight failure
+     PSAGENT_ADMIN    also record tasks and publish runbooks
+     PSAGENT_AUDITOR  also the admin dashboard: usage, cost, the audit log
+   A user with none of them gets no token, and the widget does not show.
+
+   Token = OPRID.YYYYMMDD.ROLES.HashSHA256(secret|OPRID|YYYYMMDD|ROLES), valid
+   for the day; ROLES = e.g. "ADMIN+USER". The secret never leaves the app
+   server. Set the same value as PSAGENT_SHARED_SECRET on the agent service.
+   HashSHA256 needs PeopleTools 8.54+. */
 
 Constant &AGENT_URL = "https://psagent.example.com";
 Constant &AGENT_SECRET = "";
@@ -19,9 +27,32 @@ Function JsonEsc(&s As string) Returns string
    Return &r;
 End-Function;
 
+Function AgentRoles() Returns string
+   Local array of string &names = CreateArray("ADMIN", "AUDITOR", "MONITOR", "USER");
+   Local string &roles = "";
+   Local integer &i;
+   For &i = 1 To &names.Len
+      If IsUserInRole("PSAGENT_" | &names [&i]) Then
+         If All(&roles) Then
+            &roles = &roles | "+";
+         End-If;
+         &roles = &roles | &names [&i];
+      End-If;
+   End-For;
+   Return &roles;
+End-Function;
+
 Function IScript_PSAgentConfig()
    Local string &oprid = %OperatorId;
    Local string &name, &day, &sig;
+   Local string &roles = AgentRoles();
+
+   %Response.SetContentType("application/json");
+   If None(&roles) Then
+      /* no agent role: no token, and the widget stays hidden */
+      %Response.Write("{""oprid"":""" | JsonEsc(&oprid) | """,""roles"":[]}");
+      Return;
+   End-If;
 
    SQLExec("SELECT OPRDEFNDESC FROM PSOPRDEFN WHERE OPRID = :1", &oprid, &name);
    If None(&name) Then
@@ -29,13 +60,13 @@ Function IScript_PSAgentConfig()
    End-If;
 
    &day = DateTimeToLocalizedString(%Date, "yyyyMMdd");
-   &sig = HashSHA256(&AGENT_SECRET | "|" | &oprid | "|" | &day);
+   &sig = HashSHA256(&AGENT_SECRET | "|" | &oprid | "|" | &day | "|" | &roles);
 
-   %Response.SetContentType("application/json");
    %Response.Write("{");
    %Response.Write("""oprid"":""" | JsonEsc(&oprid) | """,");
    %Response.Write("""fullname"":""" | JsonEsc(&name) | """,");
+   %Response.Write("""roles"":[""" | Substitute(&roles, "+", """,""") | """],");
    %Response.Write("""agentUrl"":""" | JsonEsc(&AGENT_URL) | """,");
-   %Response.Write("""token"":""" | JsonEsc(&oprid | "." | &day | "." | &sig) | """");
+   %Response.Write("""token"":""" | JsonEsc(&oprid | "." | &day | "." | &roles | "." | &sig) | """");
    %Response.Write("}");
 End-Function;

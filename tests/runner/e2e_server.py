@@ -6,31 +6,57 @@ One origin serves everything, like PeopleSoft + a reverse-proxied agent:
   /psp/ps/EMPLOYEE/HRMS/c/MAINTAIN_SECURITY.USERMAINT.GBL   portal page: header + TargetContent frame
   /api/*                                                   real agent API, scripted LLM
   /__test/action, /__test/bodies, /__test/task_file        test hooks
-Recorded tasks are saved to a temporary copy of agent-service/tasks.
+  /__test/watch_tick                                       one watcher round (the monitors run "overnight")
+  /__test/norole                                           host page for a user without a PSAGENT role
+  /psp/ps/?cmd=login                                       a sign-in page, for the headless regression runner
+  /psc/ps/EMPLOYEE/HRMS/s/WEBLIB_SOAPTOCI...IScript_SOAPToCI  a mock SOAPTOCI (USER_PROFILE): GetCIShape, Create, Updatedata
+  /__test/ci_fill, /__test/ci_users                        fill a downloaded CI template; the users the mock CI saved
+  /psc/ps/EMPLOYEE/HRMS/q/?ICAction=ICQryNameExcelURL=...  a mock Query Viewer (Run to Excel) for the AI_ queries
+  /__test/query_hits                                       what the browser asked the mock Query Viewer for
+Recorded tasks are saved to a temporary copy of agent-service/tasks; monitors and test suites to temporary folders.
+Regression tests are on, and unattended runs use the service's own headless browser against this server.
+The audit log is on (a temporary folder) with 30 days of sample history; the scripted Claude calls and the mock
+database's queries are recorded like real ones, so the dashboard shows what the test itself did.
 """
 
 import json
+import os
+import random
+import time
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 import shutil
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "agent-service"), str(ROOT / "agent-service" / "tests")]
 
 import uvicorn  # noqa: E402
-from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response  # noqa: E402
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response  # noqa: E402
 from starlette.routing import Route  # noqa: E402
 
 from fakes import FakeLLM, response, text, tool  # noqa: E402
 from psagent.agent import Agent  # noqa: E402
-from psagent.server import create_app  # noqa: E402
+from psagent.db import check_select  # noqa: E402
+from psagent import audit, ci, queries, regress, regress_runner  # noqa: E402
+from psagent.server import Regression, create_app  # noqa: E402
 from psagent.tasks import load_tasks  # noqa: E402
+from psagent.watcher import Watcher  # noqa: E402
 from test_security import FINISH as ACCESS_FINISH, SecDB  # noqa: E402  (real security rows: ABSMITH, HCCPRS1040)
+from test_approvals import FINISH as REVIEW_FINISH, ROWS as APPROVAL_ROWS, XLAT  # noqa: E402  (absence request 1589)
+from test_runbooks import HAS_ROLE, USER_FREE, step  # noqa: E402
+from test_ci import SHAPE_XML, CIDB  # noqa: E402  (USER_PROFILE's real shape and metadata)
+from test_queries import HEADS, HIRES, PTDB, ps_answer  # noqa: E402  (PeopleTools query tables in SQLite)
 
 TASKS_DIR = Path(tempfile.mkdtemp(prefix="psagent-tasks-"))
 shutil.copytree(ROOT / "agent-service" / "tests" / "fixtures" / "tasks", TASKS_DIR, dirs_exist_ok=True)
 TASKS = load_tasks(TASKS_DIR)
+RUNBOOKS_DIR = Path(tempfile.mkdtemp(prefix="psagent-runbooks-"))
+MONITORS_DIR = Path(tempfile.mkdtemp(prefix="psagent-monitors-"))
+REGRESSION_DIR = Path(os.environ.get("PSAGENT_E2E_REGRESSION_DIR") or tempfile.mkdtemp(prefix="psagent-regression-"))
 HERE = Path(__file__).resolve().parent
 
 # Claude's suggestions for the recording made in the browser test. emplid is
@@ -61,6 +87,12 @@ DRAFT_PROCESS = {
 
 USER = {"user_id": "VELU", "description": "Velu Arumugam", "emplid": "KU0042",
         "roles": "EMPLOYEE, PeopleSoft User", "primary_permission_list": "HCCPEMPLOYEE"}
+
+def dog(title, kind, processes, **kw):
+    return {"title": title, "summary": "", "kind": kind, "processes": processes, "users": [], "stuck_minutes": 0,
+            "deadline": "", "investigate": True, "rule": "", "sql": "", "expect": "", "every_minutes": 0, "at": [],
+            "notify": [], "paused": False, "notes": "", **kw}
+
 
 llm = FakeLLM(
     response(tool("start_task", {"task_id": "create_user_profile"}),
@@ -156,12 +188,111 @@ llm = FakeLLM(
         {"kind": "open_page", "target": "MAINTAIN_SECURITY.USERMAINT.GBL", "value": ""}]}, id="s5")),
     response(tool("finish", {"success": True, "summary": "Added role Hiring Manager to ABSMITH and PeopleSoft saved it."}, id="s6")),
     response(text("Done: **ABSMITH** now has the role **Hiring Manager**. Ask them to sign out and in again.")),
+    # absence approvals: the pending list, then Review with AI on Edmund Donahue's vacation
+    response(tool("list_absence_approvals", {"everyone": False}, id="a1")),
+    response(text("**1** absence request is waiting.")),
+    response(tool("get_absence_request", {"thread": "1589"}, id="a2")),
+    response(tool("finish", REVIEW_FINISH, id="a3")),
+    # runbook drafted from the attached 5-step checklist (agent-service/runbooks/templates/test_user_setup_checklist.xlsx)
+    response(tool("draft_runbook", {
+        "title": "Set up a test user", "summary": "Creates a test user with the Employee role, checks it and gets sign-off.",
+        "inputs": [{"name": "user_id", "label": "User ID", "default": "PSA_TEST01", "hint": "", "upper": True}],
+        "steps": [
+            step("check", "Make sure the new user ID is not taken", rule="No user profile exists with this user ID",
+                 sql=USER_FREE, expect="no_rows"),
+            step("task", "Create the user profile and add the Employee role", task_id="create_user_profile",
+                 values=[{"name": "user_id", "value": "{{user_id}}"}, {"name": "roles", "value": "EMPLOYEE"}]),  # the mock page's role name
+            step("manual", "Run the portal security sync", instructions="No task for it yet: record Sync Portal Security"),
+            step("check", "Check the user has the role", rule="The user has the role Employee", sql=HAS_ROLE,
+                 expect="no_rows"),
+            step("approval", "Security manager signs off the new user", owner="Security Manager",
+                 instructions="Approve the new user"),
+        ],
+        "questions": ["Step 3: there is no Sync Portal Security task yet, so it is a manual step until you record it."]},
+        id="r1")),
+    response(text("I drafted **Set up a test user** from your checklist: 5 steps. Please check the note, then publish.")),
+    # ...and once published, run it from its tile on the welcome screen
+    response(tool("start_runbook", {"name": "Set up a test user"}, id="r2")),
+    response(text("**Set up a test user** has 5 steps. Check the inputs and click Start.")),
+    # a monitor set up in the chat, then what it found "overnight"
+    response(tool("draft_monitor", {
+        "title": "Stuck requests", "summary": "Requests waiting too long for a process server", "kind": "stuck",
+        "processes": [], "users": [], "stuck_minutes": 30, "investigate": False, "rule": "", "sql": "", "expect": "",
+        "every_minutes": 0, "at": [], "notify": ["ops@example.com"]}, id="m1")),
+    response(text("This monitor would alert on **2** requests stuck right now. Save it to start.")),
+    response(tool("show_incidents", {"hours": 16}, id="m2")),
+    response(text("One alert overnight: **2 requests stuck**, analysed below.")),
+    # the watch plan template uploaded from + Features > Watch jobs (agent-service/runbooks/templates/watch_plan_template.xlsx)
+    response(tool("draft_watch_plan", {"title": "Nightly jobs", "summary": "Batch jobs the support team watches overnight.",
+                                       "watchdogs": [
+        dog("AE test program failures", "failures", ["AEMINITEST"], notify=["ops@example.com"]),
+        dog("Cross-reference report failures", "failures", ["XRFWIN"], notify=["ops@example.com"]),
+        dog("Cross-reference report stuck", "stuck", ["XRFWIN"], stuck_minutes=30, notify=["ops@example.com"]),
+        dog("Portal security sync by 07:00", "deadline", ["PORTAL_CSS"], deadline="07:00", notify=["security@example.com"])],
+        "questions": []}, id="w1")),
+    response(text("**Nightly jobs** has 4 watchdogs. XRFWIN has **2** requests stuck right now. Confirm to schedule.")),
+    # regression tests: the test plan uploaded from + Features > Regression tests
+    response(tool("draft_test_suite", {"title": "User admin regression", "summary": "", "run_at": "", "after_patch": False, "notify": [],
+                                       "cases": [
+        {"title": "New user", "task_id": "create_user_profile", "expect": "saved", "message": "", "notes": "",
+         "values": [{"name": "user_id", "value": "RT{{n}}"}, {"name": "description", "value": "Regression {{n}}"},
+                    {"name": "roles", "value": "EMPLOYEE"}]},
+        {"title": "Duplicate user is refused", "task_id": "create_user_profile", "expect": "error", "message": "already exists",
+         "notes": "", "values": [{"name": "user_id", "value": "PS"}, {"name": "description", "value": "Duplicate"},
+                                 {"name": "roles", "value": "EMPLOYEE"}]}],
+        "questions": []}, id="t1")),
+    response(text("**User admin regression**: 2 cases on Create user profile, one negative (a duplicate user ID).")),
+    # ...the second run meets the upgraded page (Description moved): case 1 is finished live, Save auto-approved
+    *[response(tool(n, a, id=f"tl{i}")) for i, (n, a) in enumerate([
+        ("act", {"note": "Description moved: Long Description", "actions": [
+            {"kind": "set", "target": "PSOPRDEFN_LONGDESCR", "value": "Regression 0002"}]}),
+        ("act", {"note": "Roles tab", "actions": [{"kind": "tab", "target": "Roles", "value": ""}]}),
+        ("act", {"note": "Role EMPLOYEE", "actions": [{"kind": "set", "target": "PSROLEUSER_VW_ROLENAME$0", "value": "EMPLOYEE"}]}),
+        ("request_commit", {"target": "#ICSave", "summary": [{"label": "User ID", "value": "RT0002"}]}),
+        ("finish", {"success": True, "summary": "Created RT0002; Description is now Long Description."}),
+    ])],
+    # ask the data: Claude picks AI_NEW_HIRES, the browser runs it, a breakdown by department
+    response(tool("find_queries", {"question": "How many new hires this year by department?"}, id="aq1")),
+    response(tool("run_query", {"name": "AI_NEW_HIRES", "prompts": [{"name": "BIND1", "value": "2026-01-01"},
+                                                                    {"name": "End Date", "value": "10/31/2026"}]}, id="aq2")),
+    response(text("Running **AI_NEW_HIRES** (New Hires) from 2026-01-01 to 2026-10-31.")),
+    response(tool("summarize_result", {"group_by": ["Department"], "op": "count", "measure": ""}, id="aq3")),
+    response(text("**7** new hires this year: **4** in 10200, 2 in 10300 and 1 in 10400 (from AI_NEW_HIRES).")),
     drafts=[DRAFT, DRAFT_PROCESS],
 )
 class TraceDB(SecDB):
-    """Also posts a 232 MB trace file (like the real PORTAL_CSS run): the widget must read only its end."""
+    """Also posts a 232 MB trace file (like the real PORTAL_CSS run): the widget must read only its end.
+    And answers the absence reviewer's queries (request 1589)."""
 
     def query(self, sql, params=None, **kw):
+        why = kw.get("why", "")
+        if why.startswith("ci "):                          # Load with a CI: the catalog and the checks
+            return CI_DB.query(sql, params, kw.get("max_rows", 200), kw.get("who", ""), why)
+        if why.startswith("query "):                       # Ask the data: the AI_ catalog and prompt checks
+            return Q_DB.query(sql, params, kw.get("max_rows", 200), kw.get("who", ""), why)
+        if why.startswith("runbook draft check"):          # the draft's check queries, test-run
+            check_select(sql)
+            return (["OPRID"], [], False) if "psoprdefn" in sql.lower() else (["PROBLEM"], [["missing role"]], False)
+        if why.startswith("runbook check"):                # running it: the user is free, then has the role
+            check_select(sql)
+            return ["OPRID"], [], False
+        if why == "monitor draft process":
+            return ["PRCSTYPE"], [["Application Engine"]], False
+        if why == "monitor draft preview (deadline)":
+            return ["N"], [[3]], False
+        if why.startswith("monitor"):                      # monitor drafts and the watcher: two requests stuck
+            check_select(sql)
+            return (["PRCSINSTANCE", "PRCSTYPE", "PRCSNAME", "OPRID", "RUNCNTLID", "RUNSTATUS", "RUNDTTM", "SERVER"],
+                    [[557022, "Application Engine", "PSXPARCHATTR", "PS", " ", "5", "2026-07-23 20:56:28", " "],
+                     [557040, "Application Engine", "PSXPARCHATTR", "PS", " ", "5", "2026-10-23 01:57:29", " "]], False)
+        if why == "process server status":
+            return ["SERVERNAME", "SERVERSTATUS", "LASTUPDDTTM"], [["PRCS8622", "3", "2026-10-30 22:05:08"]], False
+        if why.startswith("meaning of "):
+            return ["FIELDVALUE", "XLATLONGNAME"], XLAT[params["f"]], False
+        if why in APPROVAL_ROWS and why not in ("security admin check", "recent failed requests"):
+            check_select(sql)
+            cols, rows = APPROVAL_ROWS[why]
+            return cols, rows(params or {}), False
         cols, rows, cut = super().query(sql, params, **kw)
         if "FROM PS_CDM_LIST" in sql.upper():
             rows = rows + [["http://ps:8000/psreports/ps", 85515, "AE_AEMINITEST_557060.trc", TRACE_SIZE]]
@@ -181,8 +312,95 @@ def trace(request):
                     headers={"Content-Range": f"bytes {TRACE_SIZE - len(tail)}-{TRACE_SIZE - 1}/{TRACE_SIZE}"})
 
 
-app = create_app(Agent(llm, TASKS, TraceDB(), security_admins=["TESTER"]), secret="", allowed_origins=[], dev_oprid="TESTER",
-                 teachers={"*"}, tasks_dir=str(TASKS_DIR))
+DB = TraceDB()
+AUDIT_DIR = Path(tempfile.mkdtemp(prefix="psagent-audit-"))
+AUDIT = audit.Audit(AUDIT_DIR, days=90)
+CI_DB = CIDB()
+CI_STORE = ci.Store(tempfile.mkdtemp(prefix="psagent-ci-"))
+CI_SAVED = {}          # what the mock CI saved: user -> {values, roles, emails}
+Q_DB = PTDB()
+QUERY_HITS = []        # what the browser asked the mock Query Viewer for
+
+
+def seed_audit(a, days=30, now=None):
+    """A month of plausible use: a few people chatting and running tasks, the watcher's alerts, a weekly test run."""
+    rnd, now = random.Random(7), now or datetime.now()
+    people = {"VELU": ("tasks", 6), "ABSMITH": ("troubleshoot", 3), "HCRUSA_KU0007": ("approvals", 2), "PS": ("security", 1)}
+    for d in range(days, 0, -1):
+        day = (now - timedelta(days=d)).replace(hour=8, minute=0, second=0)
+        if day.weekday() >= 5 and rnd.random() < 0.7:
+            continue
+        for who, (feature, busy) in people.items():
+            for k in range(rnd.randint(0, busy)):
+                t = day + timedelta(minutes=rnd.randint(0, 540))
+                sess = f"{who.lower()}-{d}-{k}"
+                a.add("chat", "Sent a message", ts=t, oprid=who, feature="chat", session=sess, ms=rnd.randint(2000, 9000))
+                for c in range(rnd.randint(1, 3)):
+                    tin, tout, tcr = rnd.randint(1500, 6000), rnd.randint(150, 900), rnd.randint(8000, 40000)
+                    a.add("claude", "claude-opus-5-5", ts=t, oprid=who, feature=feature if c else "chat", session=sess,
+                          model="claude-opus-5-5", tin=tin, tout=tout, tcr=tcr, ms=rnd.randint(1500, 6000),
+                          cost=a.cost("claude-opus-5-5", {"input_tokens": tin, "output_tokens": tout, "cache_read_input_tokens": tcr}))
+                if feature == "tasks":
+                    failed = rnd.random() < 0.12
+                    a.add("task.confirmed", "Create User Profile", ts=t, oprid=who, feature="tasks", ref=f"run-{d}{k}",
+                          data={"task": "create_user_profile", "values": [{"label": "User ID", "value": f"NEW{d:02d}{k}"},
+                                                                         {"label": "Roles", "value": "EMPLOYEE"}]})
+                    a.add("task.run", "Create User Profile: " + ("Save. PeopleSoft said: User ID already exists" if failed else "done"),
+                          "failed" if failed else "ok", f"run-{d}{k}", ts=t, oprid=who, feature="tasks")
+                elif feature == "troubleshoot":
+                    inst = 557000 + d * 3 + k
+                    a.add("query", f"process {inst}", ts=t, oprid=who, feature="troubleshoot", n=1, ms=40,
+                          data={"sql": f"SELECT PRCSINSTANCE, PRCSNAME, RUNSTATUS FROM PSPRCSRQST WHERE PRCSINSTANCE = {inst}"})
+                    a.add("troubleshoot", f"Process {inst}: Divide by zero at Step02 statement 3", ts=t, oprid=who,
+                          feature="troubleshoot", ref=str(inst))
+                elif feature == "approvals":
+                    a.add("absence.review", f"Request {1500 + d}: approve", ts=t, oprid=who, feature="approvals", ref=str(1500 + d))
+                else:
+                    a.add("access.check", "ABSMITH / Create Job Opening: missing role Recruiter", ts=t, oprid=who, feature="security")
+        if d % 4 == 0:
+            a.add("incident", "AEMINITEST failed: Divide by zero at Step02 statement 3", "alert", f"inc-{d}",
+                  ts=day.replace(hour=3), oprid="PSAGENT_WATCH", feature="watcher")
+            a.add("claude", "claude-opus-5-5", ts=day.replace(hour=3), oprid="PSAGENT_WATCH", feature="watcher",
+                  model="claude-opus-5-5", tin=24000, tout=2200, tcr=60000, ms=43000, cost=0.152)
+        if d % 7 == 2:
+            a.add("regression.run", "Smoke test: 2 of 2 passed (unattended)", ts=day.replace(hour=6), oprid="TESTER", feature="regression")
+    a.add("claude", "API error 529: overloaded", "error", ts=now - timedelta(days=2, hours=3), oprid="ABSMITH",
+          feature="troubleshoot", model="claude-opus-5-5", ms=300)
+
+
+seed_audit(AUDIT)
+_query = DB.query
+
+
+def _audited_query(sql, params=None, **kw):
+    t0 = time.monotonic()
+    out = _query(sql, params, **kw)
+    audit.query(kw.get("who", ""), kw.get("why", ""), sql, len(out[1]) if out else 0, time.monotonic() - t0)
+    return out
+
+
+DB.query = _audited_query
+_create = llm.create
+
+
+def _audited_create(*a, **kw):
+    """The scripted answers cost like a typical real call: about 3,000 tokens in, 300 out, 20,000 from the cache."""
+    out = _create(*a, **kw)
+    audit.claude("claude-opus-5-5", SimpleNamespace(input_tokens=3000, output_tokens=300, cache_creation_input_tokens=0,
+                                                    cache_read_input_tokens=20000), 1.2)
+    return out
+
+
+llm.create = _audited_create
+REG_STORE = regress.Store(REGRESSION_DIR)
+WATCHER = Watcher(DB, None, str(MONITORS_DIR), summary_at=None)   # no investigations: a stuck monitor needs none
+WATCHER.start = lambda *a, **k: None                              # the test runs its rounds via /__test/watch_tick
+AGENT = Agent(llm, TASKS, DB)   # TESTER is PSAGENT_ADMIN in development (teachers "*" below)
+REGRESSION = Regression(REG_STORE, regress.Runner(REG_STORE, lambda: AGENT.tasks, AGENT.operator))   # unattended: set in main
+app = create_app(AGENT, secret="", allowed_origins=[], dev_oprid="TESTER", teachers={"*"}, tasks_dir=str(TASKS_DIR),
+                 runbooks_dir=str(RUNBOOKS_DIR), watcher=WATCHER, monitor_users={"*"}, regression=REGRESSION,
+                 audit_log=AUDIT, auditors={"*"}, audit_jobs=audit.Jobs(AUDIT, budget=25, weekly=""), ci_store=CI_STORE,
+                 query_catalog=queries.Catalog(DB))
 bodies = []
 
 
@@ -227,6 +445,113 @@ PORTAL = """<!doctype html><html><head><meta charset="utf-8"><title>User Profile
 <script src="/psagent.js"></script></body></html>"""
 
 
+LOGIN = """<!doctype html><html><head><meta charset="utf-8"><title>Oracle PeopleSoft Sign-in</title></head><body>
+<form id="login" method="post" action="?&cmd=login&languageCd=ENG"><input type="hidden" name="lcsrf_token" value="t0k">
+<input type="text" id="userid" name="userid"><input type="password" id="pwd" name="pwd"><input name="Submit" type="submit" value="Sign In">
+</form></body></html>"""
+
+
+async def login(request):
+    """Like PeopleSoft's sign-in: TESTER / Te5ter! gets PS_TOKEN and the homepage, anything else the sign-in page again."""
+    if request.method == "POST":
+        form = urllib.parse.parse_qs((await request.body()).decode())
+        if form.get("userid") == ["TESTER"] and form.get("pwd") == ["Te5ter!"] and form.get("lcsrf_token") == ["t0k"]:
+            r = RedirectResponse("/psp/ps/EMPLOYEE/HRMS/c/NUI_FRAMEWORK.PT_LANDINGPAGE.GBL", status_code=302)
+            r.set_cookie("PS_TOKEN", "ok")
+            return r
+    return HTMLResponse(LOGIN)
+
+
+def _soap(inner):
+    return ('<?xml version="1.0"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">'
+            f"<SOAP-ENV:Body>{inner}</SOAP-ENV:Body></SOAP-ENV:Envelope>")
+
+
+def _fault(key, text, mset="91", mnum="37", explain=""):
+    return _soap("<SOAP-ENV:Fault><faultcode>200</faultcode><faultstring>Component Interface API</faultstring><runcode>0</runcode>"
+                 f"<detail><keyinformation><UserID>{key}</UserID></keyinformation><messages><type>Error</type><messagesetnumber>{mset}"
+                 f"</messagesetnumber><messagenumber>{mnum}</messagenumber><messagetext>{text}</messagetext><explaintext>{explain}"
+                 "</explaintext></messages></detail></SOAP-ENV:Fault>")
+
+
+async def soaptoci(request):
+    """Like WEBLIB_SOAPTOCI for USER_PROFILE: GetCIShape, Create and Updatedata, one transaction per request."""
+    import xml.etree.ElementTree as ET
+    raw = (await request.body()).decode()
+    if not raw or request.query_params.get("postDataBin") != "y":    # like PIA: without postDataBin=y the body is dropped
+        return Response("No content provided.")
+    body = next(e for e in ET.fromstring(raw).iter() if e.tag.endswith("Body"))
+    tran = list(body)[0]
+    action, _, name = tran.tag.split("__")
+    if name != "USER_PROFILE":
+        return Response(_fault("", f"Cannot find Component Interface {name}", "91", "2"), media_type="text/xml")
+    if action == "GetCIShape":
+        return Response(SHAPE_XML, media_type="text/xml")
+    vals = {c.tag: (c.text or "") for c in tran if len(c) == 0}
+    uid = vals.get("UserID", "")
+    roles = [(c.get("CINodeAction") or "", c.findtext("RoleName") or "") for c in tran if c.tag == "Roles"]
+    emails = [c.findtext("EmailAddress") or "" for c in tran if c.tag == "EmailAddresses"]
+    for i, (_, role) in enumerate(roles):
+        if role not in ("EMPLOYEE", "PeopleSoft User", "Manager"):
+            return Response(_fault(uid, "Invalid value -- press the prompt button or hyperlink for a list of valid values (15,11) "
+                                        f"{{USER_PROFILE.Roles({i + 1}).RoleName}}", "15", "11",
+                                   "The value entered in the field does not match one of the allowable values."), media_type="text/xml")
+    if action == "Create":
+        if uid in CI_DB.users:
+            return Response(_fault(uid, "Data being added conflicts with existing data. (18,1)", "18", "1"), media_type="text/xml")
+        CI_DB.users.add(uid)
+        CI_SAVED[uid] = {"values": vals, "roles": [r for _, r in roles], "emails": emails}
+    elif action == "Updatedata":
+        if uid not in CI_DB.users:
+            return Response(_fault(uid, "Failed to get the CI", "91", "59"), media_type="text/xml")
+        u = CI_SAVED.setdefault(uid, {"values": {}, "roles": [], "emails": []})
+        u["values"].update(vals)
+        u["roles"] += [r for a, r in roles if a == "INSERT"]
+    else:
+        return Response(_fault(uid, f"Unknown Method {action}", "91", "53"), media_type="text/xml")
+    return Response(_soap(f"<{action}__CompIntfc__USER_PROFILE><notification>1</notification><detail><keyinformation><UserID>{uid}"
+                          f"</UserID></keyinformation></detail></{action}__CompIntfc__USER_PROFILE>"), media_type="text/xml")
+
+
+async def ci_fill(request):
+    """Fill a downloaded CI template like a person would: rows typed under the headers, per sheet ({sheet: [{column: value}]})."""
+    import base64
+    from psagent import runbooks, xlsx
+    data = json.loads((await request.body()).decode())
+    book = []
+    for name, rows in runbooks.xlsx_sheets(base64.b64decode(data["file"])):
+        cells = [c for _, c in rows]
+        head = next((i for i, c in enumerate(cells) if c and c[0] in ("Action", "Row action")), None)
+        if head is not None:
+            for r in data["rows"].get(name, []):
+                cells.append([next((v for k, v in r.items() if h == k or h.endswith(f"({k})")), "") for h in cells[head]])
+        book.append({"name": name, "rows": cells, "header": head})
+    return Response(xlsx.write(book), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def query_viewer(request):
+    """Like Query Viewer's Run links for AI_NEW_HIRES: the Excel file filtered by hire date (dates read only as
+    YYYY-MM-DD: anything else gives no rows, like PeopleSoft), its prompt page when a prompt is missing."""
+    action, _, name = request.query_params.get("ICAction", "").partition("=")
+    binds = {k: v for k, v in request.query_params.items() if k.upper().startswith("BIND")}
+    QUERY_HITS.append({"action": action, "query": name, **binds})
+    if name != "PUBLIC.AI_NEW_HIRES":
+        return HTMLResponse(f"<html><body>Query [Open Query] [CQryStmt::Prepare] QDM could not load query definition [ {name} ]</body></html>")
+    if not binds.get("BIND1") or not binds.get("BIND2"):
+        return HTMLResponse("<html><body>AI_NEW_HIRES - New Hires * Start Date * End Date <input name='InputKeys_bind1'></body></html>")
+
+    def serial(d):
+        try:
+            return (datetime.strptime(d, "%Y-%m-%d") - datetime(1899, 12, 30)).days
+        except ValueError:
+            return None
+    lo, hi = serial(binds["BIND1"]), serial(binds["BIND2"])
+    rows = [r for r in HIRES if lo is not None and hi is not None and lo <= float(r[2]) <= hi]
+    if action == "ICQryNameURL":
+        return HTMLResponse("<table>" + "".join(f"<tr><td>{r[0]}</td><td>{r[1]}</td></tr>" for r in rows) + "</table>")
+    return Response(ps_answer("New Hires", HEADS, rows), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 def portal(request):
     query = "&".join(filter(None, [request.url.query, "PortalActualURL=x&PortalRegistryName=EMPLOYEE"]))
     return HTMLResponse(PORTAL.replace("{name}", request.path_params["name"]).replace("{query}", query))
@@ -266,7 +591,19 @@ app.router.routes.extend([
     Route("/__test/action", action),
     Route("/__test/bodies", lambda r: JSONResponse(bodies)),
     Route("/__test/task_file", lambda r: Response((TASKS_DIR / (r.query_params["id"] + ".yaml")).read_text())),
+    Route("/__test/watch_tick", lambda r: JSONResponse([i["id"] for i in WATCHER.tick()])),
+    Route("/__test/norole", lambda r: HTMLResponse(HOST.replace("fullname: 'Test User'", "fullname: 'No Role', roles: []"))),
+    Route("/psc/ps/EMPLOYEE/HRMS/s/WEBLIB_SOAPTOCI.SOAPTOCI.FieldFormula.IScript_SOAPToCI", soaptoci, methods=["POST"]),
+    Route("/__test/ci_fill", ci_fill, methods=["POST"]),
+    Route("/__test/ci_users", lambda r: JSONResponse(CI_SAVED)),
+    Route("/psc/ps/EMPLOYEE/HRMS/q/", query_viewer),
+    Route("/__test/query_hits", lambda r: JSONResponse(QUERY_HITS)),
+    Route("/psp/ps/", login, methods=["GET", "POST"]),
 ])
 
 if __name__ == "__main__":
+    port = int(sys.argv[1])
+    REGRESSION.unattended = regress_runner.Unattended(REGRESSION.runner, REG_STORE, regress_runner.Headless(
+        f"http://127.0.0.1:{port}/psp/ps/EMPLOYEE/HRMS/c/NUI_FRAMEWORK.PT_LANDINGPAGE.GBL", "TESTER", "Te5ter!",
+        {"password": "Unatt3nd!"}, ROOT / "psagent.js"))
     uvicorn.run(Recorder(app), host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")

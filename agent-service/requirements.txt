@@ -3,3 +3,7 @@ starlette
 uvicorn
 pyyaml
 oracledb>=2.0
+# the audit log's SQLite, for Pythons built without it (PeopleSoft's bundled Python on Linux)
+pysqlite3-binary; sys_platform == "linux" and platform_machine == "x86_64"
+# optional, for unattended regression runs: playwright (then: python -m playwright install chromium)
+playwright

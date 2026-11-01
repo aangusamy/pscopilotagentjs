@@ -12,6 +12,9 @@ query is logged with who asked and why.
 
 import logging
 import re
+import time
+
+from . import audit
 
 log = logging.getLogger("psagent")
 
@@ -88,6 +91,7 @@ class ReadOnlyDB:
         """-> (columns, rows, truncated). Raises QueryError. max_cell: longer for reading program code."""
         sql = check_select(sql)
         log.info("db query by %s (%s): %s", who or "?", why[:120], " ".join(sql.split())[:500])
+        t0 = time.monotonic()
         try:
             with self._pool.acquire() as conn:
                 conn.call_timeout = TIMEOUT_MS
@@ -102,7 +106,9 @@ class ReadOnlyDB:
                 finally:
                     conn.rollback()
         except self._oracledb.Error as e:
+            audit.query(who, why, sql, None, time.monotonic() - t0, str(e).splitlines()[0][:300])
             raise QueryError(str(e).splitlines()[0][:300]) from e
+        audit.query(who, why, sql, min(len(raw), max_rows), time.monotonic() - t0)
         hide = [masked(c) for c in cols]
         rows = [[("***" if hide[i] and v is not None else _cell(v, max_cell)) for i, v in enumerate(r)] for r in raw[:max_rows]]
         return cols, rows, len(raw) > max_rows

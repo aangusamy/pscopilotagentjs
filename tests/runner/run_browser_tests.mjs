@@ -26,6 +26,8 @@ async function waitForServer() {
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
+/* PSA_SNAP=<folder>: save screenshots of the main screens there as the tests run */
+const snap = (page, name) => process.env.PSA_SNAP ? page.screenshot({ path: path.join(process.env.PSA_SNAP, name + '.png') }) : null;
 
 async function actionFor(values) {
   const r = await fetch(`${BASE}/__test/action?values=${encodeURIComponent(JSON.stringify(values))}`);
@@ -428,6 +430,441 @@ test('security: "why can\'t ABSMITH access Create Job Opening?" -> security chai
   const apply = bodies.filter(b => b.includes('"run_id":"sec-') && !b.includes('"snapshot"'));
   assert.ok(apply.length >= 2, 'steps and apply sent with the access check id');
   assert.ok(bodies.some(b => b.includes('"run_id":"live-') && b.includes('"snapshot"')), 'the fix ran live');
+});
+
+test('approvals: pending absence requests -> Review with AI -> approval status, recommendation, confidence score', async page => {
+  await page.click('#psa-fab');
+  await page.locator('.psa-tile', { hasText: 'Review absence approvals' }).click();    // from the welcome screen
+  const list = page.locator('.psa-card', { hasText: 'Absence requests waiting for you' });
+  await list.waitFor({ timeout: 60000 });
+  const lt = await list.innerText();
+  for (const s of ['Edmund Donahue', 'KU0102', 'Vacation · 31 Jan 2018 · 8 h', 'Waiting for RCHANNING · since 6 Dec 2017'])
+    assert.ok(lt.includes(s), s + ' missing in\n' + lt);
+  await list.locator('button', { hasText: 'Review with AI' }).click();
+  const card = page.locator('.psa-card.psa-diag', { hasText: 'Absence request 1589' });
+  await card.waitFor({ timeout: 60000 });
+  const text = (await card.innerText()).toUpperCase();
+  for (const s of ['Approval status', 'Pending · step 1 of 1 · Waiting for RCHANNING', 'Submitted 6 Dec 2017 by EDONAHUE',
+    'Recommend: send back', '88/100 · high', 'Something needs fixing before you approve it', 'Why this confidence',
+    'Overlaps: Approved sick leave on 31 Jan', 'Suggested comment', 'please withdraw or change the dates', 'You decide'])
+    assert.ok(text.includes(s.toUpperCase()), s + ' missing in\n' + text);
+  assert.equal(await card.locator('.psa-chk.missing').count(), 1);                    // the problem check
+  assert.equal(await card.locator('.psa-chk.info').count(), 1);                       // unknown status cleaned
+  assert.equal(await card.locator('.psa-conf-bar i').evaluate(e => e.style.width), '88%');
+  assert.equal(await card.locator('a.psa-btn').getAttribute('href'), '/psc/ps/EMPLOYEE/HRMS/c/EOAWMA_MAIN_FL.EOAWMA_MAIN_FL.GBL');
+  const feed = await page.locator('.psa-feed').last().innerText();
+  for (const s of ['Reviewing absence request 1589', 'Read absence request 1589: balance, approvals, other absences, team', 'Diagnosis ready'])
+    assert.ok(feed.includes(s), s + ' missing in\n' + feed);
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b);
+  assert.ok(bodies.some(b => b.includes('"thread":"1589"')), 'review started for request 1589');
+  assert.ok(bodies.some(b => b.includes('"run_id":"apr-')), 'steps sent with the review id');
+});
+
+test('runbooks: attach the Excel checklist -> draft runbook card -> publish', async page => {
+  const xlsx = path.join(here, '..', '..', 'agent-service', 'runbooks', 'templates', 'test_user_setup_checklist.xlsx');
+  await page.click('#psa-fab');
+  await page.setInputFiles('#psa-file', xlsx);
+  await page.locator('.psa-file', { hasText: 'test_user_setup_checklist.xlsx' }).waitFor();
+  await page.fill('#psa-input', 'build a runbook from this checklist');
+  await page.press('#psa-input', 'Enter');
+  const card = page.locator('.psa-card', { hasText: 'Runbook: Set up a test user' });
+  await card.waitFor({ timeout: 30000 });
+  const t = (await card.innerText()).toUpperCase();      // section headings are shown in capitals
+  for (const s of ['Drafted from test_user_setup_checklist.xlsx', 'Please check', 'no Sync Portal Security task yet',
+    'User ID', 'PSA_TEST01', '5 steps', 'Today: passes', 'Today: fails', 'tested with user_id = PSA_TEST01',
+    'Runs the task Create User Profile with User ID = {{user_id}}, Roles = EMPLOYEE', 'Asks when it runs:',
+    'Owner: Security Manager', 'Nothing has run'])
+    assert.ok(t.includes(s.toUpperCase()), s + ' missing in\n' + t);
+  assert.deepEqual(await card.locator('.psa-rb-t').allInnerTexts(), ['CHECK', 'TASK', 'MANUAL', 'CHECK', 'APPROVAL']);
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b);
+  assert.ok(bodies.some(b => b.includes('"media_type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"')),
+    'the checklist was sent as an Excel file');
+  await card.locator('[data-pub]').click();
+  await page.locator('.psa-bot', { hasText: 'as runbooks/set_up_a_test_user.yaml' }).waitFor({ timeout: 10000 });
+  assert.equal(await card.locator('[data-pub]').innerText(), 'Published');
+});
+
+test('runbooks: run the published runbook from its tile: check, task with confirm card, manual step, check, approval', async page => {
+  await page.click('#psa-fab');
+  await page.locator('.psa-tile', { hasText: 'Run: Set up a test user' }).click();
+  const start = page.locator('.psa-card', { hasText: 'Run: Set up a test user' });
+  await start.waitFor({ timeout: 30000 });
+  assert.equal(await start.locator('[data-in="user_id"]').inputValue(), 'PSA_TEST01');
+  await start.locator('[data-in="user_id"]').fill('RBUSER1');
+  await start.locator('[data-go]').click();
+  // step 1 (check) ran on the service; step 2 is the task's confirm card
+  const task = page.locator('.psa-card', { hasText: 'Step 2: Create the user profile and add the Employee role' });
+  await task.waitFor({ timeout: 30000 });
+  const tt = await task.innerText();
+  for (const s of ['Runs the task Create User Profile', 'RBUSER1', 'Employee', 'Description (needed)'])
+    assert.ok(tt.includes(s), s + ' missing in\n' + tt);
+  assert.equal(await task.locator('.psa-ok').isDisabled(), true);              // description and password first
+  await task.locator('[data-fill="description"]').fill('Runbook User');
+  await task.locator('[data-secret="password"]').fill('Rb$ecret1');
+  await task.locator('[data-confirm="password"]').fill('Rb$ecret1');
+  await task.locator('.psa-ok').click();
+  // the task runs in the workspace; then step 3 waits for the person
+  const manual = page.locator('.psa-card', { hasText: 'Step 3: Run the portal security sync' });
+  await manual.waitFor({ timeout: 60000 });
+  await manual.locator('.psa-ok', { hasText: 'Done' }).click();
+  const approval = page.locator('.psa-card', { hasText: 'Step 5: Security manager signs off the new user' });
+  await approval.waitFor({ timeout: 30000 });
+  assert.ok((await approval.innerText()).includes('Approver: Security Manager'));
+  await approval.locator('.psa-ok', { hasText: 'Approve' }).click();
+  const done = page.locator('.psa-card', { hasText: 'Set up a test user: completed' });
+  await done.waitFor({ timeout: 30000 });
+  assert.equal(await done.locator('.psa-chk.ok').count(), 5);
+  const feed = await page.locator('.psa-feed').last().innerText();
+  for (const s of ['1. Make sure the new user ID is not taken', '2. Create the user profile and add the Employee role: Saved',
+    '3. Run the portal security sync: Done by TESTER', '5. Security manager signs off the new user: Approved by TESTER'])
+    assert.ok(feed.includes(s), s + ' missing in\n' + feed);
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b);
+  assert.ok(bodies.some(b => b.includes('"inputs":{"user_id":"RBUSER1"}')), 'started with the input');
+  assert.ok(!bodies.some(b => b.includes('Rb$ecret1')), 'the password never reaches the service');
+});
+
+test('roles: no PSAGENT role -> no widget; with a role it shows', async page => {
+  await page.goto(`${BASE}/__test/norole`);
+  await page.waitForTimeout(1200);
+  assert.equal(await page.locator('#psa-fab').count(), 0, 'the widget must stay hidden');
+  await page.goto(HOME);
+  await page.locator('#psa-fab').waitFor({ timeout: 10000 });
+});
+
+test('watcher: set up a monitor in the chat -> preview -> save; overnight alert on the welcome screen, in the chat and from the email link', async page => {
+  await page.click('#psa-fab');
+  const watch = page.locator('.psa-tile', { hasText: 'Watch something for me' });
+  await watch.click();
+  assert.equal(await page.inputValue('#psa-input'), 'Watch ');
+  await page.fill('#psa-input', 'Watch for requests stuck more than 30 minutes and email ops@example.com');
+  await page.press('#psa-input', 'Enter');
+  const mc = page.locator('.psa-card', { hasText: 'Monitor: Stuck requests' });
+  await mc.waitFor({ timeout: 30000 });
+  const mt = await mc.innerText();
+  for (const s of ['2 REQUESTS ARE STUCK RIGHT NOW', 'PSXPARCHATTR', 'Every 5 minutes', 'ops@example.com', 'Email is not set up'])   // headings are upper case (CSS)
+    assert.ok(mt.includes(s), s + ' missing in\n' + mt);
+  await mc.locator('[data-save]').click();
+  await page.locator('.psa-bot', { hasText: 'monitors/stuck_requests.yaml' }).waitFor({ timeout: 10000 });
+  // "overnight": one watcher round
+  const ids = await (await fetch(`${BASE}/__test/watch_tick`)).json();
+  assert.equal(ids.length, 1);
+  await page.click('#psa-new');
+  const alert = page.locator('.psa-alert', { hasText: 'from the watcher' });
+  await alert.waitFor({ timeout: 10000 });
+  await page.locator('#psa-close').click();
+  await page.click('#psa-fab');
+  await page.locator('.psa-tile', { hasText: 'What happened overnight?' }).click();
+  const list = page.locator('.psa-card', { hasText: 'in the last 16 hours' });
+  await list.waitFor({ timeout: 30000 });
+  await list.locator('[data-n="0"]').click();
+  const inc = page.locator('.psa-card.psa-diag', { hasText: '2 requests stuck' });
+  await inc.waitFor({ timeout: 10000 });
+  const it = await inc.innerText();
+  for (const s of ['Every process server is running', 'PRCS8622: Running', '557022', 'ACTION NEEDED'])
+    assert.ok(it.includes(s), s + ' missing in\n' + it);
+  // the email's "Open in the agent" link opens the panel on the alert
+  await page.goto(HOME + '?tab=DEFAULT&psagent=' + ids[0]);
+  await page.locator('.psa-card.psa-diag', { hasText: '2 requests stuck' }).waitFor({ timeout: 15000 });
+});
+
+test('watch plan: + Features > Watch jobs -> download template -> upload -> overview -> confirm -> manage: pause, delete, download, stop', async page => {
+  await page.click('#psa-fab');
+  await page.click('#psa-feat');
+  await page.locator('#psa-featmenu button', { hasText: 'Watch jobs' }).click();
+  const g = page.locator('.psa-card.psa-guide', { hasText: 'Watch jobs' });
+  await g.waitFor({ timeout: 10000 });
+  const [dl] = await Promise.all([page.waitForEvent('download'), g.locator('[data-dl]').click()]);
+  assert.equal(dl.suggestedFilename(), 'watch_plan_template.xlsx');
+  const [chooser] = await Promise.all([page.waitForEvent('filechooser'), g.locator('[data-up]').click()]);
+  await chooser.setFiles(path.join(here, '..', '..', 'agent-service', 'runbooks', 'templates', 'watch_plan_template.xlsx'));
+  const wp = page.locator('.psa-card', { hasText: 'Watch plan: Nightly jobs' });
+  await wp.waitFor({ timeout: 30000 });
+  const wt = await wp.innerText();
+  for (const s of ['From watch_plan_template.xlsx', 'AE test program failures', 'Cross-reference report stuck', '2 requests are stuck right now',
+                   'Portal security sync by 07:00', 'Succeeded on 3 of the last 30 days', 'Every day at 07:00', 'security@example.com'])
+    assert.ok(wt.includes(s), s + ' missing in\n' + wt);
+  const bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b.includes('watch_plan_template.xlsx'));
+  assert.ok(bodies.some(b => b.includes('"message":"Build a watch plan from this sheet"')), 'the file went with the guide message');
+  await wp.locator('[data-go]').click();
+  await page.locator('.psa-bot', { hasText: 'monitors/nightly_jobs.yaml' }).waitFor({ timeout: 10000 });
+  const pill = page.locator('#psa-dogs');
+  assert.match(await pill.innerText(), /◉ 5 watchdogs/);       // 4 here + the stuck monitor from the previous test
+  // the manager
+  await pill.click();
+  const mg = page.locator('.psa-card.psa-mgr');
+  await mg.waitFor({ timeout: 10000 });
+  const plan = mg.locator('.psa-plan', { hasText: 'Nightly jobs' });
+  assert.equal(await plan.locator('.psa-dog').count(), 4);
+  await plan.locator('.psa-dog', { hasText: 'Cross-reference report stuck' }).locator('[data-act="pause"]').click();
+  await plan.locator('.psa-dog.psa-paused', { hasText: 'Cross-reference report stuck' }).waitFor({ timeout: 10000 });
+  assert.match(await pill.innerText(), /\(4 active\)/);
+  const del = () => mg.locator('.psa-plan', { hasText: 'Nightly jobs' }).locator('.psa-dog', { hasText: 'Portal security sync' }).locator('[data-act="delete"]');
+  await del().click();
+  assert.match(await del().innerText(), /click again/);           // asks first
+  await del().click();
+  await page.waitForFunction(() => document.querySelectorAll('.psa-mgr .psa-plan')[1]?.querySelectorAll('.psa-dog').length === 3
+    || [...document.querySelectorAll('.psa-mgr .psa-plan')].some(p => p.innerText.includes('Nightly jobs') && p.querySelectorAll('.psa-dog').length === 3));
+  const [x] = await Promise.all([page.waitForEvent('download'), mg.locator('.psa-plan', { hasText: 'Nightly jobs' }).locator('[data-dl]').click()]);
+  assert.equal(x.suggestedFilename(), 'nightly_jobs.xlsx');
+  const stop = mg.locator('[data-act="stop"]');
+  await stop.click();
+  await stop.click();
+  await page.locator('#psa-dogs.psa-off', { hasText: 'Watching stopped' }).waitFor({ timeout: 10000 });
+  await mg.locator('[data-act="start"]').click();
+  await page.locator('#psa-dogs:not(.psa-off)').waitFor({ timeout: 10000 });
+  assert.ok((await mg.textContent()).includes('stopped all watching'), 'the change is in the history (collapsed)');
+});
+
+test('regression: template -> upload -> overview -> save -> run here (passes) -> page changed (passed with changes) -> unattended run on the service', async page => {
+  await page.click('#psa-fab');
+  await page.click('#psa-feat');
+  await page.locator('#psa-featmenu button', { hasText: 'Regression tests' }).click();
+  const home = page.locator('.psa-card.psa-guide', { hasText: 'Regression tests' });
+  await home.waitFor({ timeout: 10000 });
+  assert.ok((await home.innerText()).includes('Unattended runs sign in as TESTER'));
+  const [dl] = await Promise.all([page.waitForEvent('download'), home.locator('[data-tpl]').click()]);
+  assert.equal(dl.suggestedFilename(), 'regression_test_plan.xlsx');
+  const plan = path.join(os.tmpdir(), 'psagent_regression_test_plan.xlsx');
+  await dl.saveAs(plan);
+  const [chooser] = await Promise.all([page.waitForEvent('filechooser'), home.locator('[data-up]').click()]);
+  await chooser.setFiles(plan);
+  const ov = page.locator('.psa-card', { hasText: 'Test suite: User admin regression' });
+  await ov.waitFor({ timeout: 30000 });
+  const ot = await ov.innerText();
+  for (const s of ['From psagent_regression_test_plan.xlsx', 'New user', 'RT{{n}}', 'Duplicate user is refused', 'Error: "already exists"'])
+    assert.ok(ot.includes(s), s + ' missing in\n' + ot);
+  await ov.locator('[data-go]').click();
+  // run 1, here: both pass (the duplicate is refused, as expected)
+  const runNow = page.locator('.psa-card', { hasText: 'Saved User admin regression' });
+  await runNow.locator('.psa-ok').click();
+  let start = page.locator('.psa-card', { hasText: '{{n}} = 0001' });
+  await start.waitFor({ timeout: 10000 });
+  await start.locator('[data-sec="password"]').fill('Regr3ss!');
+  await start.locator('[data-go]').click();
+  let rep = page.locator('.psa-card.psa-diag', { hasText: 'User admin regression: 2 of 2 passed' });
+  await rep.waitFor({ timeout: 90000 });
+  let bodies = (await (await fetch(`${BASE}/__test/bodies`)).json()).join('\n');
+  assert.ok(!bodies.includes('Regr3ss!'), 'the password never reaches the service');
+  // run 2: the page was upgraded (Description moved): case 1 is finished live -> passed with changes
+  await page.evaluate(() => sessionStorage.setItem('mock.upgraded', '1'));
+  await page.click('#psa-feat');
+  await page.locator('#psa-featmenu button', { hasText: 'Regression tests' }).click();
+  const home2 = page.locator('.psa-card.psa-guide', { hasText: 'Regression tests' }).last();
+  await home2.locator('.psa-plan', { hasText: 'User admin regression' }).locator('[data-run]').click();
+  start = page.locator('.psa-card', { hasText: '{{n}} = 0002' });
+  await start.locator('[data-sec="password"]').fill('Regr3ss!');
+  await start.locator('[data-go]').click();
+  rep = page.locator('.psa-card.psa-diag', { hasText: '1 of 2 passed, 1 passed with changes' });
+  await rep.waitFor({ timeout: 120000 });
+  const rt = await rep.textContent();
+  for (const s of ['Passed with changes', 'was Passed', 'no longer matched the page', 'Live: Description moved: Long Description',
+                   'Finished live: Created RT0002', 'compared with the run of'])
+    assert.ok(rt.includes(s), s + ' missing in\n' + rt);
+  const [x] = await Promise.all([page.waitForEvent('download'), rep.locator('[data-xl]').click()]);
+  assert.match(x.suggestedFilename(), /^regression-user_admin_regression-rt-.*\.xlsx$/);
+  await page.evaluate(() => sessionStorage.removeItem('mock.upgraded'));
+  // run 3: unattended, in the service's own headless browser (signs in as TESTER, runs the same widget code)
+  await page.click('#psa-feat');
+  await page.locator('#psa-featmenu button', { hasText: 'Regression tests' }).click();
+  const home3 = page.locator('.psa-card.psa-guide', { hasText: 'Regression tests' }).last();
+  await home3.locator('.psa-plan', { hasText: 'User admin regression' }).locator('[data-una]').click();
+  await page.locator('.psa-bot', { hasText: 'Started an unattended run' }).waitFor({ timeout: 10000 });
+  let last = null;
+  for (let i = 0; i < 120 && !last; i++) {
+    const h = await (await fetch(`${BASE}/api/regress`)).json();
+    if (!h.unattended.busy && h.runs.length && h.runs[0].mode === 'server') last = h.runs[0];
+    else await new Promise(r => setTimeout(r, 1000));
+  }
+  assert.ok(last, 'the unattended run finished');
+  assert.equal(last.headline, '2 of 2 passed');
+  const full = (await (await fetch(`${BASE}/api/regress/report?run=${last.run_id}`)).json()).report;
+  assert.equal(full.by, 'TESTER');
+  assert.equal(full.n, '0003');
+});
+
+test('audit: + Features > Audit opens the dashboard beside the chat: overview, usage and cost, the audit log, failures, watcher and tests', async page => {
+  await page.setViewportSize({ width: 1500, height: 950 });
+  await page.click('#psa-fab');
+  await page.locator('.psa-tile', { hasText: 'Audit dashboard' }).waitFor({ timeout: 10000 });
+  await page.click('#psa-feat');
+  await page.locator('#psa-featmenu button', { hasText: 'Audit' }).click();
+  const dash = page.locator('#psa-audit');
+  await dash.locator('.psa-au-kpis').waitFor({ timeout: 10000 });
+  // beside the chat, not over it
+  const [d, p] = [await dash.boundingBox(), await page.locator('#psa-panel').boundingBox()];
+  assert.ok(d.x + d.width <= p.x, 'the dashboard is left of the chat');
+  let t = await dash.innerText();
+  for (const s of ['People', 'Messages', 'Task runs', 'Claude cost', 'of the $25.00 budget', 'Cost by feature', 'Top users', 'VELU', 'Troubleshooter'])
+    assert.ok(t.includes(s), s + ' missing in\n' + t);
+  assert.ok(await dash.locator('.psa-au-bar').count() >= 3, 'the daily cost bars');
+  await dash.locator('.psa-au-hit').last().hover();
+  assert.match(await dash.locator('.psa-au-tip').innerText(), /\$[\d.]+, \d+ messages/);
+  await snap(page, 'audit_1_overview');
+  // 30 days, usage by user: the people of the sample history and this test run's own user
+  await dash.locator('[data-days]').selectOption('30');
+  await dash.locator('[data-tab="usage"]').click();
+  await dash.locator('.psa-au-table').waitFor();
+  t = await dash.innerText();
+  for (const s of ['VELU', 'ABSMITH', 'TESTER', 'PSAGENT_WATCH (the service)', 'Per conversation'])
+    assert.ok(t.includes(s), s + ' missing in\n' + t);
+  await snap(page, 'audit_2_usage_by_user');
+  await dash.locator('[data-by="feature"]').click();
+  await dash.locator('.psa-au-table', { hasText: 'Troubleshooter' }).waitFor();
+  const [x] = await Promise.all([page.waitForEvent('download'), dash.locator('[data-xl="usage"]').click()]);
+  assert.match(x.suggestedFilename(), /^psagent-usage-by-feature-.*\.xlsx$/);
+  // a user's row opens the audit log filtered to them; a run's row shows the confirmed values
+  await dash.locator('[data-by="user"]').click();
+  await dash.locator('tr[data-user="VELU"]').click();
+  await dash.locator('.psa-au-log').waitFor();
+  assert.equal(await dash.locator('select[name="user"]').inputValue(), 'VELU');
+  const confirmed = dash.locator('tr[data-ev]', { hasText: 'task.confirmed' }).first();
+  await confirmed.click();
+  assert.match(await dash.locator('.psa-au-detail').first().innerText(), /User ID = NEW\d+/);
+  await snap(page, 'audit_3_log_velu');
+  // database queries, searched
+  await dash.locator('select[name="user"]').selectOption('');
+  await dash.locator('select[name="kind"]').selectOption('queries');
+  await dash.locator('input[name="q"]').fill('PSPRCSRQST');
+  await dash.locator('[data-filters] button[type="submit"]').click();
+  await dash.locator('tr[data-ev]', { hasText: 'query' }).first().click();
+  assert.match(await dash.locator('.psa-au-detail pre').first().innerText(), /SELECT .*PSPRCSRQST/);
+  const [xl] = await Promise.all([page.waitForEvent('download'), dash.locator('[data-xl="events"]').click()]);
+  assert.equal(xl.suggestedFilename(), 'psagent-audit-log.xlsx');
+  // failures; the watcher and the regression runs (this test run's own included)
+  await dash.locator('[data-tab="failures"]').click();
+  await dash.locator('.psa-au-chips').waitFor();
+  t = await dash.innerText();
+  assert.ok(t.includes('Tasks') && t.includes('User ID already exists') && t.includes('API error 529'), t);
+  await snap(page, 'audit_4_failures');
+  await dash.locator('[data-tab="ops"]').click();
+  await dash.locator('.psa-au-cols').waitFor();
+  t = await dash.innerText();
+  assert.ok(t.includes('User admin regression') && t.includes('watchdogs active'), t);
+  // what people typed in the chat is not kept
+  const typed = await (await fetch(`${BASE}/api/audit?tab=events&kind=all&days=90&q=${encodeURIComponent('stuck more than 30 minutes')}`)).json();
+  assert.deepEqual(typed.events, []);
+  const chats = await (await fetch(`${BASE}/api/audit?tab=events&kind=all&days=1&user=TESTER&q=Sent`)).json();
+  assert.ok(chats.events.length > 3, 'but each message is counted');
+  // ask the agent: the chat on the right
+  await dash.locator('[data-ask]').click();
+  assert.match(await page.getAttribute('#psa-input', 'placeholder'), /Who spent the most/);
+  await dash.locator('[data-close]').click();
+  assert.equal(await dash.isVisible(), false);
+});
+
+test('excel to CI: + Features > Load with a CI -> pick USER_PROFILE -> template -> fill -> checks -> load through SOAPTOCI -> results; a template dropped in the chat', async page => {
+  await page.setViewportSize({ width: 1400, height: 950 });
+  await page.click('#psa-fab');
+  await page.click('#psa-feat');
+  await page.locator('#psa-featmenu button', { hasText: 'Load with a CI' }).click();
+  const picker = page.locator('.psa-card.psa-ci', { hasText: 'Load with a Component Interface' });
+  await picker.waitFor({ timeout: 10000 });
+  await picker.locator('.psa-ci-q').fill('user');
+  await picker.locator('[data-ci="USER_PROFILE"]').waitFor({ timeout: 10000 });
+  await snap(page, 'ci_1_picker');
+  await picker.locator('[data-ci="USER_PROFILE"]').click();
+  // the shape, read with GetCIShape through SOAPTOCI in this session
+  const shape = page.locator('.psa-card.psa-ci', { hasText: 'USER_PROFILE: User Profile Component' });
+  await shape.waitFor({ timeout: 15000 });
+  assert.ok((await shape.innerText()).includes('You may Create and Update through this CI'));
+  assert.equal(await shape.locator('[data-p="UserID"]').isDisabled(), true, 'the key is always in');
+  for (const id of ['UserDescription', 'Roles.RoleName', 'EmailAddresses.EmailAddress']) {
+    const box = shape.locator(`[data-p="${id}"]`);
+    if (!(await box.isVisible())) await box.evaluate(b => b.closest('details').open = true);
+    if (!(await box.isChecked())) await box.check();
+  }
+  await snap(page, 'ci_2_template');
+  const [dl] = await Promise.all([page.waitForEvent('download'), shape.locator('[data-dl]').click()]);
+  assert.equal(dl.suggestedFilename(), 'user_profile_template.xlsx');
+  const tpl = path.join(os.tmpdir(), 'psagent_ci_template.xlsx');
+  await dl.saveAs(tpl);
+  // fill it in, as a person would
+  const fs = await import('node:fs');
+  const rows = {
+    USER_PROFILE: [
+      { Action: 'Create', UserID: 'CITEST01', UserDescription: 'CI Test One', SymbolicID: 'SYSADM1' },
+      { Action: 'Create', UserID: 'CITEST02', UserDescription: 'CI Test Two', SymbolicID: 'SYSADM1' },
+      { Action: 'Create', UserID: 'JSMITH', UserDescription: 'Exists already', SymbolicID: 'SYSADM1' },
+      { Action: 'Update', UserID: 'VP1', UserDescription: 'Vice President One' }],
+    Roles: [{ 'USER_PROFILE.UserID': 'CITEST01', RoleName: 'EMPLOYEE' }, { 'USER_PROFILE.UserID': 'CITEST02', RoleName: 'EMPLOYE' },
+            { 'Row action': 'Add', 'USER_PROFILE.UserID': 'VP1', RoleName: 'Manager' }],
+    EmailAddresses: [{ 'USER_PROFILE.UserID': 'CITEST01', EmailType: 'Work', EmailAddress: 'citest01@example.com' }],
+  };
+  const filledRes = await fetch(`${BASE}/__test/ci_fill`, { method: 'POST', body: JSON.stringify({ file: fs.readFileSync(tpl).toString('base64'), rows }) });
+  const filled = path.join(os.tmpdir(), 'new users.xlsx');
+  fs.writeFileSync(filled, Buffer.from(await filledRes.arrayBuffer()));
+  const [chooser] = await Promise.all([page.waitForEvent('filechooser'), shape.locator('[data-up]').click()]);
+  await chooser.setFiles(filled);
+  // every row checked before anything is saved
+  const review = page.locator('.psa-ci-load', { hasText: 'new users.xlsx → USER_PROFILE' }).last();
+  await review.waitFor({ timeout: 15000 });
+  let t = await review.innerText();
+  for (const s of ['4 rows', '3 ready', '1 with problems: not loaded', 'User ID JSMITH already exists: use Update to change it', 'Load 3 rows'])
+    assert.ok(t.includes(s), s + ' missing in\n' + t);
+  assert.deepEqual(await (await fetch(`${BASE}/__test/ci_users`)).json(), {}, 'nothing saved before Load');
+  await snap(page, 'ci_3_review');
+  await review.locator('[data-go]').click();
+  await page.locator('.psa-bot', { hasText: '2 of 3 rows saved through USER_PROFILE' }).waitFor({ timeout: 30000 });
+  t = await review.innerText();
+  for (const s of ['✓ Saved', '✕ Failed', 'Invalid value -- press the prompt button', '3 of 3 rows loaded: done', 'Download the rows to fix', 'Explain the errors'])
+    assert.ok(t.includes(s), s + ' missing in\n' + t);
+  await snap(page, 'ci_4_loaded');
+  const saved = await (await fetch(`${BASE}/__test/ci_users`)).json();
+  assert.deepEqual(saved.CITEST01.roles, ['EMPLOYEE']);
+  assert.deepEqual(saved.CITEST01.emails, ['citest01@example.com']);
+  assert.equal(saved.CITEST01.values.UserDescription, 'CI Test One');
+  assert.deepEqual(saved.VP1.roles, ['Manager'], 'Update with Row action Add inserts the role');
+  assert.equal(saved.CITEST02, undefined);
+  const [fix] = await Promise.all([page.waitForEvent('download'), review.locator('[data-x="fix"]').click()]);
+  assert.equal(fix.suggestedFilename(), 'new users-to-fix.xlsx');
+  const [res] = await Promise.all([page.waitForEvent('download'), review.locator('[data-x="results"]').click()]);
+  assert.equal(res.suggestedFilename(), 'new users-results.xlsx');
+  // each row is in the audit log
+  const log = await (await fetch(`${BASE}/api/audit?tab=events&feature=ci&days=1`)).json();
+  assert.ok(log.events.filter(e => e.event === 'ci.row').length === 3, 'three rows in the audit log');
+  // the fixed rows dropped straight in the chat: checked at once, no Claude call
+  const fixFile = path.join(os.tmpdir(), 'new users-to-fix.xlsx');
+  await fix.saveAs(fixFile);
+  const [att] = await Promise.all([page.waitForEvent('filechooser'), page.click('#psa-attach')]);
+  await att.setFiles(fixFile);
+  await page.fill('#psa-input', 'load these');
+  await page.press('#psa-input', 'Enter');
+  const again = page.locator('.psa-ci-load', { hasText: 'new users-to-fix.xlsx → USER_PROFILE' });
+  await again.waitFor({ timeout: 15000 });
+  t = await again.innerText();
+  assert.ok(t.includes('2 rows') && t.includes('CITEST02') && t.includes('JSMITH'), t);
+});
+
+test('ask the data: + Features > Ask the data lists the AI_ queries the user may run -> a question -> Claude picks AI_NEW_HIRES -> the browser runs it in PeopleSoft -> table, chart, Excel', async page => {
+  await page.setViewportSize({ width: 1400, height: 950 });
+  await page.click('#psa-fab');
+  await page.click('#psa-feat');
+  await page.locator('#psa-featmenu button', { hasText: 'Ask the data' }).click();
+  const list = page.locator('.psa-qr-list');
+  await list.waitFor({ timeout: 10000 });
+  let t = await list.innerText();
+  for (const s of ['New Hires', 'AI_NEW_HIRES', 'asks for Start Date, End Date', 'My team', 'private', 'Headcount', 'a prompt has no name'])
+    assert.ok(t.includes(s), s + ' missing in\n' + t);
+  assert.ok(!t.includes('AI_PAYCHECKS') && !t.includes('AI_THEIRS') && !t.includes('AIXDEPT'), 'only the AI_ queries this user may run');
+  await snap(page, 'qr_1_list');
+  await page.fill('#psa-input', 'How many new hires this year by department?');
+  await page.press('#psa-input', 'Enter');
+  const res = page.locator('.psa-card.psa-qr', { hasText: 'AI_NEW_HIRES' }).last();
+  await res.waitFor({ timeout: 20000 });
+  await page.locator('.psa-bot', { hasText: 'new hires this year: 4 in 10200' }).waitFor({ timeout: 10000 });
+  t = await res.innerText();
+  for (const s of ['New Hires', 'Start Date: 2026-01-01', 'End Date: 2026-10-31', '7 rows', 'Rows by Department', '10200', 'Mark Chen',
+                   '2026-01-01', 'Download Excel', 'Open in Query Viewer'])
+    assert.ok(t.includes(s), s + ' missing in\n' + t);
+  // the browser ran it in the session, with the dates as YYYY-MM-DD (12/31/2026 would silently give no rows)
+  const hits = await (await fetch(`${BASE}/__test/query_hits`)).json();
+  assert.deepEqual(hits.at(-1), { action: 'ICQryNameExcelURL', query: 'PUBLIC.AI_NEW_HIRES', BIND1: '2026-01-01', BIND2: '2026-10-31' });
+  const [dl] = await Promise.all([page.waitForEvent('download'), res.locator('[data-xl]').click()]);
+  assert.equal(dl.suggestedFilename(), 'AI_NEW_HIRES.xlsx');
+  assert.ok((await res.locator('a', { hasText: 'Open in Query Viewer' }).getAttribute('href')).includes('ICQryNameURL=PUBLIC.AI_NEW_HIRES&BIND1=2026-01-01'));
+  const log = await (await fetch(`${BASE}/api/audit?tab=events&feature=data&days=1`)).json();
+  assert.ok(log.events.some(e => e.event === 'query.run' && e.detail === 'AI_NEW_HIRES: 7 rows'), 'the run is in the audit log');
+  await snap(page, 'qr_2_result');
 });
 
 let failed = 0;

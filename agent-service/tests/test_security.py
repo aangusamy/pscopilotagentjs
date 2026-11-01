@@ -132,13 +132,6 @@ class AccessToolsTest(unittest.TestCase):
         self.assertTrue(r["user_security_classes_missing"] and r["row_security_permission_list_would_grant"])
         self.assertIn("SCRTY_OPRCLS", r["likely_cause"])
 
-    def test_admins(self):
-        c = AccessChecker(None, SecDB(), admins=["SECADM"])
-        self.assertTrue(c.is_admin("secadm"))                 # listed
-        self.assertTrue(c.is_admin("PS"))                     # holds an admin role
-        self.assertFalse(c.is_admin("ABSMITH"))
-        self.assertFalse(AccessChecker(None, SecDB(), admin_roles=()).is_admin("PS"))
-
     def test_names_and_goals(self):
         self.assertEqual(_component("HRS_JO_LAUNCH (HRS_HRPM.HRS_JO_LAUNCH.GBL)"), "HRS_JO_LAUNCH")
         self.assertEqual(_name("ADMINISTER_WORKFORCE_(GBL)"), "ADMINISTER_WORKFORCE_(GBL)")
@@ -152,7 +145,7 @@ class AccessToolsTest(unittest.TestCase):
 class AccessFlowTest(unittest.TestCase):
     def test_question_to_diagnosis_to_apply(self):
         llm = access_llm()
-        agent, s = Agent(llm, TASKS, SecDB()), Session(id="s", oprid="PS")
+        agent, s = Agent(llm, TASKS, SecDB()), Session(id="s", oprid="PS", can_teach=True, can_monitor=True)   # PSAGENT_ADMIN
         r = agent.chat(s, "Why can't ABSMITH access Create Job Opening?")
         t = r.troubleshoot
         self.assertEqual((t["kind"], t["user"], t["title"]), ("security", "ABSMITH", "Checking ABSMITH's access to Create Job Opening"))
@@ -177,20 +170,38 @@ class AccessFlowTest(unittest.TestCase):
         self.assertEqual(s.running["task_id"], "security fix")
         self.assertIn("error", agent.apply_security_fix(s, "sec-unknown"))
 
-    def test_only_security_admins(self):
+    def test_others_access_only_for_admins(self):
         llm = FakeLLM(response(tool("check_user_access", {"user": "PS", "page": "Job Data", "question": ""})),
-                      response(text("Only security administrators can check that.")))
+                      response(text("Only PSAGENT_ADMIN users can check that.")))
         r = Agent(llm, TASKS, SecDB()).chat(Session(id="s", oprid="ABSMITH"), "why can't PS open Job Data")
         self.assertIsNone(r.troubleshoot)
-        self.assertIn("only security administrators", json.dumps(llm.calls[-1][-1]["content"]))
+        self.assertIn("checking other users' access is for PSAGENT_ADMIN", json.dumps(llm.calls[-1][-1]["content"]))
+
+    def test_users_check_their_own_access(self):
+        """PSAGENT_USER: their own access ("me"), without Claude's own queries, and no Apply."""
+        llm = FakeLLM(response(tool("check_user_access", {"user": "me", "page": "Create Job Opening", "question": ""})),
+                      response(text("Checking your access.")),
+                      response(tool("check_access", {"user": "ABSMITH", "component": "HRS_HRPM.HRS_JO_LAUNCH.GBL"})),
+                      response(tool("finish", FINISH, id="f")))
+        agent, s = Agent(llm, TASKS, SecDB()), Session(id="s", oprid="ABSMITH")
+        t = agent.chat(s, "why can't I open Create Job Opening?").troubleshoot
+        self.assertEqual((t["user"], s.investigation.free_sql), ("ABSMITH", False))
+        self.assertNotIn("query", [x["name"] for x in agent.access.tools_for(s.investigation)])
+        for _ in range(3):
+            out = agent.troubleshoot_step(s, t["run_id"])
+            if out["done"]:
+                break
+        self.assertEqual((out["diagnosis"]["verdict"], out["diagnosis"]["can_apply"]), ("missing_access", False))
+        self.assertIn("error", agent.apply_security_fix(s, t["run_id"]))
 
     def test_api(self):
         app = create_app(Agent(access_llm(), TASKS, SecDB()), "k", [])
         c = TestClient(app)
-        h = {"Authorization": f"Bearer {auth.make_token('k', 'PS')}"}
+        h = {"Authorization": f"Bearer {auth.make_token('k', 'PS', roles=['ADMIN'])}"}
         self.assertTrue(c.get("/api/me", headers=h).json()["security"])
-        other = {"Authorization": f"Bearer {auth.make_token('k', 'ABSMITH')}"}
-        self.assertFalse(c.get("/api/me", headers=other).json()["security"])
+        other = {"Authorization": f"Bearer {auth.make_token('k', 'ABSMITH', roles=['USER'])}"}
+        me = c.get("/api/me", headers=other).json()
+        self.assertEqual((me["security"], me["own_access"]), (False, True))
         r = c.post("/api/chat", json={"message": "Why can't ABSMITH access Create Job Opening?"}, headers=h).json()
         sid, run = r["session_id"], r["troubleshoot"]["run_id"]
         for _ in range(4):

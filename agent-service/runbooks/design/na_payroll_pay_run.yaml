@@ -1,0 +1,192 @@
+# DESIGN SKETCH, hand-written: what a payroll runbook needs (pass rules, reviews, `needs`, `when`).
+# Published runbooks (runbooks/*.yaml, drafted by the agent) use the simpler first format in psagent/runbooks.py:
+# checks return the wrong rows (expect: no_rows). This file is not loaded.
+# Made from templates/na_payroll_checklist.xlsx (steps 1-19: one pay run). Month-end (steps 20-25) is a second runbook.
+#
+# Kept out of tasks/: the task loader reads every tasks/*.yaml as a task.
+# A runbook only puts steps in order; each Process / Report / Page task step runs a task
+# (recorded or hand-written, in tasks/). Check queries are read-only and run through the same
+# guarded database access as the troubleshooter.
+#
+# Step types:
+#   check     read-only query + pass rule; on_fail: stop (default) | warn
+#   process   run a task that submits a process, then wait for Success in Process Monitor
+#   review    Claude looks at the data and recommends, with a confidence score
+#   approval  wait for the owner's approval
+#   manual    a person does it and ticks it off
+#   (task)    a Page task: run a task, no process to wait for
+#
+# Every step can have: owner, when (skip unless true), needs (approval step that must be approved first).
+
+id: na_payroll_pay_run
+title: North American Payroll pay run
+summary: One on-cycle pay run, from paysheets to the bank file, with checks, a review and the payroll manager's sign-off before Confirm.
+inputs:
+  run_id:
+    label: Run ID
+    required: true
+    upper: true
+    hint: Pay run ID of the pay calendars, e.g. KUWK-25-19.
+owners:
+  admin: Payroll Administrator
+  manager: Payroll Manager
+  treasury: Treasury
+
+steps:
+# ---- Pre-calculation ----
+- id: calendar_ready
+  check: The pay calendar exists and the previous run of each pay group is confirmed
+  owner: admin
+  sql: |
+    select c.paygroup, c.pay_end_dt,
+           (select max(p.pay_confirm_run) keep (dense_rank last order by p.pay_end_dt)
+              from ps_pay_calendar p
+             where p.company = c.company and p.paygroup = c.paygroup and p.pay_end_dt < c.pay_end_dt
+               and p.pay_off_cycle_cal = 'N') prev_confirmed
+      from ps_pay_calendar c
+     where c.run_id = :run_id
+  pass: rows > 0 and all prev_confirmed = 'Y'
+
+- id: cutoff
+  manual: Time, additional pay and one-time deductions are entered for the period
+  owner: admin
+
+- id: presheet_audit
+  process: { task: run_presheet_audit, process: PAY034, values: { run_id: "{{run_id}}" } }
+  owner: admin
+
+- id: paysheets
+  process: { task: create_paysheets, process: PSPPYBLD, values: { run_id: "{{run_id}}" } }
+  owner: admin
+
+- id: paysheets_created
+  check: Paysheets are created for every pay calendar of the run
+  owner: admin
+  sql: select count(*) n from ps_pay_calendar where run_id = :run_id and pay_sheets_run <> 'Y'
+  pass: n = 0
+
+- id: coverage
+  check: Every active employee of the run's pay groups is on a paysheet
+  owner: admin
+  on_fail: warn          # can be right (new hire after cut-off, unpaid leave): the review explains it
+  sql: |
+    select c.paygroup,
+           (select count(distinct j.emplid) from ps_job j
+             where j.company = c.company and j.paygroup = c.paygroup and j.empl_status in ('A', 'L', 'P', 'W')
+               and j.effdt = (select max(j2.effdt) from ps_job j2
+                               where j2.emplid = j.emplid and j2.empl_rcd = j.empl_rcd and j2.effdt <= c.pay_end_dt)
+               and j.effseq = (select max(j3.effseq) from ps_job j3
+                                where j3.emplid = j.emplid and j3.empl_rcd = j.empl_rcd and j3.effdt = j.effdt)) active,
+           (select count(distinct e.emplid) from ps_pay_earnings e
+             where e.company = c.company and e.paygroup = c.paygroup and e.pay_end_dt = c.pay_end_dt) on_paysheets
+      from ps_pay_calendar c
+     where c.run_id = :run_id
+  pass: all on_paysheets = active
+
+- id: precalc_audit
+  process: { task: run_precalc_audit, process: PAY035, values: { run_id: "{{run_id}}" } }
+  owner: admin
+
+# ---- Calculation ----
+- id: preliminary_calc
+  process: { task: calculate_pay, process: PSPPYRUN, values: { run_id: "{{run_id}}", preliminary: "Y" } }
+  owner: admin
+
+- id: no_calc_errors
+  check: No pay lines in Calculation Error and no payroll error messages
+  owner: admin
+  sql: |
+    select (select count(*) from ps_pay_earnings e join ps_pay_calendar c
+              on e.company = c.company and e.paygroup = c.paygroup and e.pay_end_dt = c.pay_end_dt
+             where c.run_id = :run_id and e.pay_line_status = 'E') error_lines,
+           (select count(*) from ps_pay_message m where m.run_id = :run_id) messages
+      from dual
+  pass: error_lines = 0 and messages = 0
+  on_fail: stop
+  explain: true          # the troubleshooter reads the messages and the employees' data and suggests the fixes
+
+- id: error_report
+  process: { task: run_payroll_error_report, process: PAY011, values: { run_id: "{{run_id}}" } }
+  when: no_calc_errors.failed
+  owner: admin
+
+- id: final_calc
+  process: { task: calculate_pay, process: PSPPYRUN, values: { run_id: "{{run_id}}", preliminary: "N" } }
+  owner: admin
+
+- id: all_calculated
+  check: Every pay line is Calculated
+  owner: admin
+  sql: |
+    select count(*) n from ps_pay_earnings e join ps_pay_calendar c
+        on e.company = c.company and e.paygroup = c.paygroup and e.pay_end_dt = c.pay_end_dt
+     where c.run_id = :run_id and e.pay_line_status not in ('C', 'F')   -- Calculated, or already Confirmed
+  pass: n = 0
+
+- id: payroll_register
+  process: { task: run_payroll_register, process: PAY002, values: { run_id: "{{run_id}}" } }
+  owner: admin
+
+- id: reasonableness
+  review: >
+    Compare gross and net pay of this run with the last confirmed run of each pay group. Explain
+    differences in headcount and totals, and list employees whose gross pay changed by more than 25%
+    with the likely reason (bonus, retro pay, new hire, termination, unpaid leave). Recommend whether
+    the payroll manager should approve.
+  owner: manager
+  data:
+    this_run: |
+      select c.paygroup, c.pay_end_dt, count(*) checks, sum(k.total_gross) gross, sum(k.net_pay) net
+        from ps_pay_calendar c join ps_pay_check k
+          on k.company = c.company and k.paygroup = c.paygroup and k.pay_end_dt = c.pay_end_dt
+       where c.run_id = :run_id
+       group by c.paygroup, c.pay_end_dt
+    last_run: |
+      select c.paygroup, k.pay_end_dt, count(*) checks, sum(k.total_gross) gross, sum(k.net_pay) net
+        from ps_pay_calendar c join ps_pay_check k
+          on k.company = c.company and k.paygroup = c.paygroup
+         and k.pay_end_dt = (select max(p.pay_end_dt) from ps_pay_calendar p
+                              where p.company = c.company and p.paygroup = c.paygroup
+                                and p.pay_end_dt < c.pay_end_dt and p.pay_confirm_run = 'Y')
+       where c.run_id = :run_id
+       group by c.paygroup, k.pay_end_dt
+  also: [coverage, no_calc_errors]
+
+- id: manager_signoff
+  approval: Approve the pay run for confirmation
+  owner: manager
+  show: [coverage, no_calc_errors, reasonableness, payroll_register]
+
+# ---- Confirmation ----
+- id: confirm
+  process: { task: confirm_pay, process: PSPCNFRM, values: { run_id: "{{run_id}}" } }
+  needs: manager_signoff
+  owner: manager
+
+- id: confirmed
+  check: Every pay calendar of the run is confirmed, without confirm errors
+  owner: manager
+  sql: |
+    select count(*) n from ps_pay_calendar
+     where run_id = :run_id and (pay_confirm_run <> 'Y' or confirm_errors = 'Y')
+  pass: n = 0
+
+- id: deduction_register
+  process: { task: run_deduction_register, process: PAY001, values: { run_id: "{{run_id}}" } }
+  owner: admin
+
+- id: deductions_not_taken
+  process: { task: run_deductions_not_taken, process: PAY008, values: { run_id: "{{run_id}}" } }
+  owner: admin
+
+- id: print_checks
+  process: { task: print_pay_checks, process: PAY003, values: { run_id: "{{run_id}}" } }
+  owner: admin
+
+- id: direct_deposit
+  process: { task: create_direct_deposit_file, process: DDP001, values: { run_id: "{{run_id}}" } }
+  owner: admin
+
+- id: bank_file_sent
+  manual: Send the direct deposit file to the bank and record the acknowledgement
+  owner: treasury

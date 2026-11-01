@@ -132,6 +132,8 @@ class Investigation:
     queries: list = field(default_factory=list)   # [{purpose, sql, rows}] shown on the card
     rounds: int = 0
     diagnosis: dict | None = None
+    free_sql: bool = True      # Claude's own read-only queries (PSAGENT_MONITOR and ADMIN only)
+    own: bool = False          # a user's own process: other people's runs are shown without their user and run control
 
 
 class Troubleshooter:
@@ -149,6 +151,20 @@ class Troubleshooter:
             "SELECT PRCSINSTANCE FROM (SELECT PRCSINSTANCE FROM PSPRCSRQST WHERE OPRID = :o AND RUNSTATUS IN ('3','10','8') "
             "ORDER BY PRCSINSTANCE DESC) WHERE ROWNUM = 1", {"o": oprid}, who=oprid, why="latest failed request")
         return str(rows[0][0]) if rows else None
+
+    def owner(self, instance):
+        """Who submitted a request (None when there is no such request)."""
+        _, rows, _ = self.db.query("SELECT OPRID FROM PSPRCSRQST WHERE PRCSINSTANCE = :i", {"i": int(instance)},
+                                   max_rows=1, why="who ran the request")
+        return str(rows[0][0]).strip() if rows else None
+
+    def recent_failures(self, oprid, hours=24, limit=5):
+        """The user's requests that failed recently, newest first: the alert on the welcome screen."""
+        _, rows, _ = self.db.query(
+            "SELECT PRCSINSTANCE, PRCSNAME, RUNSTATUS FROM PSPRCSRQST WHERE OPRID = :o AND RUNSTATUS IN ('3','10','8') "
+            "AND RQSTDTTM > SYSDATE - :h / 24 ORDER BY PRCSINSTANCE DESC",
+            {"o": oprid, "h": hours}, max_rows=limit, who=oprid, why="recent failed requests")
+        return [{"instance": str(i), "name": str(n or "").strip(), "status": RUNSTATUS.get(str(st), str(st))} for i, n, st in rows]
 
     def log_files(self, instance):
         """Posted output files of the request, as same-origin paths the widget can fetch in the user's session."""
@@ -185,7 +201,7 @@ class Troubleshooter:
             return self._give_up(inv, "The investigation took too many steps without a clear answer.")
         inv.rounds += 1
         try:
-            resp = self.llm.create(self.system, inv.messages, self.tools, effort=self.effort)
+            resp = self.llm.create(self.system, inv.messages, self.tools_for(inv), effort=self.effort)
         except LLMError as e:
             log.warning("troubleshoot step failed: %s", e)
             return {"steps": [], "done": True, "diagnosis": None, "error": "The AI service is unavailable right now."}
@@ -207,6 +223,10 @@ class Troubleshooter:
                             **({"is_error": True} if err else {})})
         inv.messages.append({"role": "user", "content": results})
         return {"steps": steps, "done": bool(inv.diagnosis), "diagnosis": inv.diagnosis}
+
+    def tools_for(self, inv):
+        """The investigator's tools; without its own read-only queries for users who are not PSAGENT_MONITOR or ADMIN."""
+        return self.tools if inv.free_sql else [t for t in self.tools if t["name"] != "query"]
 
     def _opening(self, inv, logs):
         parts = [f"Process instance {inv.instance} failed. Find out why and how to fix it."]
@@ -244,7 +264,10 @@ class Troubleshooter:
         try:
             if name == "get_process":
                 n = str(args.get("instance") or inv.instance)
-                return f"Read process {n}: status, message log, earlier runs", self._process(n, oprid), False
+                own = getattr(inv, "own", False)
+                if own and n != inv.instance:
+                    return f"Process {n} not read", "error: only the process under investigation can be read", True
+                return f"Read process {n}: status, message log, earlier runs", self._process(n, oprid, own), False
             if name == "get_ae_program":
                 p = _ident(args.get("program"))
                 return f"Read Application Engine program {p}", self._ae_program(p, oprid), False
@@ -264,6 +287,8 @@ class Troubleshooter:
                 r = _ident(args.get("record"))
                 return f"Read record definition {r}", self._record(r, oprid), False
             if name == "query":
+                if not inv.free_sql:
+                    return "Query refused", "error: queries are only for PSAGENT_MONITOR and PSAGENT_ADMIN users", True
                 purpose = str(args.get("purpose") or "query")[:200]
                 cols, rows, cut = self.db.query(args.get("sql"), who=oprid, why=purpose)
                 inv.queries.append({"purpose": purpose, "sql": str(args.get("sql"))[:4000], "rows": len(rows)})
@@ -277,7 +302,7 @@ class Troubleshooter:
         cols, rows, _ = self.db.query(sql, params, max_rows=max_rows, who=oprid, why=why, **kw)
         return [dict(zip(cols, r)) for r in rows]
 
-    def _process(self, n, oprid):
+    def _process(self, n, oprid, own=False):
         if not n.isdigit():
             return "error: the instance must be a number"
         i = int(n)
@@ -321,6 +346,8 @@ class Troubleshooter:
                           {"n": rq[0]["PRCSNAME"], "i": i}, oprid, "earlier runs")
         for e in earlier + overlap:
             e["RUNSTATUS"] = f"{e['RUNSTATUS']} ({RUNSTATUS.get(str(e['RUNSTATUS']), '?')})"
+            if own and str(e.get("OPRID") or "").strip() != str(r.get("OPRID") or "").strip():
+                e["OPRID"], e["RUNCNTLID"] = "(another user)", ""
         for p in parms:   # the password parameter is never shown
             for k in p:
                 p[k] = re.sub(r"(-CP\s+)\S+", r"\1***", str(p[k] or ""))

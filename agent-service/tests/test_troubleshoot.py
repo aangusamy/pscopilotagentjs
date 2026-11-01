@@ -40,8 +40,12 @@ class FakeDB:
         s = sql.upper()
         if "NVL(ENDDTTM, SYSDATE) >" in s:     # runs of the same process at the same time
             return ["PRCSINSTANCE", "RUNSTATUS", "RUNCNTLID", "OPRID", "BEGINDTTM", "ENDDTTM"], self.overlap, False
+        if "RQSTDTTM > SYSDATE" in s:          # the welcome screen's alert
+            return ["PRCSINSTANCE", "PRCSNAME", "RUNSTATUS"], [[557060, "AEMINITEST", "10"], [557041, "PRCSYSPURGE", "3"]], False
         if "FROM PSPRCSRQST WHERE OPRID" in s:
             return ["PRCSINSTANCE"], [[557060]], False
+        if s.startswith("SELECT OPRID FROM PSPRCSRQST WHERE PRCSINSTANCE"):   # who ran it
+            return ["OPRID"], ([["PS"]] if params["i"] in (557060, 557046) else [["ABSMITH"]] if params["i"] == 557099 else []), False
         if "FROM PS_CDM_LIST" in s:
             return (["URL", "CONTENTID", "FILENAME", "FILE_SIZE"],
                     [["http://ps:8000/psreports/ps", 85515, "AE_AEMINITEST_557060.stdout", 512],
@@ -130,6 +134,7 @@ class TroubleshootTest(unittest.TestCase):
     def test_from_question_to_diagnosis(self):
         db, llm = FakeDB(), investigating_llm()
         agent, s = Agent(llm, TASKS, db), Session(id="s", oprid="PS")
+        s.can_monitor = True                                          # PSAGENT_MONITOR: also its own queries
         r = agent.chat(s, "my process failed, can you check?")
         t = r.troubleshoot
         self.assertEqual(t["instance"], "557060")                     # the user's latest failed request
@@ -158,6 +163,30 @@ class TroubleshootTest(unittest.TestCase):
         self.assertIn("[troubleshoot result] process 557060", s.messages[-1]["content"])   # follow-ups know it
         self.assertIsNone(s.investigation)
         self.assertTrue(all(q[0].upper().startswith(("SELECT", "WITH")) for q in db.queries))
+
+    def test_users_look_into_their_own_processes(self):
+        """PSAGENT_USER: only their own requests, without Claude's own queries; other people's overlapping runs
+        without their user and run control. PSAGENT_MONITOR: anyone's, with queries."""
+        llm = FakeLLM(response(tool("troubleshoot_process", {"instance": "557099", "question": ""})), response(text("Not yours.")),
+                      response(tool("troubleshoot_process", {"instance": "557060", "question": ""}, id="b")), response(text("On it.")),
+                      response(tool("query", {"sql": "SELECT EMPLID FROM PS_JOB", "purpose": "peek"}),
+                               tool("get_process", {"instance": "557099"}, id="g")))
+        db = FakeDB()
+        db.overlap = [[557059, "9", "AELHSB46", "ABSMITH", "2026-10-23 20:41:04", "2026-10-23 20:44:21"]]
+        agent, s = Agent(llm, TASKS, db), Session(id="s", oprid="PS")
+        self.assertIsNone(agent.chat(s, "why did 557099 fail").troubleshoot)
+        self.assertIn("not one of this user's", json.dumps(llm.calls[1][-1]["content"]))
+        t = agent.chat(s, "and 557060?").troubleshoot
+        self.assertEqual((s.investigation.free_sql, s.investigation.own), (False, True))
+        self.assertNotIn("query", [x["name"] for x in agent.troubleshooter.tools_for(s.investigation)])
+        out = agent.troubleshoot_step(s, t["run_id"])
+        self.assertEqual(out["steps"], ["Query refused", "Process 557099 not read"])
+        p = json.loads(agent.troubleshooter._process("557060", "PS", own=True))
+        self.assertEqual((p["overlapping_runs"][0]["OPRID"], p["overlapping_runs"][0]["RUNCNTLID"]), ("(another user)", ""))
+        m = Session(id="m", oprid="OPS1", can_monitor=True)
+        llm.responses += [response(tool("troubleshoot_process", {"instance": "557099", "question": ""}, id="c")), response(text("On it."))]
+        self.assertEqual(agent.chat(m, "why did 557099 fail").troubleshoot["instance"], "557099")
+        self.assertEqual((m.investigation.free_sql, m.investigation.own), (True, False))
 
     def test_delivered_code_and_overlapping_runs(self):
         db = FakeDB()
@@ -221,6 +250,28 @@ class TroubleshootTest(unittest.TestCase):
         self.assertEqual(out["diagnosis"]["category"], "code")
         other = {"Authorization": f"Bearer {auth.make_token('k', 'X')}"}
         self.assertEqual(c.post("/api/troubleshoot/step", json={"session_id": sid, "run_id": run}, headers=other).status_code, 404)
+
+    def test_recent_failures_on_welcome(self):
+        db = FakeDB()
+        c = TestClient(create_app(Agent(investigating_llm(), TASKS, db), "k", []))
+        me = c.get("/api/me", headers={"Authorization": f"Bearer {auth.make_token('k', 'PS')}"}).json()
+        self.assertEqual(me["failed"], [{"instance": "557060", "name": "AEMINITEST", "status": "No Success"},
+                                        {"instance": "557041", "name": "PRCSYSPURGE", "status": "Error"}])
+        self.assertEqual(db.queries[-1][1], {"o": "PS", "h": 24})                  # only the user's own requests
+        self.assertTrue(all(t["component"] for t in me["tasks"]))                   # for "fits this page"
+
+    def test_welcome_without_database(self):
+        c = TestClient(create_app(Agent(investigating_llm(), TASKS), "k", []))
+        me = c.get("/api/me", headers={"Authorization": f"Bearer {auth.make_token('k', 'PS')}"}).json()
+        self.assertEqual((me["troubleshoot"], me["failed"]), (False, []))
+
+    def test_welcome_survives_database_errors(self):
+        class DownDB(FakeDB):
+            def query(self, *a, **kw):
+                raise QueryError("ORA-12541: TNS:no listener")
+        c = TestClient(create_app(Agent(investigating_llm(), TASKS, DownDB()), "k", []))
+        r = c.get("/api/me", headers={"Authorization": f"Bearer {auth.make_token('k', 'PS')}"})
+        self.assertEqual((r.status_code, r.json()["failed"]), (200, []))
 
 
 if __name__ == "__main__":

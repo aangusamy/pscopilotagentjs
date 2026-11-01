@@ -390,7 +390,8 @@ SECRET = "k"
 
 
 def hdr(oprid):
-    return {"Authorization": f"Bearer {auth.make_token(SECRET, oprid)}"}
+    """TEACHER holds PSAGENT_ADMIN; anyone else PSAGENT_USER."""
+    return {"Authorization": f"Bearer {auth.make_token(SECRET, oprid, roles=['ADMIN'] if oprid == 'TEACHER' else ['USER'])}"}
 
 
 class RecordingApiTest(unittest.TestCase):
@@ -398,7 +399,7 @@ class RecordingApiTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.llm = FakeLLM(drafts=[claude_draft()])
         self.agent = Agent(self.llm, load_tasks(TASKS_DIR))
-        self.c = TestClient(create_app(self.agent, SECRET, [], teachers={"TEACHER"}, tasks_dir=self.tmp.name))
+        self.c = TestClient(create_app(self.agent, SECRET, [], tasks_dir=self.tmp.name))
 
     def tearDown(self):
         self.tmp.cleanup()

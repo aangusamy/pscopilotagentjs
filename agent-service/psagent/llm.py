@@ -2,6 +2,9 @@
 
 import json
 import logging
+import time
+
+from . import audit
 
 log = logging.getLogger("psagent")
 
@@ -28,6 +31,7 @@ class ClaudeLLM:
         caching = ({"cache_control": {"type": "ephemeral"}} if cache == "conversation" else {})
         if cache == "prefix":
             system = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        t0 = time.monotonic()
         try:
             resp = self.client.beta.messages.create(
                 model=self.model,
@@ -43,17 +47,22 @@ class ClaudeLLM:
                 fallbacks="default",
             )
         except a.RateLimitError as e:
+            audit.claude(self.model, None, time.monotonic() - t0, f"rate limited: {e.message}")
             raise LLMError(f"rate limited: {e.message}") from e
         except a.APIStatusError as e:
+            audit.claude(self.model, None, time.monotonic() - t0, f"API error {e.status_code}: {e.message}")
             raise LLMError(f"API error {e.status_code}: {e.message}") from e
         except a.APIConnectionError as e:
+            audit.claude(self.model, None, time.monotonic() - t0, f"connection error: {e}")
             raise LLMError(f"connection error: {e}") from e
         log.debug("claude %s stop=%s usage=%s", resp._request_id, resp.stop_reason, resp.usage)
+        audit.claude(self.model, resp.usage, time.monotonic() - t0)
         return resp
 
     def structured(self, system, prompt, schema):
         """One-shot JSON answer matching `schema` (used to draft recorded tasks)."""
         a = self._anthropic
+        t0 = time.monotonic()
         try:
             resp = self.client.beta.messages.create(
                 model=self.model,
@@ -65,9 +74,12 @@ class ClaudeLLM:
                 fallbacks="default",
             )
         except a.APIStatusError as e:
+            audit.claude(self.model, None, time.monotonic() - t0, f"API error {e.status_code}: {e.message}")
             raise LLMError(f"API error {e.status_code}: {e.message}") from e
         except a.APIConnectionError as e:
+            audit.claude(self.model, None, time.monotonic() - t0, f"connection error: {e}")
             raise LLMError(f"connection error: {e}") from e
+        audit.claude(self.model, resp.usage, time.monotonic() - t0)
         if resp.stop_reason in ("refusal", "max_tokens"):
             raise LLMError(f"no usable answer (stop_reason={resp.stop_reason})")
         text = next((b.text for b in resp.content if b.type == "text"), "")

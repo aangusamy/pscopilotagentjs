@@ -178,22 +178,305 @@ For adding a role, adding a permission list to a role, authorizing a page in a
 permission list or unlocking an account, *Apply* starts a live run that makes
 exactly that change on screen and stops for your approval before Save.
 
-Who may use it (both asking and Apply):
+Who may use it: anyone checks their own access (*"why can't I open Job Data?"*, without Claude's own
+queries and without Apply); checking another user's access, and Apply, need **PSAGENT_ADMIN**.
 
-```
-PSAGENT_SECURITY_ROLES=Security Administrator,PeopleSoft Administrator   # default
-PSAGENT_SECURITY_ADMINS=SECADMIN1,SECADMIN2                              # extra OPRIDs
-```
+## Absence approval reviews
+
+*"Show my pending absence approvals"* (also the *Review absence approvals*
+tile) lists the absence requests waiting for you (Absence Management approvals,
+`EOAWPRCS_ID = AbsenceManagement`), with a **Review with AI** button on each.
+The review reads, from the same read-only database:
+
+1. the request (`GP_ABSSS_V_XREF`, `GP_ABS_EVENT`): absence type, dates,
+   duration, and whether it changes an earlier absence;
+2. the approval status (`EOAW_STEPINST` / `EOAW_USERINST`): who already
+   approved, who it is waiting for, which step;
+3. the employee's job on the first day (active, department, manager);
+4. the balance: each entitlement of the absence type, its `<entitlement>_BAL`
+   accumulator from the last calendar before the absence, minus approved and
+   in-approval absences not yet deducted; and what the type does when the
+   balance is short (`NEG_BAL_OPTN`);
+5. the employee's other absences: overlaps (duplicates) and the last 12 months;
+6. team coverage: who else under the same manager (else department) is off on
+   the same days.
+
+The card shows the **approval status**, the **recommendation** (approve, send
+back, deny, or needs your review), a **confidence score** from 0 to 100 with its
+reason, every check (✓ / ! / ✕), a suggested comment to send, and what could not
+be checked. An "approve" despite a failed check is capped at 50. Nothing is
+approved by the agent: *Open Approvals in PeopleSoft* takes the approver to the
+Fluid Approvals page to decide. A review takes about 30-45 seconds.
+
+Approvers can review the requests waiting for them. **PSAGENT_ADMIN** users can
+also list and review everyone's (*"show everyone's pending absence requests"*).
+
+## Runbooks from a checklist
+
+A runbook is a checklist the agent runs in order: **checks** (read-only
+queries), **tasks** and **processes** (tasks from the catalog), **approvals**
+and **manual** steps. Admins (`PSAGENT_ADMIN`) attach the checklist they
+already have (Excel `.xlsx`, `.csv` or PDF) and ask *"build a runbook from this
+checklist"*:
+
+1. Claude maps every row to a step: a task and its values, or a check with its
+   query, or an approval or manual step; values that change each run become
+   inputs (the checklist's example is the default).
+2. The service checks the draft: tasks and fields exist, no passwords in it,
+   inputs are defined, check queries are single SELECTs and are **test-run now,
+   read-only** with the inputs' defaults. Problems go back to Claude to fix.
+3. The review card shows each step, what each check returns today, what a task
+   will ask when it runs, and Claude's questions. Changes: say them in the chat.
+4. **Publish** saves `runbooks/<id>.yaml`. Nothing runs at this point.
+
+Running one: anyone can say *"run Set up a test user"* or click its **Run:**
+tile on the welcome screen. A start card asks for the inputs (with their
+defaults), then the steps run in order and the chat shows each one:
+
+| Step | What happens |
+|---|---|
+| check | The service runs its read-only query; a failure stops the run (unless the step is "warn only") |
+| task | The task's confirm card: the runbook's values, anything still needed, and the password (typed there, never sent to the service). Then it runs on screen |
+| process | Like a task, then the service follows the request in `PSPRCSRQST` (by its instance, or the user's first request after the step started) until it ends: Success goes on, Error / Not Successful stops the run and offers *Why did process N fail?* |
+| approval | Waits for Approve or Reject (first version: whoever runs it approves; the approver is logged) |
+| manual | Waits until the person ticks it off |
+
+The run stops at the first problem or at **Stop the run**. Claude is not called
+between steps. Every run is logged to `runbooks/runs/<id>-<run>.json` (who,
+inputs, each step's result).
+
+`runbooks/templates/` has the checklist template (`runbook_checklist_template.xlsx`),
+a 5-step test checklist that uses tasks on the demo system
+(`test_user_setup_checklist.xlsx`) and a North American Payroll pay run and
+month-end checklist. `runbooks/design/` has a hand-written sketch of the
+payroll runbook. Published runbooks go to `PSAGENT_RUNBOOKS_DIR` (default
+`runbooks/`).
+
+## The watcher: watchdogs that run on their own
+
+Users with the PeopleSoft role `PSAGENT_MONITOR` (or `PSAGENT_ADMIN`) set up
+**watchdogs**, saved in **watch plans** (`monitors/<plan>.yaml`, one file per plan).
+
+**From the template** (the usual way): **＋ Features › Watch jobs** in the chat's
+bottom bar shows the steps, with **Download the template** and **Upload the filled
+template** buttons. The template (`runbooks/templates/watch_plan_template.xlsx`,
+also served by the service) has one row per watchdog, with drop-downs:
+
+| Watchdog | Process | Watch for | Schedule | Time | Stuck after | Run by | Rule / Query (data checks) | Email | Status |
+|---|---|---|---|---|---|---|---|---|---|
+
+It comes with examples: AEMINITEST and XRFWIN failures, XRFWIN stuck, and
+PORTAL_CSS must succeed by 07:00. A second sheet explains every column. Claude
+reads the uploaded sheet (`draft_watch_plan`), the service checks every row
+against PeopleSoft (the process exists, the query is allowed) and shows an
+**overview**: each watchdog with what it would have caught. **Confirm and
+schedule** saves the plan and the watchdogs start.
+
+**In the chat**: *"watch AEMINITEST overnight and email ops@example.com"* drafts
+one watchdog (`draft_monitor`), saved as a plan of its own.
+
+| Kind (Watch for) | What it watches | Every alert has |
+|---|---|---|
+| failures (Failure) | Requests ending in Error or No Success; optionally some processes (`%` = any characters) or some users' requests | The troubleshooter's analysis: message log, the posted log files (as the service user), code and data |
+| stuck (Stuck) | Requests still Queued, Pending or Initiated N minutes after their run time | The process servers' status and the waiting requests |
+| deadline (Must succeed by) | At the time of day: the process must have ended in Success in the 24 hours before | What happened instead: never ran, failed (investigated), still waiting (servers), running late; the latest runs |
+| check (Data check) | A read-only SELECT returning the wrong rows, every N minutes or at set times | The rows; cleared when the check passes again |
+
+**Managing them**: the bottom bar shows **◉ N watchdogs** (red when there are
+alerts). It opens the watchdog list, plan by plan:
+- per watchdog: **Pause** / **Resume**, **Run now** (a test, whatever the schedule), **Delete**;
+- per plan: **Download as Excel**, **Pause all**, **Delete plan**;
+- **Stop all watching**: nothing runs until it is started again, even after a restart.
+
+Deleting and stopping ask first. To change a plan, download it as Excel, edit
+it and upload it again: the overview says what is added, removed and changed
+before you confirm. Every change is kept in the history with who made it.
+
+The watcher runs every minute inside the service, with nobody signed in. Each
+monitor that is due costs one read-only query and no Claude; only a new failure
+is investigated (`PSAGENT_WATCH_MAX_INVESTIGATIONS` per day). The same process,
+run control and user failing again within 12 hours is counted on the open
+alert, not investigated again. After the service was down, failures older than
+24 hours are not alerted.
+
+Alerts are emailed (`PSAGENT_SMTP_*`) to the monitor's recipients: what
+happened, the **analysis**, the **action needed**, and links to open the alert
+in the agent and to Process Monitor. A daily summary goes to
+`PSAGENT_ALERT_TO`. In the panel, monitor users see *"N alerts from the watcher"*
+on the welcome screen, can ask *"what happened overnight?"*, *"what is being
+watched?"* or *"pause the stuck monitor"*. Nothing is rerun or changed.
+
+Log files overnight: the widget normally reads them in the user's session. The
+watcher signs in as `PSAGENT_SVC_USER` (a PeopleSoft user with only Process
+Monitor and Report Manager access) the way a browser does and downloads the same
+files *View Log/Trace* opens. Without it, the message log is used.
+
+Kept in `monitors/`: the plans, `incidents/<id>.json` (each alert) and
+`state.json` (when each watchdog last ran, what it has seen, stopped or not, the history).
+
+## Regression tests: replay the tasks after a patch
+
+On a **test environment** (`PSAGENT_TEST_ENV=on`; the cases really save data),
+admins open **＋ Features › Regression tests**:
+
+- **Smoke test**: every task once with its defaults, no setup. A required field
+  without a default gets `RT{{n}}` when it is the key of a record the task adds
+  (a new user ID), or "Regression test {{n}}" for free text. Other tasks are
+  listed as needing a test case.
+- **Test plan template**: generated from your tasks. It has a *Suite* sheet (name,
+  run unattended at, run after a patch, who gets the report), then one sheet per
+  task with that task's fields as columns. One row is one test case: the values
+  and the expected result (*Saved*, *Process submitted*, or *Error* with part of
+  the expected message, for negative tests). `{{n}}` becomes a new number on every
+  run. Upload it; Claude reads it (`draft_test_suite`), every case is checked
+  against its task, and **Save test suite** writes `regression/<suite>.yaml`. A
+  saved suite downloads as the same template, to edit and upload again.
+- **Run here**: the password fields are typed once, then each case runs in the
+  workspace, one after another:
+
+| Result | When |
+|---|---|
+| Passed | The expected result: Saved / Process submitted, or the expected error message |
+| Passed with changes | A recorded step no longer matched the page; the case was finished live (Save approved automatically, test environments only) and reached the expected result. The report lists what changed |
+| Failed | Anything else: the step and PeopleSoft's message |
+
+- **Report**: compared with the suite's last run (*failing since the last run*,
+  *fixed*), kept in `regression/runs/` and downloadable as Excel.
+- **Run unattended**: a headless browser on the agent service signs in as
+  `PSAGENT_TEST_USER` and runs the suite with the **same widget code**
+  (`PSAgent.runSuite`). If Branding has an older `psagent.js`, the service's copy
+  is used. A suite also runs on its own at its time of day (`run_at`), and after
+  a patch when it is marked *after_patch*: the runner notices a change in
+  `PS_MAINTENANCE_LOG` and `PSRELEASE`. The report is emailed (`PSAGENT_SMTP_*`)
+  to the suite's recipients, or to `PSAGENT_ALERT_TO`. Needs `pip install
+  playwright` and `python -m playwright install chromium`.
+
+## Excel to CI: load spreadsheet rows through Component Interfaces
+
+**＋ Features › Load with a CI** does what ExcelToCI does, without the macro workbook:
+
+1. **Pick a CI.** The list shows the CIs the user's permission lists allow
+   (`PSBCDEFN` and `PSAUTHBUSCOMP` through `PS_USERCLASS_VW`, as SOAPTOCI decides it).
+2. **Choose the columns, download the template.** The browser asks PeopleSoft for
+   the CI's shape (`GetCIShape__CompIntfc__<CI>` posted to `WEBLIB_SOAPTOCI`, like
+   ExcelToCI's *New Template*). The service adds metadata from `PSBCITEM`,
+   `PSRECFIELD` (prompt table, translate, Yes/No and required edits) and `PSXLATITEM`,
+   keeps the shape (`ci_loads/shapes/`), and builds the `.xlsx`:
+   - the CI's sheet: *Action* (Create / Update), the keys, the chosen properties;
+   - one sheet per collection, linked by the parent keys, with *Row action*
+     (Change / Add / Delete) for updates;
+   - a Help sheet.
+3. **Upload it** (on the card, or drop it in the chat). The service checks every row:
+   - required fields and keys, lengths, numbers, dates and times;
+   - translate values (code or label);
+   - prompt table values, against the prompt table's key of the same name, else its
+     last key that isn't EFFDT/EFFSEQ; dynamic prompts (`%EDITTABLE`) aren't checked;
+   - the key existing for Update and not for Create, against the CI's level 0 table,
+     else its search record unless that is a dynamic view;
+   - duplicates, and collection rows without a parent.
+4. **Load.** For each ready row the service builds the SOAP request
+   (`Create__CompIntfc__<CI>` or `Updatedata__…`, collections as repeated child
+   elements, `CINodeAction="INSERT|DELETE"` for added or deleted collection rows,
+   one row per request). **The browser posts it to `WEBLIB_SOAPTOCI` in the user's
+   own session** and returns the answer: `notification 1` means saved, and the CI's
+   messages are kept. Pause, Stop and Resume work; loads are kept in `ci_loads/loads/`.
+5. **Results:** a results Excel, the rows to fix (the template with the rows that
+   weren't saved), and *Explain the errors* (one chat turn).
+
+Passwords are never in the file: a CI password property is typed on the load card and
+filled in by the browser. Every check and row is in the audit log. Users need what
+ExcelToCI users need: `WEBLIB_SOAPTOCI` in a permission list's Web Libraries (for
+example via `PTPT1200` or `HCSPWEBLIB`), and the CI's methods on the Component
+Interfaces tab. It needs the read-only database (`PSAGENT_DB_*`) for the checks.
+
+## Ask the data: answers from curated PS Queries
+
+**＋ Features › Ask the data**, or just a question in the chat (*"how many new hires this year by department?"*).
+Answers come only from PS Queries named `AI_...` (`PSAGENT_QUERY_PREFIX`), written in Query Manager. The agent never
+writes SQL for them.
+
+1. **Which queries:** public AI_ queries and the user's own private ones, whose every record is in the user's query
+   trees: `PS_USERCLASS_VW` → `PS_SCRTY_ACC_GRP` (accessible access groups) → the current `PSTREEDEFN` /
+   `PSTREENODE` → records; `PSQRYRECORD` must have no record outside them. Columns from `PSQRYFIELD`, prompts from
+   `PSQRYBIND` (translate values, prompt tables). Kept 10 minutes per user. The run link does not check query trees
+   (verified on PT 8.61), so the service builds links only for these.
+2. **Claude picks one** (`find_queries`) and its prompt values (`run_query`). The service checks them: dates sent as
+   `YYYY-MM-DD` (PeopleSoft reads other formats as no rows, silently), numbers, translate values, prompt-table values
+   (read-only), Uppercase fields; every prompt goes in the link, an optional one empty. Prompts need names (`BIND1`:
+   Query Manager gives them); a query with `:1` prompts is listed but not run.
+3. **The browser runs it** in the user's session: `/psc/<site>/<portal>/<node>/q/?ICAction=ICQryNameExcelURL=PUBLIC.<name>&BIND1=...`
+   (`PRIVATE.` for a private query). PeopleSoft applies the user's row security. The file goes to
+   `POST /api/query/result`; the service reads it (row 1: title and count, row 2: headings; dates from Excel serial
+   numbers), keeps the rows in memory for the conversation, and sends the card the first 200.
+4. **Claude gets totals only** (`queries.summary`): the row count; per column, counts of repeating values, sums,
+   date ranges. Columns that tell rows apart (names, IDs) give only their number of distinct values; sensitive columns
+   (`db.masked`: pay, national IDs, birth dates, bank details) nothing. `summarize_result` (`queries.aggregate`)
+   breaks it down under the same rules, drawn as a chart.
+
+The audit log records each run (`query.run`: query, prompt values, row count), never the results. Needs the read-only
+database (`PSAGENT_DB_*`); `PSAGENT_QUERIES=off` turns it off.
+
+## Admin dashboard and audit log
+
+Everything the agent does is recorded in `audit/psagent.db` (SQLite, next to the
+service; `PSAGENT_AUDIT_DIR`):
+
+| Recorded | With |
+|---|---|
+| Every Claude call | The feature it was for, tokens (input, output, cache write, cache read), estimated cost, seconds |
+| Every database query | Who and why, the SQL, rows, milliseconds, any error |
+| Every task run | The confirmed values (never passwords: they never reach the service), the result and PeopleSoft's message |
+| Feature events | Investigations, access checks, absence reviews, security fixes, recordings, runbooks published and run, watch plans and watchdog changes, alerts, test suites and regression runs, sign-ins |
+
+**What people type in the chat and Claude's answers are not kept**, only that a
+message was sent (or a document's name). Events older than `PSAGENT_AUDIT_DAYS`
+(default 90) are removed every day. If the file cannot be written, the agent
+carries on and logs a warning once.
+
+Users with the PeopleSoft role **PSAGENT_AUDITOR** open **＋ Features › Audit**
+(or the *Audit dashboard* card on the welcome screen). It opens on the left,
+beside the chat:
+
+- **Overview**: people, conversations, task runs, Claude cost against the period
+  before, failures, watcher alerts, regression runs; the month's spend against
+  `PSAGENT_BUDGET`; cost per day; cost by feature; top users.
+- **Usage & cost**: by user or by feature, with Excel download. Click a row for
+  that user's or feature's audit log.
+- **Audit log**: filters for user, feature, kind (actions, database queries,
+  Claude calls), outcome, dates and search; click a row for the SQL or the values;
+  Excel download (up to 1,000 rows).
+- **Failures** and **Watcher & tests**.
+
+In the chat, auditors can ask about it (*"who spent the most this week?"*): the
+`audit_report` tool answers from the same data. Others get no audit data.
+
+Cost is estimated from the tokens at list prices (Opus 5.5: $4 input, $20 output,
+$5 cache write, $0.20 cache read per million tokens); set `PSAGENT_PRICES` if
+yours differ. With SMTP set up, `PSAGENT_BUDGET` sends an email at 80% and 100%
+of the monthly budget, and a usage summary goes out every week
+(`PSAGENT_AUDIT_WEEKLY`, default Monday 08:00) to `PSAGENT_AUDIT_TO` (or
+`PSAGENT_ALERT_TO`).
 
 ## The chat panel
 
-The widget is a panel docked on the right, with the workspace beside it:
+The agent is called **Pia** (PeopleSoft Intelligent Assistant); the name is
+`NAME` at the top of `psagent.js` and the first line of `SYSTEM_PROMPT` in
+`psagent/agent.py`. The widget is a panel docked on the right, with the
+workspace beside it:
 
 * the agent's state is always visible (ready, thinking, working, waiting for
   you), on its avatar and in the header;
 * an activity feed shows each step as it happens, with a tick or the error;
-* the welcome screen lists your recent questions, the tasks it knows, and
-  "Explain this page" or "Help with this error" for the page you are on;
+* the welcome screen greets you by time of day and shows:
+  * an alert when processes of yours failed in the last 24 hours (with the
+    troubleshooting database configured), one button per process to find out why;
+  * cards with an icon per kind (task, troubleshoot, access check, explain this
+    page, help with this error); the ones for the page you are on come first,
+    marked *This page*;
+  * *What's new*, once, until dismissed or the first message (`NEWS` in
+    `psagent.js`; change its `id` to announce something new);
+* while the welcome screen is up, the message box cycles through examples of
+  what you can ask;
 * the clock button (or the Up arrow in an empty box) brings back recent
   questions; the arrows button makes the panel wider; **Ctrl+/** opens and
   closes it.
@@ -207,6 +490,29 @@ cp .env.example .env                      # then fill in the API key, secret and
 uvicorn --factory psagent.server:app_from_env --host 0.0.0.0 --port 8080 --workers 1
 ```
 
+### On a Linux server (e.g. the PeopleSoft VirtualBox image)
+
+Use the system `python3` (3.10 or newer) in its own virtual environment, not
+the `python` that comes with PeopleTools (`$PS_HOME/python`): it doesn't have
+the service's packages. Start uvicorn with `python -m uvicorn`; `python uvicorn`
+looks for a script file named `uvicorn` and fails with *can't open file*.
+
+```bash
+cd ~/pscopilotagentjs/agent-service       # wherever the folder was copied
+python3 --version                         # 3.10+; else e.g. sudo dnf install python3.11
+python3 -m venv .venv                     # once
+source .venv/bin/activate
+pip install -r requirements.txt           # once
+cp .env.example .env                      # once, then fill it in
+python -m uvicorn --factory psagent.server:app_from_env --host 0.0.0.0 --port 8080 --workers 1
+```
+
+Next time, only `cd`, `source .venv/bin/activate` and the last line are needed.
+If the browser can't reach port 8080, open it:
+`sudo firewall-cmd --add-port=8080/tcp --permanent && sudo firewall-cmd --reload`.
+`PSAGENT_ALLOWED_ORIGINS` must match the PeopleSoft URL in the browser
+(e.g. `http://vbox:8000`).
+
 Settings are read from `agent-service/.env` (see `.env.example`); real
 environment variables take precedence.
 
@@ -215,8 +521,15 @@ environment variables take precedence.
 | `PSAGENT_MODEL` | `claude-opus-5-5` | Claude model |
 | `PSAGENT_EFFORT` | `low` | `low`…`max`. Low keeps chat replies fast. Raise it if extraction misses things. |
 | `PSAGENT_TASKS_DIR` | `./tasks` | Where task YAML files live. Recorded tasks are saved here too, so it must be writable. |
-| `PSAGENT_TEACHERS` | unset | OPRIDs allowed to record tasks, comma separated (`*` = everyone). Unset = recording off. |
-| `PSAGENT_DEV_OPRID` | unset | Local testing only: requests without a valid token run as this OPRID |
+| `PSAGENT_TEACHERS` / `_MONITORS` / `_AUDITORS` | unset | Development only (`PSAGENT_DEV_OPRID`): OPRIDs given ADMIN / MONITOR / AUDITOR rights (`*` = everyone). Ignored in production, with a warning: use the roles |
+| `PSAGENT_DEV_OPRID` | unset | Local testing only: requests without a valid token run as this OPRID (roles: `PSAGENT_DEV_ROLES`) |
+| `PSAGENT_MONITORS_DIR` | `./monitors` | Monitors, their alerts and the watcher's state. `PSAGENT_WATCH=off` turns the watcher off. |
+| `PSAGENT_PS_URL` | unset | PeopleSoft address users sign in on (`…/psp/ps/EMPLOYEE/HRMS/`): links in alert emails, sign-in of the service user |
+| `PSAGENT_SVC_USER` / `_PASSWORD` | unset | Service user that downloads posted log files for overnight investigations |
+| `PSAGENT_SMTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_FROM` | unset | Alert emails (587 = STARTTLS, 465 = SSL) |
+| `PSAGENT_TEST_ENV` | unset | `on` turns regression tests on (test environments only) |
+| `PSAGENT_TEST_USER` / `_PASSWORD` / `PSAGENT_TEST_SECRETS` | unset | Unattended regression runs: the user they sign in as, and values for password fields (`password=...`) |
+| `PSAGENT_ALERT_TO` | unset | Default recipients and the daily summary (`PSAGENT_WATCH_SUMMARY`, default `07:00`) |
 
 Sessions are held in memory, so run **one worker**. Move `SessionStore` to Redis
 before scaling out.
@@ -239,14 +552,36 @@ The widget needs no App Designer changes to delivered objects.
 2. **iScript** (App Designer). Create a derived record `WEBLIB_PSAGENT` with
    field `ISCRIPT1` and paste `../psagent_iscript` into its FieldFormula. Set
    `&AGENT_URL` (e.g. `/psagent`) and `&AGENT_SECRET`, the same value as
-   `PSAGENT_SHARED_SECRET`. It returns a day-scoped token
-   `OPRID.YYYYMMDD.HashSHA256(secret|OPRID|YYYYMMDD)`, and the secret never
-   reaches the browser.
+   `PSAGENT_SHARED_SECRET`. It returns a day-scoped token with the user's agent
+   roles, `OPRID.YYYYMMDD.ROLES.HashSHA256(secret|OPRID|YYYYMMDD|ROLES)` (e.g.
+   ROLES = `ADMIN+USER`), and the secret never reaches the browser.
 3. **Security.** Open PeopleTools > Security > Permission Lists, go to the Web
    Libraries tab, add `WEBLIB_PSAGENT` and give `IScript_PSAgentConfig` Full
-   Access. Do this in the permission lists of the users who should see the
-   agent (e.g. one assigned through a "PS Agent User" role). Users without it
-   get no widget. Recording is further limited to `PSAGENT_TEACHERS`.
+   Access, in a permission list every agent user has. Then create three roles
+   and give users the ones they need. USER < MONITOR < ADMIN (each includes the one
+   before); AUDITOR is kept apart (give both when a person needs both):
+
+   | Feature | USER | MONITOR | ADMIN | AUDITOR |
+   |---|:-:|:-:|:-:|:-:|
+   | Chat, explain a page or an error | ✓ | ✓ | ✓ | ✓ |
+   | Run recorded tasks, live mode, documents | ✓ | ✓ | ✓ | |
+   | Run published runbooks | ✓ | ✓ | ✓ | |
+   | Ask the data (AI_ queries) | ✓ | ✓ | ✓ | |
+   | Excel to CI | ✓ | ✓ | ✓ | |
+   | Absence approval reviewer, own approvals | ✓ | ✓ | ✓ | |
+   | Troubleshoot **own** processes | ✓ | ✓ | ✓ | |
+   | Troubleshoot **anyone's** processes, with Claude's own read-only queries | | ✓ | ✓ | |
+   | Watcher: watchdogs, alerts, manage | | ✓ | ✓ | |
+   | Check **my own** access (*"why can't I open…"*) | ✓ | ✓ | ✓ | |
+   | Check **anyone's** access, and Apply a fix | | | ✓ | |
+   | Record tasks, publish runbooks | | | ✓ | |
+   | Regression tests (test environments) | | | ✓ | |
+   | Everyone's absence requests | | | ✓ | |
+   | Admin dashboard and audit log | | | | ✓ |
+
+   A user with none of them gets no token and no widget. The service checks the roles
+   on every request (`psagent/access.py`); PeopleSoft's own security still applies
+   inside each feature.
 4. **Widget** (no App Designer). Open PeopleTools > Portal > Branding > Branding
    Objects, JavaScript tab, and upload `../psagent.js` as `PSAGENT_JS`. Then
    open PeopleTools > Portal > Branding > Branding System Options and add
@@ -265,7 +600,7 @@ The agent works in a frame on the same origin
 
 Do the transaction once by hand and the agent can do it from then on:
 
-1. Click **Record** in the chat header (only shown to `PSAGENT_TEACHERS`), or
+1. Click **Record** in the chat header (only shown to `PSAGENT_ADMIN`), or
    type *"let me teach you how to create a requisition"*.
 2. Name the task. The page is optional: leave it empty and click **Start recording**.
 3. A red bar appears at the top. **Go to the page the way you normally do** (NavBar,

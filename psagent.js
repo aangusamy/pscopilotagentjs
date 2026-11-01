@@ -22,7 +22,8 @@
 
 (function () {
 
-  var VERSION = '2026-10-25.1';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-11-02.5';   /* shown as PSAgent.version and in the console: check after uploading */
+  var NAME = 'Pia', NAME_LONG = 'PeopleSoft Intelligent Assistant';   /* also in agent-service SYSTEM_PROMPT */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
      current page URL; change the WEBLIB part if you named the record differently. */
@@ -36,7 +37,9 @@
   var RUN = { stepTimeout: 30000, settleMs: 400, pollMs: 150, afterActionMs: 300 };
 
   /* Populated at runtime from the iScript (or window.PSAGENT_CONFIG for local testing) */
-  var cfg = { agentUrl: '', token: '', oprid: '', fullname: '' };
+  var cfg = { agentUrl: '', token: '', oprid: '', fullname: '', roles: null };
+  /* an alert email's "Open in the agent" link: ...?psagent=inc-... opens the panel on that alert */
+  var INC_LINK = (String(location.search + location.hash).match(/[?&#]psagent=(inc-[\w-]+)/) || [])[1] || null;
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function norm(t) { return String(t == null ? '' : t).replace(/\s+/g, ' ').replace(/^[\s*]+|[\s:*]+$/g, '').trim().toLowerCase(); }
@@ -1053,19 +1056,81 @@
 
   var STORE_KEY = 'psagent.chat';
 
+  /* A regression run: the service hands out one case at a time; it runs here like any task and the result goes back
+     to be judged. When the page no longer matched a recorded step, the case is finished live: Save is approved at
+     once (regression tests only run on test environments) and passwords come from the run's secrets. Used by the
+     panel and by the headless runner on the service (PSAgent.runSuite), so both behave the same.
+     ui: {workspace(ws), caseStart(c), caseEnd(c, verdict), step(text)} */
+  function suiteLoop(runId, secrets, ui) {
+    ui = ui || {};
+    secrets = secrets || {};
+    var ws = openWorkspace('Regression tests');
+    if (ui.workspace) ui.workspace(ws);
+    function secretFor(label) {
+      var key = norm(label).replace(/^(confirm|re-?enter|repeat|verify|new)\s+/, '').replace(/\s+/g, '_');
+      return secrets[key] || secrets.password || secrets[Object.keys(secrets)[0]] || '';
+    }
+    function live(c) {
+      function step(payload) {
+        var body = { run_id: runId, snapshot: snapshotPage(ws.frame, {}) };
+        for (var k in payload) body[k] = payload[k];
+        return api('/api/regress/live', body).then(function (r) {
+          if (r.verdict) return r;
+          var a = r.action || {};
+          if (ui.step && a.note) ui.step('Live: ' + a.note);
+          if (a.type === 'do') {
+            return runLiveSteps(ws.frame, a.steps || [], function (t) { if (ui.step) ui.step(t); return { end: function () {} }; })
+              .then(function (res) { return step({ result: res }); });
+          }
+          if (a.type === 'secret') {
+            return STEPS.set(ws.frame, { 'do': 'set', field: a.field, value: secretFor(a.field.label), popup: a.popup }).then(
+              function () { return step({ result: { ok: true, note: 'typed ' + a.field.label } }); },
+              function (e) { return step({ result: { ok: false, step: 'Set ' + a.field.label, error: e.message } }); });
+          }
+          if (a.type === 'confirm') return step({ approved: a.confirm_id });
+          return step({});
+        });
+      }
+      return step({});
+    }
+    function next() {
+      if (ws.stopped) return api('/api/regress/stop', { run_id: runId }).then(function (r) { ws.done(); return r.report; });
+      return api('/api/regress/next', { run_id: runId }).then(function (r) {
+        if (r.done) { ws.done(); ws.status('Regression run finished: ' + r.report.headline); return r.report; }
+        var c = r['case'];
+        if (ui.caseStart) ui.caseStart(c);
+        ws.onStep = function (n, total, text) { if (ui.step) ui.step('Case ' + c.n + ' of ' + c.of + ' · step ' + n + '/' + total + ': ' + text); };
+        return runAction(c.action, secrets, ws).catch(function (e) {
+          return { status: 'error', message: 'The runner hit an unexpected problem: ' + ((e && e.message) || e) };
+        }).then(function (res) {
+          return api('/api/regress/result', { run_id: runId, n: c.n, result: res });
+        }).then(function (v) {
+          if (v.recover) { if (ui.step) ui.step('The page changed: finishing case ' + c.n + ' live'); return live(c); }
+          return v;
+        }).then(function (v) {
+          if (ui.caseEnd) ui.caseEnd(c, v.verdict);
+          if (v.stopped) { ws.done(); return api('/api/regress/next', { run_id: runId }).then(function (x) { return x.report; }); }
+          return next();
+        });
+      });
+    }
+    return next();
+  }
+
   function initWidget() {
     if (document.getElementById('psa-fab')) return;
 
     var css = [
-      '#psa-panel,#psa-fab,#psa-ws,#psa-recbar{--psa-ink:#0f172a;--psa-sub:#64748b;--psa-line:#e6e8f0;--psa-soft:#f6f7fb;--psa-brand:#4f46e5;--psa-brand2:#0ea5e9;--psa-ok:#16a34a;--psa-warn:#d97706;--psa-err:#dc2626;font-family:"Segoe UI",system-ui,-apple-system,sans-serif;}',
+      '#psa-panel,#psa-fab,#psa-ws,#psa-recbar,#psa-audit{--psa-ink:#0f172a;--psa-sub:#64748b;--psa-line:#e6e8f0;--psa-soft:#f6f7fb;--psa-brand:#4f46e5;--psa-brand2:#0ea5e9;--psa-ok:#16a34a;--psa-warn:#d97706;--psa-err:#dc2626;font-family:"Segoe UI",system-ui,-apple-system,sans-serif;}',
       /* launcher */
       '#psa-fab{position:fixed;right:24px;bottom:24px;z-index:2147483646;display:flex;align-items:center;gap:10px;height:52px;padding:0 20px 0 7px!important;margin:0!important;border:none!important;border-radius:26px!important;background:#fff!important;color:var(--psa-ink)!important;box-shadow:0 12px 32px rgba(15,23,42,.2),0 0 0 1px rgba(79,70,229,.18);cursor:pointer;font:600 14px "Segoe UI",system-ui,sans-serif!important;transition:transform .15s,box-shadow .15s;}',
       '#psa-fab:hover{transform:translateY(-2px);box-shadow:0 16px 40px rgba(79,70,229,.3),0 0 0 1px rgba(79,70,229,.35);}',
       'body.psa-docked #psa-fab{display:none;}',
       /* the agent: an avatar with eyes and a status light */
       '.psa-av{position:relative;flex:0 0 auto;display:inline-block;width:38px;height:38px;border-radius:50%;background:radial-gradient(circle at 30% 25%,rgba(255,255,255,.55),transparent 42%),linear-gradient(135deg,var(--psa-brand),var(--psa-brand2));box-shadow:inset 0 -4px 10px rgba(0,0,0,.18);}',
-      '.psa-av i{position:absolute;top:38%;width:5px;height:10px;border-radius:3px;background:#fff;animation:psaBlink 5s infinite;}',
-      '.psa-av i:first-child{left:31%;}.psa-av i:last-child{right:31%;}',
+      '.psa-av i{position:absolute;top:30%;width:6px;height:7px;border-radius:50%;background:#fff;animation:psaBlink 5s infinite;}',
+      '.psa-av i:first-child{left:27%;}.psa-av i:last-child{right:27%;}',
+      '.psa-av:before{content:"";position:absolute;left:50%;top:52%;box-sizing:border-box;width:16px;height:8px;margin-left:-8px;border:2.5px solid #fff;border-top:none;border-radius:0 0 16px 16px;}',
       '.psa-av:after{content:"";position:absolute;right:-1px;bottom:-1px;width:11px;height:11px;border-radius:50%;background:var(--psa-ok);border:2px solid #fff;}',
       '[data-state="thinking"] .psa-av:after,[data-state="working"] .psa-av:after{background:var(--psa-brand2);animation:psaPulse 1s infinite;}',
       '[data-state="waiting"] .psa-av:after{background:var(--psa-warn);}[data-state="error"] .psa-av:after{background:var(--psa-err);}',
@@ -1073,6 +1138,9 @@
       '[data-state="working"] .psa-av i{animation:psaLook 1.6s ease-in-out infinite;}',
       '@keyframes psaBlink{0%,93%,100%{transform:scaleY(1)}96%{transform:scaleY(.1)}}',
       '@keyframes psaLook{0%,100%{transform:translateX(-2px)}50%{transform:translateX(2px)}}',
+      '#psa-hdr .psa-av.psa-wave{animation:psaWave 1.2s ease-in-out 1;transform-origin:70% 90%;}',
+      '@keyframes psaWave{0%,100%{transform:rotate(0)}15%{transform:rotate(-16deg)}30%{transform:rotate(12deg)}45%{transform:rotate(-12deg)}60%{transform:rotate(8deg)}75%{transform:rotate(-4deg)}}',
+      '@media (prefers-reduced-motion:reduce){#psa-panel .psa-av,#psa-panel .psa-av i,#psa-fab .psa-av i{animation:none!important;}}',
       '@keyframes psaPulse{50%{transform:scale(1.35);opacity:.6}}',
       '@keyframes psaGlow{0%,100%{box-shadow:0 0 0 0 rgba(79,70,229,.35)}50%{box-shadow:0 0 0 7px rgba(79,70,229,0)}}',
       '@keyframes psaIn{from{opacity:0;transform:translateX(18px)}to{opacity:1;transform:none}}',
@@ -1083,7 +1151,8 @@
       '#psa-panel.psa-open{display:flex;animation:psaIn .22s ease-out;}#psa-panel.psa-wide{width:720px;}',
       '#psa-panel *{box-sizing:border-box;}#psa-panel h2,#psa-panel h4,#psa-panel p,#psa-panel ol,#psa-panel ul{color:inherit;}',
       '#psa-hdr{flex:0 0 auto;display:flex;align-items:center;gap:12px;padding:16px 14px 14px 16px;background:linear-gradient(180deg,#f3f1ff,#fff);border-bottom:1px solid var(--psa-line);}',
-      '#psa-hdr .psa-who{flex:1;min-width:0;}#psa-hdr .psa-name{font-weight:700;font-size:15px;letter-spacing:-.01em;}',
+      '#psa-hdr .psa-who{flex:1;min-width:0;}#psa-hdr .psa-name{font-weight:700;font-size:15px;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+      '#psa-hdr .psa-name small{display:none;font-weight:500;font-size:12px;color:var(--psa-sub);letter-spacing:0;margin-left:4px;}#psa-panel.psa-wide #psa-hdr .psa-name small{display:inline;}',
       '#psa-status{font-size:12px;color:var(--psa-sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
       '.psa-ib{flex:0 0 auto;width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;gap:6px;border:none!important;border-radius:10px!important;background:transparent!important;color:var(--psa-sub)!important;cursor:pointer;padding:0!important;margin:0!important;box-shadow:none!important;}',
       '.psa-ib:hover{background:#eef2ff!important;color:var(--psa-brand)!important;}',
@@ -1107,15 +1176,48 @@
       '.psa-welcome p{margin:0 0 6px;color:var(--psa-sub);}',
       '.psa-sec{font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--psa-sub);margin:16px 0 8px;}',
       '.psa-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;}',
-      '.psa-tile{display:block;width:100%;text-align:left;border:1px solid var(--psa-line)!important;background:#fff!important;border-radius:14px!important;padding:11px 12px!important;margin:0!important;cursor:pointer;color:var(--psa-ink)!important;font:inherit!important;transition:border-color .15s,box-shadow .15s,transform .15s;}',
+      '.psa-tile{display:flex;gap:10px;align-items:flex-start;width:100%;text-align:left;border:1px solid var(--psa-line)!important;background:#fff!important;border-radius:14px!important;padding:11px 12px!important;margin:0!important;cursor:pointer;color:var(--psa-ink)!important;font:inherit!important;transition:border-color .15s,box-shadow .15s,transform .15s;}',
       '.psa-tile:hover{border-color:#c7d2fe!important;box-shadow:0 8px 20px rgba(79,70,229,.12);transform:translateY(-1px);}',
       '.psa-tile b{display:block;font-size:13px;}.psa-tile small{display:block;color:var(--psa-sub);font-size:12px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.psa-tile.psa-new{background:linear-gradient(135deg,#eef2ff,#ecfeff)!important;border-color:#c7d2fe!important;}',
+      '.psa-tic{flex:0 0 auto;width:30px;height:30px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;}',
+      '.psa-tt{flex:1;min-width:0;}.psa-fit{font-style:normal;font-weight:600;font-size:10px;color:#047857;background:#d1fae5;border-radius:999px;padding:1px 6px;margin-left:2px;vertical-align:1px;white-space:nowrap;}',
+      '.psa-alert{display:flex;gap:10px;align-items:flex-start;margin:10px 0 2px;padding:10px 12px;border:1px solid #fecaca;background:#fef2f2;border-radius:14px;color:#7f1d1d;font-size:13px;}',
+      '.psa-alert>svg{flex:0 0 auto;margin-top:2px;color:#dc2626;}',
+      '.psa-alert-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px;}',
+      '.psa-alert-list button{border:1px solid #fca5a5!important;background:#fff!important;color:#991b1b!important;border-radius:999px!important;padding:4px 11px!important;margin:0!important;cursor:pointer;font:600 12px "Segoe UI",system-ui,sans-serif!important;}',
+      '.psa-alert-list button:hover{background:#fee2e2!important;}',
+      '.psa-news{position:relative;margin:10px 0 2px;padding:10px 34px 10px 12px;border:1px solid #c7d2fe;background:linear-gradient(135deg,#eef2ff,#f5f3ff);border-radius:14px;font-size:13px;}',
+      '.psa-news>b{color:var(--psa-brand);}.psa-news ul{margin:4px 0 0;padding-left:18px;}.psa-news li{margin:2px 0;}',
+      '.psa-news-x{position:absolute;top:6px;right:6px;width:24px;height:24px;border:none!important;background:transparent!important;color:var(--psa-sub)!important;cursor:pointer;font-size:18px;line-height:1;padding:0!important;margin:0!important;border-radius:6px!important;}',
+      '.psa-news-x:hover{background:#e0e7ff!important;}',
       '.psa-recent{display:flex;align-items:center;gap:10px;width:100%;text-align:left;border:none!important;background:transparent!important;padding:7px 10px!important;margin:0!important;border-radius:10px!important;cursor:pointer;color:var(--psa-ink)!important;font:inherit!important;}',
       '.psa-recent:hover{background:var(--psa-soft)!important;}.psa-recent svg{flex:0 0 auto;color:var(--psa-sub);}.psa-recent span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       /* cards */
       '.psa-card{align-self:stretch;border:1px solid var(--psa-line);border-radius:16px;background:#fff;padding:14px 16px;box-shadow:0 6px 20px rgba(15,23,42,.06);}',
       '.psa-card h4{margin:0 0 8px;font-size:14px;font-weight:700;}',
+      '.psa-qr-name{font-weight:400;color:var(--psa-sub);font-size:12px;}.psa-qr-chart{margin:4px 0 10px;}.psa-qr-chart h5{margin:0 0 6px;font-size:12.5px;}',
+      '.psa-qr .psa-actions a{flex:1;display:inline-flex;align-items:center;justify-content:center;padding:9px;border-radius:10px;font:600 13px "Segoe UI",system-ui,sans-serif;text-decoration:none!important;color:var(--psa-ink)!important;}',
+      '.psa-qr .psa-ci-rows td{white-space:nowrap;}',
+      '.psa-ci .psa-sub{color:var(--psa-sub);font-size:12.5px;margin:0 0 8px;}.psa-ci h5{margin:10px 0 4px;font-size:12.5px;}',
+      '.psa-ci-q{width:100%;box-sizing:border-box;border:1px solid var(--psa-line);border-radius:9px;padding:7px 10px;font:13px "Segoe UI",system-ui,sans-serif;margin-bottom:6px;}',
+      '.psa-ci-list{max-height:260px;overflow:auto;display:flex;flex-direction:column;gap:2px;}',
+      '.psa-ci-list button{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:baseline;text-align:left;border:0;background:none;border-radius:8px;padding:6px 8px;cursor:pointer;font:13px "Segoe UI",system-ui,sans-serif;color:var(--psa-ink);}',
+      '.psa-ci-list button:hover,.psa-ci-list button:focus{background:var(--psa-soft);outline:none;}.psa-ci-list span{color:var(--psa-sub);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.psa-ci-list small,.psa-ci small{color:var(--psa-sub);font-size:11.5px;}',
+      '.psa-ci-ld{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-top:1px solid var(--psa-line);}.psa-ci-ld span{display:flex;flex-direction:column;min-width:0;}',
+      '.psa-ci-ld button{border:1px solid var(--psa-line);background:#fff;border-radius:8px;padding:3px 10px;cursor:pointer;font:12.5px "Segoe UI",system-ui,sans-serif;}',
+      '.psa-ci-tree{max-height:320px;overflow:auto;border:1px solid var(--psa-line);border-radius:10px;padding:4px 8px;margin-bottom:6px;}',
+      '.psa-ci-coll summary{cursor:pointer;padding:4px 0;}.psa-ci-coll ul{list-style:none;margin:0 0 4px;padding:0 0 0 2px;}.psa-ci-coll li{display:block;padding:3px 0;margin:0;}',
+      '.psa-ci-coll li small{display:block;padding-left:22px;line-height:1.3;}.psa-ci-coll input[type=checkbox]{width:14px;height:14px;margin:0;padding:0;flex:0 0 auto;}',
+      '.psa-ci-coll li label{display:flex;gap:8px;align-items:center;cursor:pointer;font-weight:400;margin:0;}.psa-ci-coll em{font-style:normal;color:var(--psa-brand);font-size:11px;}.psa-ci-sec span{color:var(--psa-sub);}',
+      '.psa-ci-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;}.psa-ci-chips span{background:var(--psa-soft);border-radius:999px;padding:2px 10px;font-size:12px;}',
+      '.psa-ci .psa-good{color:#15803d;}.psa-ci .psa-bad{color:#b91c1c;}.psa-ci .psa-warnt{color:#b45309;}.psa-ci-chips .psa-good{background:#dcfce7;}.psa-ci-chips .psa-bad{background:#fee2e2;}',
+      '.psa-ci-fp{margin:0 0 8px;padding-left:18px;color:#b91c1c;font-size:12.5px;}',
+      '.psa-ci-rows{max-height:300px;overflow:auto;border:1px solid var(--psa-line);border-radius:10px;margin-bottom:8px;}',
+      '.psa-ci-rows table{width:100%;border-collapse:collapse;font-size:12.5px;}.psa-ci-rows th{position:sticky;top:0;background:var(--psa-soft);text-align:left;font-weight:600;color:var(--psa-sub);padding:4px 6px;}',
+      '.psa-ci-rows td{border-top:1px solid #f1f3f8;padding:4px 6px;vertical-align:top;}.psa-ci-rows td:first-child{width:auto;}',
+      '.psa-ci-bar{height:8px;border-radius:4px;background:#eef0f6;overflow:hidden;margin:4px 0;}.psa-ci-bar i{display:block;height:100%;background:var(--psa-brand);border-radius:4px;transition:width .3s;}',
+      '.psa-ci-secrets label{display:flex;flex-direction:column;gap:2px;font-size:12.5px;margin-bottom:4px;}.psa-ci-secrets input{border:1px solid var(--psa-line);border-radius:8px;padding:6px 8px;}',
       '.psa-card table{width:100%;border-collapse:collapse;margin-bottom:8px;font-size:13px;}',
       '.psa-card td{padding:5px 4px;border-bottom:1px solid #f0f2f7;vertical-align:top;}.psa-card td:first-child{color:var(--psa-sub);width:45%;}',
       '.psa-card label{display:block;font-size:12px;margin:6px 0 3px;color:#475569;}',
@@ -1150,7 +1252,29 @@
       '#psa-send:disabled{opacity:.4;cursor:default;}',
       '#psa-recentpop{position:absolute;left:12px;right:12px;bottom:92px;max-height:50%;overflow-y:auto;background:#fff;border:1px solid var(--psa-line);border-radius:14px;box-shadow:0 18px 40px rgba(15,23,42,.18);padding:6px;}',
       '#psa-recentpop[hidden]{display:none;}',
-      '#psa-hint{flex:0 0 auto;padding:0 18px 10px;font-size:11px;color:#94a3b8;}',
+      '#psa-bar{flex:0 0 auto;position:relative;display:flex;align-items:center;gap:8px;padding:0 12px 8px;}',
+      '#psa-hint{flex:1 1 auto;min-width:0;font-size:11px;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+      '#psa-feat,#psa-dogs{flex:0 0 auto;border:1px solid var(--psa-line);background:#fff;color:#334155;border-radius:999px;padding:3px 10px;cursor:pointer;font:600 12px "Segoe UI",system-ui,sans-serif;}',
+      '#psa-feat:hover,#psa-dogs:hover{border-color:#a5b4fc;background:#eef2ff;}',
+      '#psa-dogs{color:#0f766e;border-color:#99f6e4;background:#f0fdfa;}#psa-dogs.psa-off{color:#92400e;border-color:#fcd34d;background:#fffbeb;}#psa-dogs.psa-alert{color:#b91c1c;border-color:#fca5a5;background:#fef2f2;}',
+      '#psa-featmenu{position:absolute;left:12px;bottom:34px;z-index:5;min-width:250px;background:#fff;border:1px solid var(--psa-line);border-radius:12px;box-shadow:0 10px 30px rgba(15,23,42,.18);padding:6px;}',
+      '#psa-featmenu button{display:flex;align-items:center;gap:10px;width:100%;text-align:left;border:0;background:none;border-radius:8px;padding:7px 8px;cursor:pointer;font:13px "Segoe UI",system-ui,sans-serif;color:#0f172a;}',
+      '#psa-featmenu button:hover,#psa-featmenu button:focus{background:#f1f5f9;outline:none;}#psa-featmenu small{display:block;color:#64748b;font-size:11.5px;}',
+      '#psa-featmenu .psa-tic{flex:0 0 28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;}',
+      '.psa-guide ol{margin:6px 0;padding-left:20px;}.psa-guide li{margin:3px 0;}',
+      '.psa-plan{border:1px solid var(--psa-line);border-radius:10px;margin:8px 0;overflow:hidden;}',
+      '.psa-plan-h{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:7px 10px;background:#f8fafc;border-bottom:1px solid var(--psa-line);}',
+      '.psa-plan-h b{flex:1 1 auto;}.psa-plan-h small{color:#64748b;}',
+      '.psa-mini{border:1px solid var(--psa-line);background:#fff;border-radius:7px;padding:2px 8px;cursor:pointer;font:12px "Segoe UI",system-ui,sans-serif;color:#334155;}',
+      '.psa-mini:hover{background:#f1f5f9;}.psa-mini.psa-danger{color:#b91c1c;border-color:#fecaca;}.psa-mini:disabled{opacity:.5;cursor:default;}',
+      '.psa-dog{display:flex;gap:8px;align-items:flex-start;padding:7px 10px;border-top:1px solid #f1f5f9;font-size:12.5px;}.psa-dog:first-of-type{border-top:0;}',
+      '.psa-dog .psa-dot{flex:0 0 8px;height:8px;border-radius:50%;margin-top:5px;background:#10b981;}.psa-dog.psa-paused .psa-dot{background:#cbd5e1;}.psa-dog.psa-failing .psa-dot{background:#ef4444;}',
+      '.psa-dog-b{flex:1 1 auto;min-width:0;}.psa-dog-b small{display:block;color:#64748b;}.psa-dog-a{flex:0 0 auto;display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;}',
+      '.psa-dog a{color:#b91c1c;cursor:pointer;}',
+      '.psa-card .psa-mon-t td:first-child{width:auto;}.psa-card .psa-wp td:first-child{width:18px;}.psa-wp td:nth-child(2){min-width:150px;}.psa-wp small{display:block;color:#64748b;}',
+      '.psa-rt{list-style:none;margin:6px 0;padding:0;font-size:13px;}.psa-rt li{padding:4px 0;border-top:1px solid #f1f5f9;}.psa-rt li:first-child{border-top:0;}',
+      '.psa-rt-i{display:inline-block;width:18px;font-weight:700;color:#94a3b8;}.psa-rt-on{background:#f8fafc;}.psa-rt-d{margin-left:18px;}.psa-rt-now{display:block;color:#64748b;}',
+      '.psa-chg{margin:6px 0;padding:7px 10px;border-radius:10px;background:#eff6ff;color:#1e3a8a;font-size:12.5px;}.psa-chg ul{margin:2px 0 0;padding-left:18px;}',
       /* documents: attached file, drop target, preview, review table */
       '#psa-files{flex:0 0 auto;display:flex;flex-wrap:wrap;gap:6px;margin:4px 14px 0;}#psa-files[hidden]{display:none;}',
       '.psa-file{display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:4px 6px 4px 10px;border:1px solid #c7d2fe;background:#eef2ff;border-radius:999px;font-size:12px;color:#3730a3;}',
@@ -1185,6 +1309,32 @@
       '.psa-chk b{font-weight:600;}.psa-fix{border:1px solid #c7d2fe;background:#eef2ff;border-radius:10px;padding:8px 10px;}',
       '.psa-links{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}.psa-links a{font-size:12px;padding:3px 9px;border-radius:999px;border:1px solid var(--psa-line);color:#3730a3!important;text-decoration:none!important;background:#fff;}',
       '.psa-links a:hover{border-color:#a5b4fc;}',
+      /* absence approvals: the list and the review's confidence score */
+      '.psa-apr-list{display:flex;flex-direction:column;gap:6px;margin-top:4px;}',
+      '.psa-apr{display:flex;align-items:center;gap:10px;justify-content:space-between;padding:8px 10px;border:1px solid var(--psa-line);border-radius:10px;font-size:13px;line-height:1.45;}',
+      '.psa-card .psa-apr small{display:inline;margin:0;}.psa-card .psa-apr .psa-apr-who{display:block;font-size:11px;margin-top:2px;}',
+      '.psa-card .psa-apr button{flex:none;white-space:nowrap;padding:7px 12px!important;margin:0!important;border-radius:9px!important;cursor:pointer;font:600 12px "Segoe UI",system-ui,sans-serif!important;}',
+      '.psa-apr-status{margin:0 0 10px;padding:8px 10px;background:#f8fafc;border:1px solid var(--psa-line);border-radius:10px;font-size:12.5px;line-height:1.5;}',
+      '.psa-apr-status>b:first-child{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--psa-sub);margin-right:6px;}',
+      '.psa-conf{flex:1;min-width:140px;}.psa-conf-h{display:flex;justify-content:space-between;font-size:12px;color:var(--psa-sub);}',
+      '.psa-conf-bar{height:8px;border-radius:999px;background:#e2e8f0;overflow:hidden;margin-top:3px;}.psa-conf-bar i{display:block;height:100%;border-radius:999px;}',
+      '.psa-card a.psa-btn{display:inline-block;padding:7px 14px;border-radius:9px;background:#4f46e5;color:#fff!important;text-decoration:none!important;font-weight:600;font-size:13px;}',
+      /* runbook draft: the steps the agent will run, by type */
+      '.psa-rb-steps{list-style:none;margin:6px 0;padding:0;display:flex;flex-direction:column;gap:6px;}',
+      '.psa-rb-steps>li{border:1px solid var(--psa-line);border-radius:10px;padding:8px 10px;font-size:13px;line-height:1.45;}',
+      '.psa-rb-h{display:flex;align-items:center;gap:8px;}.psa-rb-h b{flex:1;min-width:0;}',
+      '.psa-rb-n{flex:none;width:20px;height:20px;border-radius:50%;background:#eef2ff;color:#3730a3;font-size:11px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;}',
+      '.psa-rb-t{flex:none;font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;border-radius:999px;padding:2px 8px;}',
+      '.psa-rb-d{margin:4px 0 0 28px;color:#334155;font-size:12.5px;}.psa-card .psa-rb-d small{display:inline;margin:0;}',
+      '.psa-rb-test{display:inline-block;margin-top:3px;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;}',
+      '.psa-card .psa-rb-d details{margin:3px 0 0;}',
+      '.psa-rb-warn{margin:8px 0;padding:8px 10px;border-radius:10px;font-size:12.5px;}.psa-rb-warn ul{margin:2px 0 0;padding-left:18px;}',
+      /* monitors and the watcher's alerts */
+      '.psa-mon-facts{border-collapse:collapse;margin:6px 0;font-size:12.5px;}.psa-mon-facts td{padding:2px 10px 2px 0;vertical-align:top;}.psa-mon-facts td:first-child{color:#64748b;white-space:nowrap;}',
+      '.psa-mon-t{border-collapse:collapse;margin:6px 0;font-size:12px;width:100%;}.psa-mon-t th{text-align:left;color:#64748b;font-weight:600;border-bottom:1px solid #e2e8f0;padding:3px 6px;}.psa-mon-t td{border-bottom:1px solid #f1f5f9;padding:3px 6px;}',
+      '.psa-inc-list{list-style:none;margin:6px 0 0;padding:0;}.psa-inc-list li{margin:0 0 6px;}',
+      '.psa-inc-list button{display:block;width:100%;text-align:left;border:1px solid #e2e8f0;background:#fff;border-radius:10px;padding:7px 10px;cursor:pointer;font:13px "Segoe UI",system-ui,sans-serif;color:#0f172a;}',
+      '.psa-inc-list button:hover{border-color:#5eead4;background:#f0fdfa;}.psa-inc-list small{display:block;color:#64748b;}.psa-inc-list span{display:block;font-size:12px;color:#334155;margin-top:2px;}',
       /* workspace: where the agent works, next to the panel */
       '#psa-ws{position:fixed;top:12px;left:12px;right:12px;bottom:12px;display:none;flex-direction:column;background:#fff;border-radius:18px;overflow:hidden;z-index:2147483644;box-shadow:0 24px 64px rgba(15,23,42,.28),0 0 0 2px rgba(79,70,229,.45);font-size:13px;}',
       'body.psa-docked #psa-ws{right:464px;}body.psa-docked.psa-widebody #psa-ws{right:744px;}',
@@ -1203,7 +1353,39 @@
       '#psa-panel *:focus-visible,#psa-ws *:focus-visible,#psa-recbar *:focus-visible,#psa-fab:focus-visible{outline:3px solid #818cf8;outline-offset:2px;}',
       /* PeopleSoft pop-ups and message boxes (z-index 9999) must show above the agent's workspace */
       '#pt_modals [id^="ptMod_"],#pt_modals [id^="ptModTable_"]{z-index:2147483646!important;}',
-      '@media (max-width:760px){#psa-panel,#psa-panel.psa-wide{width:auto;left:12px;}body.psa-docked #psa-ws{display:none!important;}}'
+      '#psa-audit{position:fixed;top:12px;left:12px;right:12px;bottom:12px;display:none;flex-direction:column;background:#fff;border-radius:18px;overflow:hidden;z-index:2147483643;box-shadow:0 24px 64px rgba(15,23,42,.24),0 0 0 1px rgba(15,23,42,.08);color:var(--psa-ink);font-size:13px;line-height:1.45;text-align:left;}',
+      'body.psa-docked #psa-audit{right:464px;}body.psa-docked.psa-widebody #psa-audit{right:744px;}',
+      '.psa-au-hdr{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:12px 16px;border-bottom:1px solid var(--psa-line);background:var(--psa-soft);}',
+      '.psa-au-title b{font-size:16px;display:block;}.psa-au-title span{color:var(--psa-sub);font-size:12px;}',
+      '.psa-au-tabs{display:flex;gap:2px;flex-wrap:wrap;}.psa-au-tabs button,.psa-au-seg button{border:0;background:none;padding:6px 10px;border-radius:8px;cursor:pointer;font:600 13px "Segoe UI",system-ui,sans-serif;color:var(--psa-sub);}',
+      '.psa-au-tabs button.psa-on,.psa-au-seg button.psa-on{background:#fff;color:var(--psa-brand);box-shadow:0 1px 2px rgba(15,23,42,.12);}',
+      '.psa-au-tools{margin-left:auto;display:flex;align-items:center;gap:6px;}.psa-au-tools select,.psa-au-filters select,.psa-au-filters input{font:13px "Segoe UI",system-ui,sans-serif;border:1px solid var(--psa-line);border-radius:7px;padding:4px 6px;background:#fff;color:var(--psa-ink);}',
+      '.psa-au-tools button,.psa-au-filters button,.psa-au-xl,.psa-au-more{border:1px solid var(--psa-line);background:#fff;border-radius:8px;padding:5px 10px;cursor:pointer;font:13px "Segoe UI",system-ui,sans-serif;color:var(--psa-ink);}',
+      '.psa-au-tools button:hover,.psa-au-filters button:hover,.psa-au-xl:hover,.psa-au-more:hover{border-color:var(--psa-brand);color:var(--psa-brand);}',
+      '.psa-au-body{flex:1;overflow:auto;padding:14px 16px 24px;}.psa-au-wait,.psa-au-err{color:var(--psa-sub);}',
+      '.psa-au-period{color:var(--psa-sub);margin:0 0 10px;font-size:12.5px;}',
+      '.psa-au-kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:12px;}',
+      '.psa-au-kpi{border:1px solid var(--psa-line);border-radius:12px;padding:10px 12px;}.psa-au-kpi span{display:block;color:var(--psa-sub);font-size:12px;}.psa-au-kpi b{display:block;font-size:22px;font-weight:600;margin:2px 0;}.psa-au-kpi small{color:var(--psa-sub);font-size:11.5px;}',
+      '.psa-au-kbad b{color:var(--psa-err);}',
+      '.psa-au-meter{border:1px solid var(--psa-line);border-radius:12px;padding:10px 12px;margin-bottom:12px;}.psa-au-meter>span{display:block;height:8px;border-radius:4px;background:#eef0f6;margin-top:6px;overflow:hidden;}.psa-au-meter i{display:block;height:100%;border-radius:4px;background:var(--psa-brand);}',
+      '.psa-au-mwarn i{background:var(--psa-warn);}.psa-au-mbad i{background:var(--psa-err);}',
+      '.psa-au-sec{margin:6px 0 14px;}.psa-au-sec h5{margin:0 0 6px;font-size:13px;}.psa-au-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px;}',
+      '.psa-au-chart{width:100%;height:auto;max-height:200px;display:block;}.psa-au-bar{fill:var(--psa-brand);}.psa-au-hit{fill:transparent;cursor:default;}.psa-au-hit:hover{fill:rgba(79,70,229,.07);}',
+      '.psa-au-grid{stroke:#eef0f6;stroke-width:1;}.psa-au-base{stroke:#cbd5e1;stroke-width:1;}.psa-au-ax{fill:#64748b;font-size:10px;font-family:"Segoe UI",system-ui,sans-serif;}',
+      '.psa-au-tip{position:absolute;z-index:3;background:#0f172a;color:#fff;font-size:12px;padding:4px 8px;border-radius:6px;pointer-events:none;white-space:nowrap;}',
+      '.psa-au-hrow{display:grid;grid-template-columns:minmax(90px,140px) 1fr auto;align-items:center;gap:8px;padding:3px 0;}.psa-au-hrow[data-user]{cursor:pointer;}.psa-au-hrow[data-user]:hover .psa-au-hl{color:var(--psa-brand);}',
+      '.psa-au-hl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.psa-au-hv{font-variant-numeric:tabular-nums;color:var(--psa-ink);}',
+      '.psa-au-ht{display:inline-block;height:8px;background:transparent;vertical-align:middle;}.psa-au-hrow .psa-au-ht{display:block;}.psa-au-ht i{display:block;height:8px;border-radius:0 4px 4px 0;background:var(--psa-brand);}',
+      '.psa-au-wide .psa-au-ht{width:90px;}.psa-au-wide{white-space:nowrap;}',
+      '.psa-au-bar2{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px;}.psa-au-bar2 .psa-au-period{margin:0;}.psa-au-seg{display:inline-flex;background:var(--psa-soft);border-radius:9px;padding:2px;}.psa-au-bar2 .psa-au-xl{margin-left:auto;}',
+      '.psa-au-table{width:100%;border-collapse:collapse;font-size:12.5px;}.psa-au-table th{text-align:left;font-weight:600;color:var(--psa-sub);border-bottom:1px solid var(--psa-line);padding:5px 8px;white-space:nowrap;}',
+      '.psa-au-table td{border-bottom:1px solid #f1f3f8;padding:5px 8px;vertical-align:top;}.psa-au-table tr[data-ev],.psa-au-table tr[data-user],.psa-au-table tr[data-feature]{cursor:pointer;}.psa-au-table tbody tr:hover{background:#fafbff;}',
+      '.psa-au-detail td{background:var(--psa-soft);}.psa-au-detail pre{white-space:pre-wrap;word-break:break-word;margin:0 0 6px;font:12px Consolas,monospace;background:#fff;border:1px solid var(--psa-line);border-radius:6px;padding:6px 8px;}',
+      '.psa-au-nowrap{white-space:nowrap;font-variant-numeric:tabular-nums;}.psa-au-muted{color:var(--psa-sub);}.psa-au-ok{color:#15803d;white-space:nowrap;}.psa-au-bad{color:#b91c1c;white-space:nowrap;}.psa-au-warn{color:#b45309;white-space:nowrap;}',
+      '.psa-au-filters{display:flex;flex-wrap:wrap;align-items:flex-end;gap:8px;margin-bottom:10px;}.psa-au-filters label{display:flex;flex-direction:column;font-size:11.5px;color:var(--psa-sub);gap:2px;}.psa-au-q input{width:180px;}.psa-au-filters .psa-au-xl{margin-left:auto;}',
+      '.psa-au-more{margin:10px 0;}.psa-au-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;}.psa-au-chips span{background:#fef2f2;color:#991b1b;border-radius:999px;padding:3px 10px;font-size:12px;}',
+      '.psa-au-list{margin:0;padding-left:18px;}.psa-au-list li{margin-bottom:6px;}',
+      '@media (max-width:760px){#psa-panel,#psa-panel.psa-wide{width:auto;left:12px;}body.psa-docked #psa-ws{display:none!important;}#psa-audit,body.psa-docked #psa-audit{left:6px;right:6px;top:6px;bottom:6px;z-index:2147483646;}}'
     ].join('');
     var st = document.createElement('style');
     st.id = 'psa-styles';
@@ -1226,17 +1408,17 @@
     var fab = document.createElement('button');
     fab.id = 'psa-fab';
     fab.type = 'button';
-    fab.setAttribute('aria-label', 'Open PeopleSoft Agent');
+    fab.setAttribute('aria-label', 'Open ' + NAME + ', ' + NAME_LONG);
     fab.setAttribute('aria-expanded', 'false');
-    fab.innerHTML = AV + '<span>Ask Agent</span>';
+    fab.innerHTML = AV + '<span>Ask ' + NAME + '</span>';
     document.body.appendChild(fab);
 
     var panel = document.createElement('div');
     panel.id = 'psa-panel';
     panel.setAttribute('role', 'dialog');
-    panel.setAttribute('aria-label', 'PeopleSoft Agent');
+    panel.setAttribute('aria-label', NAME + ', ' + NAME_LONG);
     panel.innerHTML =
-      '<div id="psa-hdr">' + AV + '<div class="psa-who"><div class="psa-name">PeopleSoft Agent</div><div id="psa-status" aria-live="polite">Ready</div></div>'
+      '<div id="psa-hdr">' + AV + '<div class="psa-who"><div class="psa-name" title="' + NAME_LONG + '">' + NAME + ' <small>' + NAME_LONG + '</small></div><div id="psa-status" aria-live="polite">Ready</div></div>'
       + '<button id="psa-rec" class="psa-ib" type="button" title="Teach me a new task by doing it once" style="display:none">' + ICON.rec + 'Record</button>'
       + '<button id="psa-new" class="psa-ib" type="button" title="New conversation" aria-label="New conversation">' + ICON.compose + '</button>'
       + '<button id="psa-wide" class="psa-ib" type="button" title="Wider panel" aria-label="Wider panel">' + ICON.wide + '</button>'
@@ -1246,11 +1428,14 @@
       + '<div id="psa-recentpop" role="listbox" aria-label="Recent questions" hidden></div>'
       + '<div id="psa-files" hidden></div>'
       + '<form id="psa-form"><button id="psa-hist" class="psa-ib" type="button" title="Recent questions" aria-label="Recent questions">' + ICON.clock + '</button>'
-      + '<button id="psa-attach" class="psa-ib" type="button" title="Attach a PDF or image (or drop it here)" aria-label="Attach a document">' + ICON.clip + '</button>'
-      + '<input id="psa-file" type="file" accept="application/pdf,image/png,image/jpeg,image/gif,image/webp" hidden>'
+      + '<button id="psa-attach" class="psa-ib" type="button" title="Attach a PDF, image or Excel checklist (or drop it here)" aria-label="Attach a document">' + ICON.clip + '</button>'
+      + '<input id="psa-file" type="file" accept="application/pdf,image/png,image/jpeg,image/gif,image/webp,.xlsx,.csv" hidden>'
       + '<textarea id="psa-input" rows="1" aria-label="Message" placeholder="Ask anything, or tell me what to do..."></textarea>'
       + '<button id="psa-send" type="submit" aria-label="Send">' + ICON.send + '</button></form>'
-      + '<div id="psa-hint">Enter to send · Shift+Enter for a new line · attach or drop a PDF/image · Ctrl+/ opens and closes me</div>';
+      + '<div id="psa-bar"><button id="psa-feat" type="button" aria-haspopup="menu" aria-expanded="false">＋ Features <span aria-hidden="true">▾</span></button>'
+      + '<div id="psa-featmenu" role="menu" hidden></div>'
+      + '<span id="psa-hint">Enter to send · Shift+Enter new line · Ctrl+/</span>'
+      + '<button id="psa-dogs" type="button" hidden title="Watchdogs: open the list to pause, run, delete or download them"></button></div>';
     document.body.appendChild(panel);
     var logEl = panel.querySelector('#psa-log');
     var input = panel.querySelector('#psa-input');
@@ -1319,41 +1504,143 @@
       } catch (e) {}
     }
 
+    /* What's new: shown once, until dismissed or the first message. Change NEWS.id for the next announcement. */
+    var NEWS = { id: '2026-10-27', items: [
+      'Meet **' + NAME + '**: the PeopleSoft Agent has a name and a new look.',
+      'Processes of yours that failed in the last 24 hours show up here: one click to find out why.',
+      'Cards that fit the page you are on come first.'
+    ] };
+    function newsSeen(set) {
+      try { if (set) localStorage.setItem('psagent.news', NEWS.id); return localStorage.getItem('psagent.news') === NEWS.id; } catch (e) { return true; }
+    }
+
+    /* Welcome cards: what kind of help, with its icon and colours */
+    var TILE = {
+      error: [SVG('<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>', 16), '#b91c1c', '#fee2e2'],
+      task: [SVG('<path d="M7 4v16l13-8Z"/>', 16), '#4f46e5', '#eef2ff'],
+      trouble: [SVG('<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4Z"/>', 16), '#b45309', '#fef3c7'],
+      security: [SVG('<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>', 16), '#be123c', '#ffe4e6'],
+      explain: [SVG('<circle cx="12" cy="12" r="9"/><path d="M12 16v-4"/><path d="M12 8h.01"/>', 16), '#0369a1', '#e0f2fe'],
+      approve: [SVG('<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/><path d="m9 15 2 2 4-4"/>', 16), '#047857', '#d1fae5'],
+      runbook: [SVG('<path d="M9 6h11M9 12h11M9 18h11"/><path d="m3 6 1 1 2-2M3 12l1 1 2-2M3 18l1 1 2-2"/>', 16), '#6b21a8', '#f3e8ff'],
+      monitor: [SVG('<path d="M3 12h4l3-8 4 16 3-8h4"/>', 16), '#0f766e', '#ccfbf1'],
+      test: [SVG('<path d="M9 3h6M10 3v6l-5 9a2 2 0 0 0 1.7 3h10.6a2 2 0 0 0 1.7-3l-5-9V3"/><path d="M7.5 15h9"/>', 16), '#9d174d', '#fce7f3'],
+      'new': [SVG('<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6.3 6.3l2.5 2.5M15.2 15.2l2.5 2.5M6.3 17.7l2.5-2.5M15.2 8.8l2.5-2.5"/>', 16), '#0e7490', '#cffafe'],
+      audit: [SVG('<path d="M4 20V11M10 20V5M16 20v-6M21 20H3"/>', 16), '#1d4ed8', '#dbeafe'],
+      ci: [SVG('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M3 14h18M9 4v16"/>', 16), '#15803d', '#dcfce7'],
+      data: [SVG('<path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 5-6"/>', 16), '#6d28d9', '#ede9fe']
+    };
+
     function greet() {
       var w = document.createElement('div');
       w.className = 'psa-welcome';
       /* the user profile description, when it looks like a name (some are dates or codes) */
-      var full = String(cfg.fullname || ''), ctx = pageContext(), recent = recentList();
+      var full = String(cfg.fullname || ''), ctx = pageContext(), m = me || {};
       var name = /[A-Za-z]{2}/.test(full) && !/\d{3}/.test(full) ? full.split(/\s+/)[0] : (cfg.oprid || '');
-      var html = '<h2>Hi' + (name ? ' ' + esc(name) : '') + ', what can I do?</h2>'
-        + '<p>Tell me in your own words. I work in PeopleSoft for you, ask when I am not sure, and check with you before anything is saved.</p>';
-      if (recent.length) {
-        html += '<div class="psa-sec">Recent</div>' + recent.slice(0, 4).map(function (q) {
-          return '<button type="button" class="psa-recent" data-q="' + esc(q) + '">' + ICON.clock + '<span>' + esc(q) + '</span></button>';
-        }).join('');
+      var hour = new Date().getHours(), hello = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+      var html = '<h2>' + hello + (name ? ', ' + esc(name) : '') + '</h2>'
+        + '<p>I\'m ' + NAME + ', your ' + NAME_LONG + '. Tell me in your own words what you need: I work in PeopleSoft for you, '
+        + 'ask when I am not sure, and check with you before anything is saved.</p>';
+      if (!newsSeen()) {
+        html += '<div class="psa-news"><button type="button" class="psa-news-x" aria-label="Dismiss what\'s new">&times;</button><b>What\'s new</b><ul>'
+          + NEWS.items.map(function (x) { return '<li>' + md(x) + '</li>'; }).join('') + '</ul></div>';
       }
-      var tiles = [];
-      if (ctx.error) tiles.push({ t: 'Help with this error', s: ctx.error, q: 'Help me with this error' });
-      ((me && me.tasks) || []).slice(0, 6).forEach(function (t) { tiles.push({ t: t.title, s: t.example, q: t.example }); });
-      if (me && me.troubleshoot) tiles.push({ t: 'Troubleshoot a process', s: 'Why did my last process fail?', q: 'Why did my last process fail?' });
-      if (me && me.security) tiles.push({ t: 'Check someone\'s access', s: 'Why can\'t a user open a page?', q: '', fill: 'Why can\'t ' });
-      if (ctx.component && !isFrameworkPage(ctx)) tiles.push({ t: 'Explain this page', s: ctx.title || ctx.component, q: 'What is this page for and how do I use it?' });
-      tiles.push({ t: 'Something new', s: 'Describe it and I will work it out on screen', q: '', cls: ' psa-new' });
+      var failed = m.failed || [];
+      if (failed.length) {
+        html += '<div class="psa-alert" role="status">' + TILE.error[0] + '<div><b>' + (failed.length === 1 ? 'Your process ' + esc(failed[0].name) + ' failed'
+          : failed.length + ' of your processes failed') + ' in the last 24 hours.</b> Pick one and I will find out why.<div class="psa-alert-list">'
+          + failed.slice(0, 3).map(function (f) {
+            return '<button type="button" data-q="Why did process ' + esc(f.instance) + ' fail?">' + esc(f.name) + ' · ' + esc(f.instance)
+              + ' · ' + esc(f.status) + '</button>';
+          }).join('') + '</div></div></div>';
+      }
+      var night = m.overnight;
+      if (night && night.count) {
+        html += '<div class="psa-alert" role="status">' + TILE.monitor[0] + '<div><b>' + (night.count === 1 ? '1 alert' : night.count + ' alerts')
+          + ' from the watcher in the last 24 hours.</b> Each one is already analysed.<div class="psa-alert-list">'
+          + night.items.map(function (i) {
+            return '<button type="button" data-inc="' + esc(i.id) + '">' + esc(i.title) + ' · ' + esc(String(i.found).slice(5, 16)) + '</button>';
+          }).join('') + (night.count > night.items.length ? '<button type="button" data-q="What happened in the last 24 hours?">All ' + night.count + '</button>' : '')
+          + '</div></div></div>';
+      }
+      /* Cards; the ones for the page you are on come first */
+      var here = String(ctx.component || '').toUpperCase(), menu = String(ctx.menu || '').toUpperCase(), tiles = [];
+      ((m.tasks) || []).forEach(function (t) {
+        tiles.push({ k: 'task', t: t.title, s: t.example, q: t.example, fit: !!here && String(t.component || '').toUpperCase() === here });
+      });
+      if (m.troubleshoot) tiles.push({ k: 'trouble', t: 'Troubleshoot a process', s: 'Why did my last process fail?', q: 'Why did my last process fail?', fit: menu === 'PROCESSMONITOR' });
+      if (m.security) tiles.push({ k: 'security', t: 'Check someone\'s access', s: 'Why can\'t a user open a page?', q: '', fill: 'Why can\'t ', fit: menu === 'MAINTAIN_SECURITY' });
+      else if (m.own_access) tiles.push({ k: 'security', t: 'Check my access', s: 'Why can\'t I open a page?', q: '', fill: 'Why can\'t I open ' });
+      if (m.approvals) tiles.push({ k: 'approve', t: 'Review absence approvals', s: 'I check each request and recommend', q: 'Show my pending absence approvals', fit: /EOAW|ABS/.test(here) });
+      if (m.can_monitor && m.watcher) {
+        tiles.push({ k: 'monitor', t: 'Watch something for me', s: 'Failed or stuck processes, data checks: I alert by email', q: '', fill: 'Watch ', fit: menu === 'PROCESSMONITOR' });
+        tiles.push({ k: 'monitor', t: 'What happened overnight?', s: (m.overnight ? m.overnight.monitors : 0) + ' monitors running', q: 'What happened overnight?' });
+      }
+      if (m.ask_data) tiles.push({ k: 'data', t: 'Ask the data', s: 'How many, who, which: from your PS Queries', q: '', fill: 'How many ' });
+      if (m.can_audit) tiles.push({ k: 'audit', t: 'Audit dashboard', s: 'Who used the agent, what it cost, what failed', q: '', act: 'audit' });
+      (m.runbooks || []).forEach(function (r) {
+        tiles.push({ k: 'runbook', t: 'Run: ' + r.title, s: r.steps + ' steps' + (r.summary ? ' · ' + r.summary : ''), q: 'Run the runbook ' + r.title });
+      });
+      /* the page's own cards first, then runbooks (what the person published to run), the watcher's cards and the
+         other features the user has; recorded tasks (there can be dozens) fill the rest, at least two */
+      var rank = function (x) { return x.fit ? 0 : x.k === 'runbook' ? 1 : x.k === 'monitor' ? 2 : x.k === 'task' ? 4 : 3; };
+      tiles = tiles.map(function (x, i) { x.i = i; return x; }).sort(function (a, b) { return rank(a) - rank(b) || a.i - b.i; });
+      var runbooks = 0;
+      tiles = tiles.filter(function (x) { return x.fit || x.k !== 'runbook' || ++runbooks <= 3; });
+      var room = Math.max(8 - tiles.filter(function (x) { return x.fit || x.k !== 'task'; }).length, 2), tasks = 0;
+      tiles = tiles.filter(function (x) { return x.fit || x.k !== 'task' || ++tasks <= room; });
+      if (ctx.error) tiles.unshift({ k: 'error', t: 'Help with this error', s: ctx.error, q: 'Help me with this error' });
+      if (ctx.component && !isFrameworkPage(ctx)) tiles.push({ k: 'explain', t: 'Explain this page', s: ctx.title || ctx.component, q: 'What is this page for and how do I use it?' });
+      tiles.push({ k: 'new', t: 'Something new', s: 'Describe it and I will work it out on screen', q: '', cls: ' psa-new' });
       html += '<div class="psa-sec">I can</div><div class="psa-grid">' + tiles.map(function (x) {
+        var ic = TILE[x.k];
         return '<button type="button" class="psa-tile' + (x.cls || '') + '" data-q="' + esc(x.q) + '"' + (x.fill ? ' data-fill="' + esc(x.fill) + '"' : '')
-          + '><b>' + esc(x.t) + '</b><small>' + esc(x.s || '') + '</small></button>';
+          + (x.act ? ' data-act="' + x.act + '"' : '')
+          + '><span class="psa-tic" style="color:' + ic[1] + ';background:' + ic[2] + '">' + ic[0] + '</span><span class="psa-tt"><b>' + esc(x.t)
+          + (x.fit ? ' <em class="psa-fit">This page</em>' : '') + '</b><small>' + esc(x.s || '') + '</small></span></button>';
       }).join('') + '</div>';
       w.innerHTML = html;
       w.addEventListener('click', function (e) {
+        if (e.target.closest && e.target.closest('.psa-news-x')) { newsSeen(true); w.querySelector('.psa-news').remove(); return; }
+        var inc = e.target.closest && e.target.closest('[data-inc]');
+        if (inc) { openIncident(inc.getAttribute('data-inc')); return; }
         var b = e.target.closest && e.target.closest('[data-q]');
         if (!b) return;
+        if (b.getAttribute('data-act') === 'audit') { openAudit(); return; }
         var q = b.getAttribute('data-q');
         if (q) send(q);
         else if (b.getAttribute('data-fill')) {
-          input.value = b.getAttribute('data-fill'); input.placeholder = 'e.g. Why can\'t ABSMITH access Create Job Opening?'; input.focus();
-        } else { input.placeholder = 'e.g. Lock the account of user JSMITH and add the role Manager'; input.focus(); }
+          input.value = b.getAttribute('data-fill');
+          hint(/^Watch/.test(input.value) ? 'e.g. Watch payroll processes overnight and email payroll@company.com'
+            : /^How many/.test(input.value) ? 'e.g. How many new hires this year by department?'
+            : / I open $/.test(input.value) ? 'e.g. Why can\'t I open Create Job Opening?'
+            : 'e.g. Why can\'t ABSMITH access Create Job Opening?');
+          input.focus();
+        } else { hint('e.g. Lock the account of user JSMITH and add the role Manager'); input.focus(); }
       });
       logEl.appendChild(w);
+    }
+
+    /* The message box shows a different example every few seconds while the welcome screen is up */
+    var PLACEHOLDER = 'Ask anything, or tell me what to do...', phHold = false, phTimer = null, phIndex = 1;
+    function hint(text) { input.placeholder = text; phHold = true; }   /* a specific hint stays until the next message */
+    function examples() {
+      var m = me || {}, out = [];
+      (m.tasks || []).forEach(function (t) { (t.examples && t.examples.length ? t.examples : [t.example]).forEach(function (x) { if (x) out.push(x); }); });
+      if (m.troubleshoot) out.push('Why did my last process fail?');
+      if (m.security) out.push('Why can\'t ABSMITH open Job Data?');
+      else if (m.own_access) out.push('Why can\'t I open Job Data?');
+      if (m.approvals) out.push('Show my pending absence approvals');
+      if (m.ask_data) out.push('How many new hires this year by department?');
+      (m.runbooks || []).slice(0, 2).forEach(function (r) { out.push('Run ' + r.title); });
+      out.push('What is this page for?');
+      return out;
+    }
+    function rotatePlaceholder() {
+      if (phHold || input.value || !logEl.querySelector('.psa-welcome')) return;
+      var list = examples();
+      input.placeholder = phIndex % (list.length + 1) === 0 ? PLACEHOLDER : 'Try: "' + list[(phIndex % (list.length + 1)) - 1] + '"';
+      phIndex++;
     }
 
     var STATE_TEXT = { idle: 'Ready', thinking: 'Thinking...', working: 'Working...', waiting: 'Waiting for you', error: 'Stopped: see the chat' };
@@ -1428,20 +1715,31 @@
     }
 
     /* ---- Documents: read in the browser, sent with the next message, kept only in memory ---- */
-    var DOC_LIMIT = { 'application/pdf': 10, 'image/png': 5, 'image/jpeg': 5, 'image/gif': 5, 'image/webp': 5 };   /* MB */
-    function takeFile(file) {
+    var XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    var DOC_LIMIT = { 'application/pdf': 10, 'image/png': 5, 'image/jpeg': 5, 'image/gif': 5, 'image/webp': 5, 'text/csv': 5 };   /* MB */
+    DOC_LIMIT[XLSX] = 5;
+    var uploadAs = null;   /* message to send with the next file picked from a guide card */
+    var reading = null;    /* a file still being read (a Promise): a message sent meanwhile waits for it */
+    function takeFile(file, autoSend) {
       if (!file) return;
-      var mb = DOC_LIMIT[file.type];
-      if (!mb) { addMsg('bot', 'I can read **PDF** and **image** files (PNG, JPEG, GIF, WebP). "' + file.name + '" is not one of those.', false); return; }
+      /* Windows reports CSV files as application/vnd.ms-excel (or nothing): go by the extension for spreadsheets */
+      var type = /\.xlsx$/i.test(file.name) ? XLSX : /\.csv$/i.test(file.name) ? 'text/csv' : file.type, mb = DOC_LIMIT[type];
+      if (!mb) { addMsg('bot', 'I can read **PDF**, **image** (PNG, JPEG, GIF, WebP) and **Excel** (.xlsx, .csv) files. "' + file.name + '" is not one of those.', false); return; }
       if (file.size > mb * 1024 * 1024) { addMsg('bot', '"' + file.name + '" is too large: up to ' + mb + ' MB for this type.', false); return; }
       var reader = new FileReader();
-      reader.onload = function () {
-        attached = { name: file.name, media_type: file.type, size: file.size, data: String(reader.result).split(',')[1],
-          url: URL.createObjectURL(file) };
-        showChip();
-        input.placeholder = 'What should I do with it? (or just send)';
-        input.focus();
-      };
+      reading = new Promise(function (done) {
+        reader.onload = function () {
+          reading = null;
+          done();
+          attached = { name: file.name, media_type: type, size: file.size, data: String(reader.result).split(',')[1],
+            url: URL.createObjectURL(file) };
+          showChip();
+          if (autoSend) return send(autoSend);
+          hint('What should I do with it? (or just send)');
+          input.focus();
+        };
+        reader.onerror = function () { reading = null; done(); addMsg('bot', 'I could not read "' + file.name + '".', false); };
+      });
       reader.readAsDataURL(file);
     }
     function showChip() {
@@ -1460,10 +1758,22 @@
 
     function handleReply(r) {
       if (r.session_id) { state.sessionId = r.session_id; saveState(); }
+      if (r.query_result) showQueryResult(r.query_result, r.query_chart);
       (r.messages || []).forEach(function (m) { addMsg('bot', m); });
+      if (r.query_chart && !r.query_result) card('<h4>' + esc(r.query_chart.query) + '</h4>' + queryChart(r.query_chart)).classList.add('psa-qr');
+      if (r.query_rows) showQueryRows(r.query_rows);
       if (r.confirm) showConfirm(r.confirm);
       if (r.record) showRecordCard(r.record);
       if (r.batch) showBatch(r.batch);
+      if (r.approvals) showApprovals(r.approvals);
+      if (r.runbook) showRunbook(r.runbook);
+      if (r.runbook_run) showRunbookStart(r.runbook_run);
+      if (r.monitor) showMonitor(r.monitor);
+      if (r.watch_plan) showWatchPlan(r.watch_plan);
+      if (r.test_suite) showTestSuite(r.test_suite);
+      if (r.incidents) showIncidents(r.incidents);
+      if (r.ci_load) { if (r.ci_load.load) showCILoad(r.ci_load.load); else ciPicker(r.ci_load.ci); }
+      if (r.query_run) return runQuery(r.query_run);
       if (r.action) return runAndReport(r.action);
       if (r.live) return runLive(r.live);
       if (r.batch_action) return runBatch(r.batch_action);
@@ -1492,6 +1802,9 @@
       }
       if (busy) return;
       [].forEach.call(logEl.querySelectorAll('.psa-welcome'), function (w) { w.remove(); });
+      newsSeen(true);
+      phHold = false;
+      input.placeholder = PLACEHOLDER;
       var att = attached;
       attached = null;
       showChip();
@@ -1971,7 +2284,8 @@
     }
 
     function runTroubleshoot(t) {
-      var title = t.title || ('Troubleshooting process ' + t.instance), what = t.kind === 'security' ? 'Checking access' : 'Investigating process ' + t.instance;
+      var title = t.title || ('Troubleshooting process ' + t.instance);
+      var what = t.kind === 'security' ? 'Checking access' : t.kind === 'approval' ? 'Reviewing absence request ' + t.thread : 'Investigating process ' + t.instance;
       var feed = activity(title), logs = [], first = true;
       setStatus('working', what);
       var reads = (t.logs || []).map(function (lf) {
@@ -1992,7 +2306,7 @@
           if (!r.done) { setStatus('working', what); return next(); }
           feed.finish(r.diagnosis ? 'success' : 'error');
           setStatus(r.diagnosis ? 'idle' : 'error');
-          if (r.diagnosis) (r.diagnosis.kind === 'security' ? showAccess : showDiagnosis)(r.diagnosis);
+          if (r.diagnosis) ({ security: showAccess, approval: showReview }[r.diagnosis.kind] || showDiagnosis)(r.diagnosis);
           else addMsg('bot', '⚠️ ' + (r.error || 'I could not finish the investigation.'));
         }, function (e) {
           looking.remove();
@@ -2096,6 +2410,1380 @@
         var btn = e.target;
         (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(function () { btn.textContent = 'Copied'; },
           function () { btn.textContent = 'Copy not allowed here'; });
+      });
+    }
+
+    /* Absence requests waiting for approval: Review with AI starts a review (the same step loop as troubleshooting) */
+    function fmtDay(d) {
+      var m = String(d || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+      return m ? +m[3] + ' ' + 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' ')[m[2] - 1] + ' ' + m[1] : esc(d);
+    }
+    function showApprovals(a) {
+      var items = a.items || [];
+      if (!items.length) return;
+      var c = card('<h4>' + (a.everyone ? 'Absence requests waiting for approval' : 'Absence requests waiting for you') + '</h4>'
+        + '<div class="psa-apr-list">' + items.map(function (x, i) {
+          var days = x.from === x.to ? fmtDay(x.from) : fmtDay(x.from) + ' – ' + fmtDay(x.to);
+          var who = x.waiting_for_you ? 'Waiting for you' : 'Waiting for ' + esc(x.approver) + (x.approvers > 1 ? ' and ' + (x.approvers - 1) + ' more' : '');
+          return '<div class="psa-apr"><div><b>' + esc(x.name) + '</b> <small>' + esc(x.employee) + '</small><br>' + esc(x.absence) + ' · ' + days
+            + (x.hours != null ? ' · ' + esc(x.hours) + ' h' : '') + '<small class="psa-apr-who">' + who + ' · since ' + fmtDay(x.since) + '</small></div>'
+            + '<button type="button" class="psa-ok" data-i="' + i + '">Review with AI</button></div>';
+        }).join('') + '</div>');
+      c.addEventListener('click', function (e) {
+        var b = e.target.closest && e.target.closest('[data-i]');
+        if (!b || busy) return;
+        var x = items[+b.getAttribute('data-i')];
+        b.disabled = true;
+        b.textContent = 'Reviewing...';
+        addMsg('user', 'Review the absence request of ' + x.name + ' (' + x.absence + ', ' + fmtDay(x.from) + ')');
+        setBusy(true);
+        api('/api/approvals/review', { session_id: state.sessionId, thread: x.thread })
+          .then(function (r) { b.textContent = 'Reviewed'; return runTroubleshoot(r.troubleshoot); },
+                function (err) { b.disabled = false; b.textContent = 'Review with AI'; addMsg('bot', '⚠️ ' + err.message, false); })
+          .then(function () { setBusy(false); });
+      });
+    }
+
+    var RECOMMEND = {
+      approve: ['Recommend: approve', '#065f46', '#d1fae5', 'I reviewed this request. Everything checks out: please approve it.'],
+      send_back: ['Recommend: send back', '#92400e', '#fef3c7', 'I reviewed this request. Something needs fixing before you approve it.'],
+      deny: ['Recommend: deny', '#991b1b', '#fee2e2', 'I reviewed this request. I recommend you deny it.'],
+      needs_review: ['Needs your review', '#334155', '#f1f5f9', 'I reviewed this request but the data cannot settle it: please look at it yourself.']
+    };
+    var CONF_COLOR = { high: '#16a34a', medium: '#d97706', low: '#dc2626' };
+    var CHECK_MARK = { ok: ['ok', '✓'], warning: ['warning', '!'], problem: ['missing', '✕'], info: ['info', 'i'] };
+
+    /* Absence review result: the approval status (from PeopleSoft), the recommendation and its confidence score,
+       the checks behind it and a comment to send. The approver approves or denies in PeopleSoft. */
+    function showReview(d) {
+      var r = RECOMMEND[d.recommendation] || RECOMMEND.needs_review, st = d.status || {}, score = +d.confidence_score || 0;
+      var conf = d.confidence || 'low', col = CONF_COLOR[conf] || CONF_COLOR.low;
+      var waiting = st.waiting_count ? (st.reviewer_is_approver ? 'Waiting for <b>you</b>' : 'Waiting for <b>' + esc((st.waiting_for || []).join(', ')) + '</b>')
+        + (st.waiting_count > (st.waiting_for || []).length ? ' and ' + (st.waiting_count - st.waiting_for.length) + ' more' : '') : 'Not waiting for anyone';
+      var decided = (st.decided || []).map(function (x) { return esc(x.status) + ' by ' + esc(x.by) + (x.on ? ' on ' + fmtDay(x.on) : ''); }).join('; ');
+      var approvalsUrl = componentUrl({ menu: 'EOAWMA_MAIN_FL', component: 'EOAWMA_MAIN_FL' });
+      var c = card('<h4>Absence request ' + esc(d.thread) + (d.request ? ': ' + esc(d.request) : '') + '</h4>'
+        + '<div class="psa-apr-status"><b>Approval status</b> ' + esc(st.thread_status || '?') + (st.step ? ' · step ' + esc(st.step) : '')
+        + ' · ' + waiting + (decided ? '<br>' + decided : '') + (st.submitted ? '<br><small>Submitted ' + fmtDay(st.submitted) + ' by ' + esc(st.requested_by) + '</small>' : '') + '</div>'
+        + '<div class="psa-diag-top"><span class="psa-badge" style="color:' + r[1] + ';background:' + r[2] + '">' + r[0] + '</span>'
+        + '<div class="psa-conf" title="' + esc(d.confidence_reason || '') + '"><div class="psa-conf-h"><span>Confidence</span><b style="color:' + col + '">' + score + '/100 · '
+        + esc(conf) + '</b></div><div class="psa-conf-bar"><i style="width:' + Math.max(2, Math.min(100, score)) + '%;background:' + col + '"></i></div></div></div>'
+        + '<p class="psa-diag-sum"><b>' + r[3] + '</b><br>' + md(d.summary || '') + '</p>'
+        + (d.confidence_reason ? '<div class="psa-diag-sec"><b>Why this confidence</b>' + md(d.confidence_reason) + '</div>' : '')
+        + ((d.checks || []).length ? '<div class="psa-diag-sec"><b>What I checked</b>' + d.checks.map(function (x) {
+          var m = CHECK_MARK[x.status] || CHECK_MARK.info;
+          return '<div class="psa-chk ' + m[0] + '"><i>' + m[1] + '</i><span><b>' + esc(x.check) + '</b>: ' + md(x.detail) + '</span></div>';
+        }).join('') + '</div>' : '')
+        + (d.comment ? '<div class="psa-diag-sec"><b>Suggested comment</b><div class="psa-fix">' + md(d.comment) + '</div></div>' : '')
+        + ((d.not_checked || []).length ? '<details><summary>Not checked</summary><ul>' + d.not_checked.map(function (x) { return '<li>' + md(x) + '</li>'; }).join('') + '</ul></details>' : '')
+        + ((d.queries || []).length ? '<details><summary>' + d.queries.length + ' extra read-only ' + (d.queries.length === 1 ? 'query' : 'queries') + '</summary>'
+          + d.queries.map(function (q) { return '<div class="psa-q"><b>' + esc(q.purpose) + '</b> (' + q.rows + ' rows)<pre class="psa-code">' + esc(q.sql) + '</pre></div>'; }).join('')
+          + '</details>' : '')
+        + '<small>You decide: approve or deny in PeopleSoft. I never approve anything myself.</small>'
+        + '<div class="psa-actions"><a class="psa-btn" target="_blank" rel="noopener" href="' + esc(approvalsUrl) + '">Open Approvals in PeopleSoft</a>'
+        + (d.comment ? '<button type="button" class="psa-no" data-comment>Copy comment</button>' : '')
+        + '<button type="button" class="psa-no" data-copy>Copy report</button></div>');
+      c.classList.add('psa-diag');
+      function copy(btn, text) {
+        (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(function () { btn.textContent = 'Copied'; },
+          function () { btn.textContent = 'Copy not allowed here'; });
+      }
+      var cm = c.querySelector('[data-comment]');
+      if (cm) cm.addEventListener('click', function () { copy(cm, d.comment); });
+      c.querySelector('[data-copy]').addEventListener('click', function (e) {
+        copy(e.target, ['Absence request ' + d.thread + ': ' + (d.request || ''), r[0] + ' (confidence ' + score + '/100, ' + conf + ')',
+          'Approval status: ' + (st.thread_status || '?') + ', ' + waiting.replace(/<[^>]+>/g, ''), '', d.summary, '', 'Why this confidence: ' + (d.confidence_reason || '-'), '']
+          .concat((d.checks || []).map(function (x) { return '[' + x.status + '] ' + x.check + ': ' + x.detail; }),
+            d.comment ? ['', 'Suggested comment: ' + d.comment] : [],
+            (d.not_checked || []).length ? ['', 'Not checked:'].concat(d.not_checked.map(function (x) { return '- ' + x; })) : []).join('\n'));
+      });
+    }
+
+    /* Runbook drafted from a checklist: every step by type, what each check query returns today,
+       the author's open questions; Publish saves it (nothing runs). */
+    var RB_TYPE = {
+      check: ['Check', '#075985', '#e0f2fe'], task: ['Task', '#3730a3', '#e0e7ff'], process: ['Process', '#6b21a8', '#f3e8ff'],
+      approval: ['Approval', '#92400e', '#fef3c7'], manual: ['Manual', '#334155', '#f1f5f9']
+    };
+    function showRunbook(rb) {
+      if (!panel.classList.contains('psa-wide')) setWide(true);
+      var steps = (rb.steps || []).map(function (st) {
+        var t = RB_TYPE[st.type] || RB_TYPE.manual, d = [];
+        if (st.task) {
+          d.push('Runs the task <b>' + esc(st.task) + '</b>' + (st.values && st.values.length ? ' with ' + st.values.map(function (v) {
+            return esc(v.label) + ' = <code>' + esc(v.value) + '</code>';
+          }).join(', ') : ''));
+          if (st.asks && st.asks.length) d.push('<small>Asks when it runs: ' + esc(st.asks.join(', ')) + '</small>');
+          if (st.type === 'process') d.push('<small>Then waits for Success in Process Monitor.</small>');
+        }
+        if (st.rule) {
+          var x = st.test || {}, rows = x.rows ? ' (' + x.rows + (x.more ? '+' : '') + ' rows)' : ' (no rows)';
+          var test = x.error ? ['Query error: ' + x.error, '#991b1b', '#fee2e2']
+            : x.skipped ? ['Not tested: ' + x.skipped, '#334155', '#f1f5f9']
+            : x.passes ? ['Today: passes' + rows, '#065f46', '#d1fae5'] : ['Today: fails' + rows, '#92400e', '#fef3c7'];
+          var tried = x['with'] ? Object.keys(x['with']).map(function (k) { return k + ' = ' + x['with'][k]; }).join(', ') : '';
+          d.push(esc(st.rule) + ' <small>(' + (st.expect === 'rows' ? 'passes when the query finds rows' : 'passes when the query finds nothing') + ')</small>');
+          d.push('<span class="psa-rb-test" style="color:' + test[1] + ';background:' + test[2] + '">' + esc(test[0]) + '</span>'
+            + (tried ? ' <small>tested with ' + esc(tried) + '</small>' : ''));
+          d.push('<details><summary>Query</summary><pre class="psa-code">' + esc(st.sql) + '</pre></details>');
+        }
+        if (st.instructions) d.push(esc(st.instructions));
+        if (st.warn_only) d.push('<small>If it fails: reported, and the run goes on.</small>');
+        return '<li><div class="psa-rb-h"><span class="psa-rb-n">' + st.n + '</span><b>' + esc(st.title) + '</b>'
+          + '<span class="psa-rb-t" style="color:' + t[1] + ';background:' + t[2] + '">' + t[0] + '</span></div>'
+          + '<div class="psa-rb-d">' + d.join('<br>') + (st.owner ? '<br><small>Owner: ' + esc(st.owner) + '</small>' : '') + '</div></li>';
+      }).join('');
+      var inputs = (rb.inputs || []).map(function (i) {
+        return '<tr><td>' + esc(i.label) + '</td><td>' + (i['default'] ? '<code>' + esc(i['default']) + '</code> <small>(default)</small>' : '<small>asked each run</small>')
+          + (i.hint ? '<small>' + esc(i.hint) + '</small>' : '') + '</td></tr>';
+      }).join('');
+      var c = card('<h4>Runbook: ' + esc(rb.title) + '</h4>'
+        + (rb.source ? '<small>Drafted from ' + esc(rb.source) + '</small>' : '')
+        + (rb.summary ? '<p class="psa-diag-sum">' + esc(rb.summary) + '</p>' : '')
+        + ((rb.problems || []).length ? '<div class="psa-rb-warn" style="background:#fef2f2;color:#7f1d1d"><b>Problems I could not fix</b><ul>'
+          + rb.problems.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>' : '')
+        + ((rb.questions || []).length ? '<div class="psa-rb-warn" style="background:#fffbeb;color:#78350f"><b>Please check</b><ul>'
+          + rb.questions.map(function (x) { return '<li>' + md(x) + '</li>'; }).join('') + '</ul></div>' : '')
+        + (inputs ? '<div class="psa-diag-sec"><b>Inputs (each run)</b><table>' + inputs + '</table></div>' : '')
+        + '<div class="psa-diag-sec"><b>' + (rb.steps || []).length + ' steps</b><ol class="psa-rb-steps">' + steps + '</ol></div>'
+        + '<small>Nothing has run. To change a step, tell me in the chat and I will redraft the runbook.</small>'
+        + '<label class="psa-check" style="display:none"><input type="checkbox" data-k="overwrite"> Replace the existing runbook</label>'
+        + '<div class="psa-actions"><button type="button" class="psa-ok" data-pub>Publish runbook</button><button type="button" class="psa-no" data-x>Discard</button></div>');
+      var pub = c.querySelector('[data-pub]'), over = c.querySelector('[data-k="overwrite"]');
+      c.querySelector('[data-x]').addEventListener('click', function () { disable(c); addMsg('bot', 'Runbook draft discarded.', false); });
+      pub.addEventListener('click', function () {
+        pub.disabled = true;
+        pub.textContent = 'Publishing...';
+        api('/api/runbooks/save', { session_id: state.sessionId, draft_id: rb.draft_id, overwrite: over.checked }).then(function (r) {
+          disable(c);
+          pub.textContent = 'Published';
+          addMsg('bot', 'Published **' + r.title + '** (' + r.steps + ' steps) as `' + r.path + '`.');
+        }, function (e) {
+          pub.disabled = false;
+          pub.textContent = 'Publish runbook';
+          var exists = /already exists/.test(e.message);
+          if (exists) over.parentNode.style.display = '';
+          addMsg('bot', '⚠️ ' + e.message + (exists ? '. Tick "Replace the existing runbook" to overwrite it.' : ''), false);
+        });
+      });
+    }
+
+    /* Monitor drafted in the chat: what it watches, how often, who gets the email, and what it would have caught
+       (failures in the last 30 days, what is stuck now, what the check returns now); Save starts it. */
+    function previewTable(pv) {
+      if (!pv || !(pv.sample || []).length) return '';
+      return '<table class="psa-mon-t"><tr>' + (pv.columns || []).map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr>'
+        + pv.sample.map(function (r) { return '<tr>' + r.map(function (x) { return '<td>' + esc(x) + '</td>'; }).join('') + '</tr>'; }).join('') + '</table>';
+    }
+    function showMonitor(mo) {
+      var pv = mo.preview || {}, label = pv.error ? 'Query error: ' + pv.error : pv.skipped ? 'Not tested: ' + pv.skipped : pv.label || '';
+      var c = card('<h4>Monitor: ' + esc(mo.title) + '</h4>'
+        + (mo.summary ? '<p class="psa-diag-sum">' + esc(mo.summary) + '</p>' : '')
+        + ((mo.problems || []).length ? '<div class="psa-rb-warn" style="background:#fef2f2;color:#7f1d1d"><b>Problems I could not fix</b><ul>'
+          + mo.problems.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>' : '')
+        + '<table class="psa-mon-facts"><tr><td>Watches</td><td>' + esc(mo.what) + '</td></tr><tr><td>When</td><td>' + esc(mo.when) + '</td></tr>'
+        + '<tr><td>Email</td><td>' + (mo.notify && mo.notify.length ? esc(mo.notify.join(', ')) : '<small>default recipients</small>') + '</td></tr></table>'
+        + (label ? '<div class="psa-diag-sec"><b>' + esc(label) + '</b>' + previewTable(pv) + '</div>' : '')
+        + ((mo.warnings || []).length ? '<div class="psa-rb-warn" style="background:#fffbeb;color:#78350f"><ul>'
+          + mo.warnings.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>' : '')
+        + '<small>It only reads. Each alert is analysed and emailed with the action needed; nothing is rerun or changed.'
+        + (mo.exists ? ' Saving replaces the monitor with the same name.' : '') + '</small>'
+        + '<div class="psa-actions"><button type="button" class="psa-ok" data-save>Save and start</button><button type="button" class="psa-no" data-x>Discard</button></div>');
+      var save = c.querySelector('[data-save]');
+      c.querySelector('[data-x]').addEventListener('click', function () { disable(c); addMsg('bot', 'Monitor discarded.', false); });
+      save.addEventListener('click', function () {
+        save.disabled = true;
+        save.textContent = 'Saving...';
+        api('/api/monitors/save', { session_id: state.sessionId, draft_id: mo.draft_id }).then(function (r) {
+          disable(c);
+          save.textContent = 'Running';
+          addMsg('bot', 'Saved **' + r.title + '** (`' + r.path + '`). It runs ' + r.when.toLowerCase() + ', starting now.');
+        }, function (e) {
+          save.disabled = false;
+          save.textContent = 'Save and start';
+          addMsg('bot', '⚠️ ' + e.message, false);
+        });
+      });
+    }
+
+    /* ＋ Features: the fixed things the agent does, by role. Picking one starts a guided flow (Watch jobs, Build a
+       runbook: download the template, fill it, upload it) or asks the question for you. */
+    function features() {
+      var m = me || {}, f = [];
+      if (m.can_monitor && m.watcher) {
+        f.push({ k: 'monitor', t: 'Watch jobs', s: 'Upload a watch plan: I watch and email the analysis', go: guideWatch });
+        f.push({ k: 'monitor', t: 'Manage watchdogs', s: 'Pause, run, delete, download', go: showManager });
+      }
+      if (m.regress) f.push({ k: 'test', t: 'Regression tests', s: 'Replay the tasks after a patch: what broke?', go: showRegress });
+      if (m.can_teach) f.push({ k: 'runbook', t: 'Build a runbook', s: 'Upload your checklist', go: guideRunbook });
+      if ((m.runbooks || []).length) f.push({ k: 'runbook', t: 'Run a runbook', s: m.runbooks.length + ' published', go: pickRunbook });
+      if (m.troubleshoot) f.push({ k: 'trouble', t: 'Troubleshoot a process', s: 'Why did my last process fail?', go: function () { send('Why did my last process fail?'); } });
+      if (m.security) f.push({ k: 'security', t: 'Check someone\'s access', s: 'Why can\'t a user open a page?', go: function () {
+        input.value = 'Why can\'t '; hint('e.g. Why can\'t ABSMITH access Create Job Opening?'); input.focus(); } });
+      else if (m.own_access) f.push({ k: 'security', t: 'Check my access', s: 'Why can\'t I open a page?', go: function () {
+        input.value = 'Why can\'t I open '; hint('e.g. Why can\'t I open Create Job Opening?'); input.focus(); } });
+      if (m.approvals) f.push({ k: 'approve', t: 'Review absence approvals', s: 'I check each request and recommend', go: function () { send('Show my pending absence approvals'); } });
+      if (m.can_teach) f.push({ k: 'task', t: 'Record a task', s: 'Do it once by hand, I learn it', go: function () { showRecordCard({ title: '' }); } });
+      if (m.ask_data) f.push({ k: 'data', t: 'Ask the data', s: 'How many, who, which: from your AI_ queries', go: showQueries });
+      if (m.ci) f.push({ k: 'ci', t: 'Load with a CI', s: 'Excel to CI: upload rows, I check and load them', go: function () { ciPicker(); } });
+      if (m.can_audit) f.push({ k: 'audit', t: 'Audit', s: 'Usage, cost, failures and the audit log', go: function () { openAudit(); } });
+      return f;
+    }
+    function toggleFeatures(show) {
+      var menu = panel.querySelector('#psa-featmenu'), btn = panel.querySelector('#psa-feat');
+      show = show === undefined ? menu.hidden : show;
+      if (show) {
+        var f = features();
+        menu.innerHTML = f.length ? f.map(function (x, i) {
+          var ic = TILE[x.k];
+          return '<button type="button" role="menuitem" data-f="' + i + '"><span class="psa-tic" style="color:' + ic[1] + ';background:' + ic[2] + '">'
+            + ic[0] + '</span><span><b>' + esc(x.t) + '</b><small>' + esc(x.s) + '</small></span></button>';
+        }).join('') : '<small style="padding:6px;display:block">Connecting to the agent...</small>';
+        menu.onclick = function (e) {
+          var b = e.target.closest && e.target.closest('[data-f]');
+          if (!b) return;
+          toggleFeatures(false);
+          [].forEach.call(logEl.querySelectorAll('.psa-welcome'), function (w) { w.remove(); });
+          f[+b.getAttribute('data-f')].go();
+        };
+      }
+      menu.hidden = !show;
+      btn.setAttribute('aria-expanded', show ? 'true' : 'false');
+      if (show) { var first = menu.querySelector('button'); if (first) first.focus(); }
+    }
+
+    /* A file the service sends as {name, data (base64)}: saved through the browser's download */
+    function download(path) {
+      return apiGet(path).then(function (r) {
+        var bin = atob(r.data), bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([bytes], { type: XLSX }));
+        a.download = r.name;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+        return r.name;
+      });
+    }
+    function guide(title, steps, template, uploadText, extra) {
+      var c = card('<h4>' + esc(title) + '</h4><ol>' + steps.map(function (x) { return '<li>' + md(x) + '</li>'; }).join('') + '</ol>'
+        + '<div class="psa-actions"><button type="button" class="psa-ok" data-up>Upload the filled template</button>'
+        + '<button type="button" class="psa-no" data-dl>Download the template</button>' + (extra || '') + '</div>');
+      c.classList.add('psa-guide');
+      c.querySelector('[data-dl]').addEventListener('click', function (e) {
+        var b = e.target;
+        b.disabled = true;
+        download('/api/templates/' + template).then(function (name) { b.disabled = false; b.textContent = 'Downloaded ' + name; },
+          function (err) { b.disabled = false; addMsg('bot', '⚠️ ' + err.message, false); });
+      });
+      c.querySelector('[data-up]').addEventListener('click', function () { uploadAs = uploadText; panel.querySelector('#psa-file').click(); });
+      return c;
+    }
+    function guideWatch() {
+      var c = guide('Watch jobs', [
+        '**Download the watch plan template.** It comes with examples: AEMINITEST and XRFWIN failures, XRFWIN stuck, PORTAL_CSS must succeed by 07:00.',
+        '**Fill one row per job:** the process, what to watch for (Failure, Stuck, Must succeed by, Data check), when, and who gets the email.',
+        '**Upload it here.** I check every row against PeopleSoft and give you an overview with what each watchdog would have caught. Nothing runs until you confirm.'
+      ], 'watch_plan', 'Build a watch plan from this sheet', '<button type="button" class="psa-no" data-mg>Manage watchdogs</button>');
+      c.querySelector('[data-mg]').addEventListener('click', showManager);
+    }
+    function guideRunbook() {
+      guide('Build a runbook', [
+        '**Download the checklist template**, or use the checklist you already have (Excel, CSV or PDF).',
+        '**One row per step:** what to do, the process or page, what must be true afterwards, who owns it.',
+        '**Upload it here.** I map every row to a check, task, process, approval or manual step and test the checks. You review it and publish.'
+      ], 'runbook', 'Build a runbook from this checklist');
+    }
+    function pickRunbook() {
+      var rbs = (me && me.runbooks) || [];
+      var c = card('<h4>Run a runbook</h4><ul class="psa-inc-list">' + rbs.map(function (r, i) {
+        return '<li><button type="button" data-r="' + i + '"><b>' + esc(r.title) + '</b><small>' + r.steps + ' steps</small>'
+          + (r.summary ? '<span>' + esc(r.summary) + '</span>' : '') + '</button></li>';
+      }).join('') + '</ul>');
+      c.addEventListener('click', function (e) {
+        var b = e.target.closest && e.target.closest('[data-r]');
+        if (b) send('Run the runbook ' + rbs[+b.getAttribute('data-r')].title);
+      });
+    }
+
+    /* The overview of an uploaded watch plan: every watchdog with what it would have caught, what changes when the
+       plan already exists; Confirm and schedule saves it and the watcher starts. */
+    function showWatchPlan(wp) {
+      if (!panel.classList.contains('psa-wide')) setWide(true);
+      var ch = wp.changes, list = function (title, items) { return items.length ? '<li><b>' + title + ':</b> ' + items.map(esc).join(', ') + '</li>' : ''; };
+      var rows = (wp.watchdogs || []).map(function (d) {
+        var pv = d.preview || {}, label = pv.error ? 'Query error: ' + pv.error : pv.skipped ? 'Not tested: ' + pv.skipped : pv.label || '';
+        return '<tr><td>' + d.n + '</td><td><b>' + esc(d.title) + '</b>' + (d.paused ? ' <small>(paused)</small>' : '') + '<small>' + esc(d.what) + '</small>'
+          + ((d.problems || []).length ? '<small style="color:#b91c1c">' + d.problems.map(esc).join('<br>') + '</small>' : '') + '</td>'
+          + '<td>' + esc(d.when) + '</td><td>' + (d.notify && d.notify.length ? esc(d.notify.join(', ')) : '<small>default</small>') + '</td>'
+          + '<td>' + esc(label) + (pv.sample && pv.sample.length ? '<details><summary>Examples</summary>' + previewTable(pv) + '</details>' : '') + '</td></tr>';
+      }).join('');
+      var c = card('<h4>Watch plan: ' + esc(wp.title) + '</h4>'
+        + (wp.source ? '<small>From ' + esc(wp.source) + '</small>' : '')
+        + (wp.summary ? '<p class="psa-diag-sum">' + esc(wp.summary) + '</p>' : '')
+        + ((wp.problems || []).length ? '<div class="psa-rb-warn" style="background:#fef2f2;color:#7f1d1d"><b>Problems I could not fix</b><ul>'
+          + wp.problems.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>' : '')
+        + (ch ? '<div class="psa-chg"><b>This replaces the saved plan ' + esc(wp.title) + '</b><ul>' + list('Added', ch.added) + list('Removed', ch.removed)
+          + list('Changed', ch.changed.map(function (x) { return x.title + ' (' + x.fields.join(', ').replace(/_/g, ' ') + ')'; }))
+          + '<li>' + ch.unchanged + ' unchanged</li></ul></div>' : '')
+        + ((wp.questions || []).length ? '<div class="psa-rb-warn" style="background:#fffbeb;color:#78350f"><b>Please check</b><ul>'
+          + wp.questions.map(function (x) { return '<li>' + md(x) + '</li>'; }).join('') + '</ul></div>' : '')
+        + '<table class="psa-mon-t psa-wp"><tr><th>#</th><th>Watchdog</th><th>When</th><th>Email</th><th>What it would have caught</th></tr>' + rows + '</table>'
+        + ((wp.warnings || []).length ? '<div class="psa-rb-warn" style="background:#fffbeb;color:#78350f"><ul>'
+          + wp.warnings.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>' : '')
+        + '<small>Watchdogs only read. Each alert is analysed and emailed with the action needed; nothing is rerun or changed.</small>'
+        + '<div class="psa-actions"><button type="button" class="psa-ok" data-go>Confirm and schedule</button><button type="button" class="psa-no" data-x>Discard</button></div>');
+      var go = c.querySelector('[data-go]');
+      c.querySelector('[data-x]').addEventListener('click', function () { disable(c); addMsg('bot', 'Watch plan discarded. Nothing was scheduled.', false); });
+      go.addEventListener('click', function () {
+        go.disabled = true;
+        go.textContent = 'Scheduling...';
+        api('/api/watchplans/save', { session_id: state.sessionId, draft_id: wp.draft_id }).then(function (r) {
+          disable(c);
+          go.textContent = 'Scheduled';
+          setDogs(r.counts);
+          addMsg('bot', 'Scheduled **' + r.title + '**: ' + r.watchdogs + ' watchdogs (`' + r.path + '`). They start now; open **◉ watchdogs** below to pause, run, delete or download them.');
+        }, function (e) {
+          go.disabled = false;
+          go.textContent = 'Confirm and schedule';
+          addMsg('bot', '⚠️ ' + e.message, false);
+        });
+      });
+    }
+
+    /* ＋ Features › Load with a CI (Excel to CI): pick a Component Interface, download its template, upload it filled
+       in; the service checks every row, then this browser posts each row to WEBLIB_SOAPTOCI in the user's own session
+       (as ExcelToCI does), so PeopleSoft saves it as them. */
+    var ciUpload = null;
+    function ciUrl() {
+      var m = location.pathname.match(/\/ps[cp]\/([^\/]+)\/([^\/]+)\/([^\/]+)\//);
+      var site = m ? m[1].replace(/_newwin$/i, '').replace(/_\d+$/, '') : 'ps';
+      return '/psc/' + site + '/' + (m ? m[2] : 'EMPLOYEE') + '/' + (m ? m[3] : 'HRMS') + '/s/WEBLIB_SOAPTOCI.SOAPTOCI.FieldFormula.IScript_SOAPToCI';
+    }
+    function soapToCI(xml) {
+      // postDataBin=y: without it the servlet doesn't pass the body on (%Request.GetContentBody() is empty).
+      // Not disconnect=y as ExcelToCI sends: that ends the user's session.
+      return fetch(ciUrl() + '?postDataBin=y', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'text/xml; charset=UTF-8' }, body: xml })
+        .then(function (r) { return r.text(); });
+    }
+    function xmlEsc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function ciPicker(name) {
+      if (name) return ciPick(name);
+      var c = card('<h4>Load with a Component Interface</h4><p class="psa-sub">Like ExcelToCI, without the macro workbook: pick a CI, '
+        + 'download its template, fill it in and upload it. I check every row before anything is saved; then each row is saved '
+        + 'through the CI as you.</p><input type="search" class="psa-ci-q" placeholder="Search CIs: user, job, position..." aria-label="Search Component Interfaces">'
+        + '<div class="psa-ci-list" role="listbox" aria-label="Component Interfaces"><small>Loading...</small></div><div class="psa-ci-loads"></div>');
+      c.classList.add('psa-ci');
+      var q = c.querySelector('.psa-ci-q'), list = c.querySelector('.psa-ci-list'), timer = null;
+      function search() {
+        apiGet('/api/ci?q=' + encodeURIComponent(q.value.trim())).then(function (r) {
+          list.innerHTML = r.cis.length ? r.cis.slice(0, 40).map(function (x) {
+            return '<button type="button" role="option" data-ci="' + esc(x.name) + '"><b>' + esc(x.name) + '</b><span>' + esc(x.descr)
+              + '</span><small>' + [x.create ? 'Create' : '', x.update ? 'Update' : ''].filter(Boolean).join(' · ') + '</small></button>';
+          }).join('') + (r.more || r.cis.length > 40 ? '<small>More match: type more of the name.</small>' : '')
+            : '<small>No CI you may load matches "' + esc(q.value) + '".</small>';
+        }, function (e) { list.innerHTML = '<small>⚠️ ' + esc(e.message) + '</small>'; });
+      }
+      q.addEventListener('input', function () { clearTimeout(timer); timer = setTimeout(search, 250); });
+      list.addEventListener('click', function (e) { var b = e.target.closest('[data-ci]'); if (b) ciPick(b.getAttribute('data-ci')); });
+      search();
+      apiGet('/api/ci/loads').then(function (r) {
+        if (!r.loads.length) return;
+        c.querySelector('.psa-ci-loads').innerHTML = '<h5>Your recent loads</h5>' + r.loads.slice(0, 5).map(function (l) {
+          return '<div class="psa-ci-ld"><span><b>' + esc(l.file) + '</b> → ' + esc(l.ci) + '<small>' + esc(ciStatus(l)) + '</small></span>'
+            + '<button type="button" data-open="' + esc(l.load_id) + '">' + (/paused|checked|running/.test(l.status) && l.processed < l.total ? 'Resume' : 'Open') + '</button></div>';
+        }).join('');
+        c.querySelector('.psa-ci-loads').addEventListener('click', function (e) {
+          var b = e.target.closest('[data-open]');
+          if (b) apiGet('/api/ci/load?load=' + encodeURIComponent(b.getAttribute('data-open'))).then(function (x) { showCILoad(x.load); });
+        });
+      }, function () {});
+      setTimeout(function () { q.focus(); }, 50);
+    }
+    function ciStatus(l) {
+      var d = l.done || {};
+      if (l.status === 'checked') return l.created.slice(5, 16) + ': checked, ' + l.counts.ready + ' ready, ' + l.counts.problems + ' with problems';
+      return (l.started || l.created).slice(5, 16) + ': ' + l.status + ', ' + l.processed + ' of ' + l.total + ' loaded'
+        + (d.error ? ', ' + d.error + ' failed' : '');
+    }
+    function ciPick(name) {
+      var wait = addMsg('bot', 'Reading **' + name + '** from PeopleSoft...', false);
+      return apiGet('/api/ci/shape?ci=' + encodeURIComponent(name)).then(function (r) {
+        if (r.shape) return r;
+        /* the CI's shape, as ExcelToCI's New Template reads it: GetCIShape through SOAPTOCI, in this session */
+        return soapToCI(r.request).then(function (xml) { return api('/api/ci/shape', { ci: name, xml: xml }); });
+      }).then(function (r) { if (wait) wait.remove(); showCIShape(r.shape); },
+        function (e) { if (wait) wait.remove(); addMsg('bot', '⚠️ ' + e.message, false); });
+    }
+    function showCIShape(s) {
+      function propRow(cpath, p) {
+        var id = cpath ? cpath + '.' + p.name : p.name, locked = p.key || (p.required && !p.readonly);
+        if (p.readonly && !p.key) return '';
+        if (p.secret) return '<li class="psa-ci-sec"><span>🔒 ' + esc(p.label) + '</span><small>typed on the load card, never in the file</small></li>';
+        return '<li><label><input type="checkbox" data-p="' + esc(id) + '"' + (p['default'] ? ' checked' : '') + (locked ? ' disabled' : '') + '> '
+          + esc(p.label) + (p.required && !p.readonly ? ' <em>*</em>' : '') + (p.key ? ' <em>key</em>' : '') + '</label><small>' + esc(p.name) + ' · '
+          + esc(p.type_label) + (p.length ? ' ' + p.length : '') + (p.values ? ' · ' + p.values + ' values' : '') + '</small></li>';
+      }
+      function coll(c) {
+        var props = c.props.map(function (p) { return propRow(c.path, p); }).join('');
+        return '<details' + (c.level === 0 ? ' open' : '') + ' class="psa-ci-coll" style="margin-left:' + (c.level * 12) + 'px"><summary><b>'
+          + esc(c.level === 0 ? s.ci : c.name) + '</b> <small>' + (c.level === 0 ? 'one row per record' : 'a list in each record: its own sheet')
+          + '</small></summary><ul>' + props + '</ul></details>' + c.collections.map(coll).join('');
+      }
+      var can = [s.can.create ? 'Create' : '', s.can.update ? 'Update' : ''].filter(Boolean).join(' and ');
+      var c = card('<h4>' + esc(s.ci) + ': ' + esc(s.descr) + '</h4><p class="psa-sub">You may <b>' + esc(can || 'not load') + '</b> through this CI. '
+        + 'Tick the columns you want in the template (keys and required ones are always in). Lists like Roles get their own sheet.</p>'
+        + '<div class="psa-ci-tree">' + coll(s.root) + '</div><div class="psa-actions"><button type="button" class="psa-ok" data-dl>Download template</button>'
+        + '<button type="button" class="psa-no" data-up>Upload the filled template</button></div>');
+      c.classList.add('psa-ci');
+      c.querySelector('[data-dl]').addEventListener('click', function (e) {
+        var b = e.target, props = [].map.call(c.querySelectorAll('[data-p]:checked'), function (x) { return x.getAttribute('data-p'); });
+        b.disabled = true;
+        api('/api/ci/template', { ci: s.ci, props: props }).then(function (r) { saveB64(r); b.disabled = false; b.textContent = 'Downloaded ' + r.name; },
+          function (err) { b.disabled = false; addMsg('bot', '⚠️ ' + err.message, false); });
+      });
+      c.querySelector('[data-up]').addEventListener('click', function () { ciUpload = { ci: s.ci }; panel.querySelector('#psa-file').click(); });
+      c.scrollIntoView({ block: 'nearest' });
+    }
+    function saveB64(r) {
+      var bin = atob(r.data), bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([bytes], { type: XLSX }));
+      a.download = r.name;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    }
+    function ciUploadFile(file, cu) {
+      if (!file) return;
+      if (!/\.xlsx$/i.test(file.name)) { addMsg('bot', 'Upload the template as an Excel file (.xlsx).', false); return; }
+      var reader = new FileReader();
+      reader.onload = function () {
+        addMsg('user', '📎 ' + file.name, false);
+        var wait = addMsg('bot', 'Checking every row of **' + file.name + '** against PeopleSoft...', false);
+        api('/api/ci/check', { ci: cu.ci, name: file.name, data: String(reader.result).split(',')[1] }).then(function (r) {
+          if (wait) wait.remove();
+          showCILoad(r.load);
+        }, function (e) { if (wait) wait.remove(); addMsg('bot', '⚠️ ' + e.message, false); });
+      };
+      reader.readAsDataURL(file);
+    }
+    var CI_STATUS = { ready: ['Ready', ''], problem: ['Problem', 'psa-bad'], ok: ['✓ Saved', 'psa-good'], warning: ['✓ Saved, warning', 'psa-warnt'], error: ['✕ Failed', 'psa-bad'] };
+    function ciRows(l) {
+      return '<div class="psa-ci-rows"><table><thead><tr><th>Row</th><th>Action</th><th>Key</th><th>Lists</th><th>Status</th></tr></thead><tbody>'
+        + l.rows.map(function (r) {
+          var st = CI_STATUS[r.status] || [r.status, ''];
+          return '<tr data-n="' + r.n + '"><td>' + r.row + '</td><td>' + esc(r.action) + '</td><td><b>' + esc(r.label) + '</b></td><td>' + (r.children || '')
+            + '</td><td><span class="' + st[1] + '">' + st[0] + '</span>' + (r.problems.length ? '<br><small>' + r.problems.map(esc).join('<br>') + '</small>'
+            : r.detail && r.status !== 'ok' ? '<br><small>' + esc(r.detail) + '</small>' : '') + '</td></tr>';
+        }).join('') + '</tbody></table>' + (l.more_rows ? '<small>and ' + l.more_rows + ' more rows (all in the results file)</small>' : '') + '</div>';
+    }
+    function showCILoad(l) {
+      var c = card('');
+      c.classList.add('psa-ci', 'psa-ci-load');
+      c.setAttribute('data-load', l.load_id);
+      renderCILoad(c, l);
+      c.scrollIntoView({ block: 'nearest' });
+      return c;
+    }
+    function renderCILoad(c, l) {
+      var d = l.done || {}, finished = /done|stopped/.test(l.status), left = l.total - l.processed;
+      var head = '<h4>' + esc(l.file) + ' → ' + esc(l.ci) + '</h4>';
+      var chips = '<div class="psa-ci-chips"><span>' + l.counts.rows + ' rows</span><span class="psa-good">' + l.counts.ready + ' ready</span>'
+        + (l.counts.problems ? '<span class="psa-bad">' + l.counts.problems + ' with problems: not loaded</span>' : '')
+        + (l.processed ? '<span class="psa-good">' + (d.ok + d.warning) + ' saved</span>' + (d.error ? '<span class="psa-bad">' + d.error + ' failed</span>' : '') : '') + '</div>';
+      var fileProblems = (l.file_problems || []).length ? '<ul class="psa-ci-fp">' + l.file_problems.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>' : '';
+      var secrets = !finished && left > 0 && (l.secrets || []).length ? '<div class="psa-ci-secrets">' + l.secrets.map(function (s) {
+        return '<label>' + esc(s.label) + ' for the new rows <input type="password" autocomplete="new-password" data-sec="' + esc(s.name) + '"></label>';
+      }).join('') + '<small>Typed here, filled in by this browser: it never reaches the agent service.</small></div>' : '';
+      var progress = l.processed || l.status === 'running' ? '<div class="psa-ci-bar" role="progressbar" aria-valuemin="0" aria-valuemax="' + l.total + '" aria-valuenow="'
+        + l.processed + '"><i style="width:' + (l.total ? 100 * l.processed / l.total : 0) + '%"></i></div><p class="psa-sub psa-ci-now">' + l.processed + ' of ' + l.total
+        + ' rows loaded' + (finished ? (l.status === 'stopped' ? ': stopped' : ': done') : '') + '</p>' : '';
+      var actions = '';
+      if (!finished && left > 0) {
+        actions = l.status === 'running' ? '<button type="button" class="psa-no" data-pause>Pause</button><button type="button" class="psa-no" data-stop>Stop</button>'
+          : '<button type="button" class="psa-ok" data-go>' + (l.processed ? 'Resume: load the other ' + left : 'Load ' + left + (left === 1 ? ' row' : ' rows')) + '</button>'
+            + '<button type="button" class="psa-no" data-stop>' + (l.processed ? 'Stop here' : 'Cancel') + '</button>';
+      }
+      if (l.processed || l.counts.problems) actions += '<button type="button" class="psa-no" data-x="results">Download results</button>';
+      if (l.counts.problems || d.error) actions += '<button type="button" class="psa-no" data-x="fix">Download the rows to fix</button>';
+      if (finished && d.error) actions += '<button type="button" class="psa-no" data-explain>Explain the errors</button>';
+      c.innerHTML = head + chips + fileProblems + progress + ciRows(l) + secrets + '<div class="psa-actions">' + actions + '</div>';
+      c.onclick = function (e) {
+        var b = e.target.closest && e.target.closest('button');
+        if (!b) return;
+        if (b.hasAttribute('data-go')) {
+          var secrets = {}, missing = false;
+          [].forEach.call(c.querySelectorAll('[data-sec]'), function (i) { secrets[i.getAttribute('data-sec')] = i.value; if (!i.value) missing = true; });
+          if (missing) { addMsg('bot', 'Type the password for the new rows first.', false); return; }
+          runCILoad(c, l, secrets);
+        } else if (b.hasAttribute('data-pause') || b.hasAttribute('data-stop')) {
+          c.ciHalt = b.hasAttribute('data-stop') ? 'stop' : 'pause';
+          if (l.status !== 'running') api('/api/ci/' + c.ciHalt, { load_id: l.load_id }).then(function (r) { renderCILoad(c, r.load); });
+          b.disabled = true;
+        } else if (b.hasAttribute('data-x')) {
+          download('/api/ci/export?load=' + encodeURIComponent(l.load_id) + '&what=' + b.getAttribute('data-x')).then(function (name) { b.textContent = 'Downloaded ' + name; },
+            function (err) { addMsg('bot', '⚠️ ' + err.message, false); });
+        } else if (b.hasAttribute('data-explain')) {
+          var bad = l.rows.filter(function (r) { return r.status === 'error'; }).slice(0, 15);
+          send('These rows failed when I loaded ' + l.file + ' through the CI ' + l.ci + '. Explain why in plain words and what to change in the file:\n'
+            + bad.map(function (r) { return '- row ' + r.row + ' (' + r.label + '): ' + r.detail; }).join('\n'));
+        }
+      };
+    }
+    /* the load: next row from the service -> SOAPTOCI in this session -> its answer back to the service, until done */
+    function runCILoad(c, l, secrets) {
+      c.ciHalt = null;
+      return api('/api/ci/start', { load_id: l.load_id }).then(function (r) {
+        renderCILoad(c, r.load);
+        var t0 = Date.now(), n0 = r.load.processed, last = r.load;
+        function step() {
+          if (c.ciHalt) return api('/api/ci/' + c.ciHalt, { load_id: l.load_id }).then(function (x) { renderCILoad(c, x.load); });
+          return api('/api/ci/next', { load_id: l.load_id }).then(function (x) {
+            if (x.done || x.paused) { renderCILoad(c, x.load); if (x.done) ciDone(x.load); return; }
+            var xml = x.row.xml.replace(/\{\{secret:(\w+)\}\}/g, function (m, k) { return xmlEsc(secrets[k] || ''); });
+            var now = c.querySelector('.psa-ci-now');
+            if (now) now.textContent = 'Loading ' + x.row.label + '... (' + last.processed + ' of ' + last.total + ')';
+            return soapToCI(xml).then(null, function (e) { return 'network error: ' + e.message; }).then(function (text) {
+              return api('/api/ci/result', { load_id: l.load_id, n: x.row.n, response: text });
+            }).then(function (res) {
+              last = res.load;
+              var bar = c.querySelector('.psa-ci-bar i'), done = last.processed - n0, per = (Date.now() - t0) / Math.max(1, done);
+              if (bar) bar.style.width = (100 * last.processed / Math.max(1, last.total)) + '%';
+              var row = c.querySelector('tr[data-n="' + x.row.n + '"] td:last-child'), st = CI_STATUS[res.result.status];
+              if (row) row.innerHTML = '<span class="' + st[1] + '">' + st[0] + '</span>' + (res.result.status !== 'ok' ? '<br><small>' + esc(res.result.detail) + '</small>' : '');
+              if (now) now.textContent = last.processed + ' of ' + last.total + ' rows loaded'
+                + (last.total > last.processed ? ', about ' + Math.max(1, Math.round(per * (last.total - last.processed) / 60000)) + ' min left' : '');
+              return step();
+            });
+          });
+        }
+        return step();
+      }).then(null, function (e) { addMsg('bot', '⚠️ The load stopped: ' + e.message + '. Open it again from Load with a CI to resume.', false); });
+    }
+    function ciDone(l) {
+      var d = l.done || {};
+      addMsg('bot', '**' + l.file + '**: ' + (d.ok + d.warning) + ' of ' + l.total + ' rows saved through ' + l.ci
+        + (d.warning ? ' (' + d.warning + ' with warnings)' : '') + (d.error ? ', **' + d.error + ' failed**: download the rows to fix, correct them and upload that file.' : '.')
+        + (l.counts.problems ? ' ' + plural(l.counts.problems, 'row') + ' had problems and ' + (l.counts.problems === 1 ? 'was' : 'were') + ' not loaded.' : ''), false);
+    }
+
+    /* ＋ Features › Ask the data: answers from the user's curated PS Queries (named AI_...). Claude picks the query and
+       its prompt values; this browser runs it with Query Viewer's Run to Excel link in the user's own session (PeopleSoft
+       applies their row security); the service reads the file, Claude gets only counts and totals. */
+    var queryFiles = {};       /* run_id -> PeopleSoft's Excel file, for Download Excel (memory only) */
+    function qryUrl(action, q) {
+      var m = location.pathname.match(/\/ps[cp]\/([^\/]+)\/([^\/]+)\/([^\/]+)\//);
+      var site = m ? m[1].replace(/_newwin$/i, '').replace(/_\d+$/, '') : 'ps';
+      return '/psc/' + site + '/' + (m ? m[2] : 'EMPLOYEE') + '/' + (m ? m[3] : 'HRMS') + '/q/?ICAction=' + action + '='
+        + (q.private ? 'PRIVATE.' : 'PUBLIC.') + q.name
+        + (q.params || []).map(function (x) { return '&' + encodeURIComponent(x[0]) + '=' + encodeURIComponent(x[1]); }).join('');
+    }
+    function blobB64(blob) {
+      return new Promise(function (resolve, reject) {
+        var fr = new FileReader();
+        fr.onload = function () { resolve(String(fr.result).split(',')[1]); };
+        fr.onerror = reject;
+        fr.readAsDataURL(blob);
+      });
+    }
+    function pageText(html) {   /* what PeopleSoft showed instead of the file (DOMParser runs no script, loads nothing) */
+      var d = new DOMParser().parseFromString(String(html), 'text/html');
+      [].forEach.call(d.querySelectorAll('script,style'), function (x) { x.remove(); });
+      return (d.body ? d.body.textContent : '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+    }
+    function saveBlob(blob, name) {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    }
+    function runQuery(q) {
+      var feed = activity('Running ' + q.name + ' in PeopleSoft');
+      var line = feed.add(q.title + (q.shown.length ? ': ' + q.shown.map(function (x) { return x.label + ' ' + x.value; }).join(', ') : ''));
+      setStatus('working', 'Running ' + q.name);
+      return fetch(qryUrl('ICQryNameExcelURL', q), { credentials: 'same-origin' }).then(function (r) {
+        var ct = r.headers.get('content-type') || '';
+        if (r.ok && /spreadsheet|ms-excel/i.test(ct)) {
+          return r.blob().then(function (blob) {
+            queryFiles[q.run_id] = { blob: blob, name: q.name + '.xlsx' };
+            return blobB64(blob).then(function (b64) { return { data: b64 }; });
+          });
+        }
+        return r.text().then(function (t) { return { error: pageText(t) || 'HTTP ' + r.status }; });
+      }, function (e) { return { error: 'network error: ' + e.message }; }).then(function (out) {
+        line.end(!out.error, out.error ? out.error.slice(0, 140) : null);
+        feed.finish(out.error ? 'error' : 'success');
+        var t = typing('Reading the answer...');
+        out.session_id = state.sessionId;
+        out.run_id = q.run_id;
+        return api('/api/query/result', out).then(function (r) { t.remove(); setStatus('idle'); return handleReply(r); },
+          function (e) { t.remove(); setStatus('error'); addMsg('bot', '⚠️ ' + e.message, false); });
+      });
+    }
+    function queryChart(ch) {
+      return '<div class="psa-qr-chart"><h5>' + esc(ch.value.charAt(0).toUpperCase() + ch.value.slice(1) + ' by ' + ch.by.join(' and ')) + '</h5>'
+        + hbars(ch.rows.slice(0, 15), function (r) { return r.slice(0, -1).join(' · '); }, function (r) { return +r[r.length - 1] || 0; }, num)
+        + (ch.rows.length > 15 || ch.more ? '<small>and ' + ((ch.more || 0) + Math.max(0, ch.rows.length - 15)) + ' more</small>' : '') + '</div>';
+    }
+    function rowsTable(x) {
+      return x.rows.length ? '<div class="psa-ci-rows"><table><thead><tr>' + x.headings.map(function (h) { return '<th>' + esc(h) + '</th>'; }).join('')
+          + '</tr></thead><tbody>' + x.rows.map(function (r) { return '<tr>' + r.map(function (v) { return '<td>' + esc(v) + '</td>'; }).join('') + '</tr>'; }).join('')
+          + '</tbody></table></div>' + (x.count > x.rows.length ? '<small>The first ' + x.rows.length + ' of ' + x.count + ' rows: all of them are in the Excel file.</small>' : '')
+        : '<p class="psa-sub">No rows.</p>';
+    }
+    function showQueryRows(x) {   /* the rows matching a filter ("who has role X"), from the whole result */
+      card('<h4>' + esc(x.title) + ' <small class="psa-qr-name">' + esc(x.query) + '</small></h4>'
+        + '<p class="psa-sub">' + x.filters.map(function (f) { return esc(f[0]) + ': <b>' + esc(f[1]) + '</b>'; }).join(' · ') + '</p>'
+        + '<div class="psa-ci-chips"><span>' + plural(x.count, 'matching row') + '</span></div>' + rowsTable(x)).classList.add('psa-ci', 'psa-qr');
+    }
+    function showQueryResult(x, chart) {
+      var c = card('<h4>' + esc(x.title) + ' <small class="psa-qr-name">' + esc(x.name) + (x.private ? ' · private' : '') + '</small></h4>'
+        + (x.shown.length ? '<p class="psa-sub">' + x.shown.map(function (v) { return esc(v.label) + ': <b>' + esc(v.value) + '</b>'; }).join(' · ') + '</p>' : '')
+        + '<div class="psa-ci-chips"><span>' + plural(x.count, 'row') + '</span></div>'
+        + (chart ? queryChart(chart) : '')
+        + rowsTable(x)
+        + '<div class="psa-actions"><button type="button" class="psa-no" data-xl>Download Excel</button>'
+        + '<a class="psa-no" target="_blank" rel="noopener" href="' + esc(qryUrl('ICQryNameURL', x)) + '">Open in Query Viewer</a></div>');
+      c.classList.add('psa-ci', 'psa-qr');
+      c.querySelector('[data-xl]').addEventListener('click', function () {
+        var f = queryFiles[x.run_id];
+        if (f) saveBlob(f.blob, f.name); else window.open(qryUrl('ICQryNameExcelURL', x), '_blank');
+      });
+    }
+    function showQueries() {
+      apiGet('/api/queries').then(function (r) {
+        var qs = r.queries;
+        var c = card('<h4>Ask the data</h4><p class="psa-sub">Ask in your own words, e.g. <i>"how many new hires this year by department?"</i> '
+          + 'I answer only from these PS Queries (named ' + esc(r.prefix) + '...), run in PeopleSoft as you.</p>'
+          + (qs.length ? '<ul class="psa-inc-list">' + qs.map(function (q, i) {
+            return '<li><button type="button" data-q="' + i + '"' + (q.problem ? ' disabled' : '') + '><b>' + esc(q.title) + '</b><small>' + esc(q.name)
+              + (q.private ? ' · private' : '') + (q.prompts.length ? ' · asks for ' + q.prompts.map(function (p) { return p.label; }).join(', ') : '') + '</small>'
+              + (q.description ? '<span>' + esc(q.description) + '</span>' : '') + (q.problem ? '<span>⚠️ ' + esc(q.problem) + '</span>' : '') + '</button></li>';
+          }).join('') + '</ul>'
+            : '<p class="psa-sub">No ' + esc(r.prefix) + ' query is available to you yet. An administrator creates them in Query Manager, named '
+              + esc(r.prefix) + '...; you see the ones your query security allows.</p>'));
+        c.classList.add('psa-qr-list');
+        c.addEventListener('click', function (e) {
+          var b = e.target.closest && e.target.closest('[data-q]');
+          if (b) { var q = qs[+b.getAttribute('data-q')]; send('Run ' + q.name + ' (' + q.title + ')'); }
+        });
+      }, function (e) { addMsg('bot', '⚠️ ' + e.message, false); });
+    }
+
+    /* ＋ Features › Audit (auditors): the admin dashboard, on the left beside the chat. Five tabs read /api/audit;
+       the chat stays open on the right, so the auditor can ask about what they see. */
+    var auditEl = null, audit = { tab: 'overview', days: 7, by: 'user', f: { kind: 'actions' }, events: [], more: false };
+    var AU_TABS = [['overview', 'Overview'], ['usage', 'Usage & cost'], ['events', 'Audit log'], ['failures', 'Failures'], ['ops', 'Watcher & tests']];
+    function money(x) { x = +x || 0; return '$' + (x >= 100 ? x.toFixed(0) : x >= 1 ? x.toFixed(2) : x.toFixed(x ? 3 : 2)); }
+    function num(x) { return (+x || 0).toLocaleString(); }
+    function openAudit(tab, filters) {
+      if (!auditEl) {
+        auditEl = document.createElement('div');
+        auditEl.id = 'psa-audit';
+        auditEl.setAttribute('role', 'region');
+        auditEl.setAttribute('aria-label', 'Agent audit dashboard');
+        auditEl.innerHTML = '<div class="psa-au-hdr"><div class="psa-au-title"><b>Audit</b><span>PeopleSoft Agent: usage, cost and the audit log</span></div>'
+          + '<div class="psa-au-tabs" role="tablist">' + AU_TABS.map(function (t) {
+            return '<button type="button" role="tab" data-tab="' + t[0] + '">' + t[1] + '</button>'; }).join('') + '</div>'
+          + '<div class="psa-au-tools"><label>Period <select data-days><option value="1">Today</option><option value="7">7 days</option>'
+          + '<option value="30">30 days</option><option value="90">90 days</option></select></label>'
+          + '<button type="button" data-ask title="Ask the agent about this">Ask the agent</button>'
+          + '<button type="button" data-refresh aria-label="Refresh" title="Refresh">&#x21bb;</button>'
+          + '<button type="button" data-close aria-label="Close the dashboard" title="Close">&#x2715;</button></div></div>'
+          + '<div class="psa-au-body" aria-live="polite"></div><div class="psa-au-tip" role="tooltip" hidden></div>';
+        document.body.appendChild(auditEl);
+        auditEl.querySelector('.psa-au-tabs').addEventListener('click', function (e) {
+          var b = e.target.closest('[data-tab]');
+          if (b) { audit.tab = b.getAttribute('data-tab'); loadAudit(); }
+        });
+        auditEl.querySelector('[data-days]').addEventListener('change', function (e) { audit.days = +e.target.value; loadAudit(); });
+        auditEl.querySelector('[data-refresh]').addEventListener('click', function () { loadAudit(); });
+        auditEl.querySelector('[data-close]').addEventListener('click', function () { auditEl.style.display = 'none'; });
+        auditEl.querySelector('[data-ask]').addEventListener('click', function () {
+          if (!panel.classList.contains('psa-open')) open();
+          hint('e.g. Who spent the most this week? Why did DEMO1\'s runs fail?');
+          input.focus();
+        });
+        /* bar tooltips: one shared box, positioned over the hovered mark */
+        auditEl.addEventListener('mouseover', function (e) {
+          var t = e.target.closest && e.target.closest('[data-tip]'), tip = auditEl.querySelector('.psa-au-tip');
+          if (!t) { tip.hidden = true; return; }
+          tip.textContent = t.getAttribute('data-tip');
+          tip.hidden = false;
+          var r = t.getBoundingClientRect(), box = auditEl.getBoundingClientRect();
+          tip.style.left = Math.max(4, Math.min(box.width - tip.offsetWidth - 4, r.left - box.left + r.width / 2 - tip.offsetWidth / 2)) + 'px';
+          tip.style.top = Math.max(4, r.top - box.top - tip.offsetHeight - 6) + 'px';
+        });
+      }
+      if (tab) audit.tab = tab;
+      if (filters) { audit.f = Object.assign({ kind: 'actions' }, filters); }
+      if (auditEl.style.display !== 'flex' && panel.classList.contains('psa-open'))
+        addMsg('bot', 'The audit dashboard is open on the left. Ask me about it here, e.g. *Who spent the most this week?* or *What failed for VELU yesterday?*', false);
+      auditEl.style.display = 'flex';
+      auditEl.querySelector('[data-days]').value = String(audit.days);
+      loadAudit();
+    }
+    function auditQuery(extra) {
+      var q = { tab: audit.tab, days: audit.days };
+      if (audit.tab === 'usage') q.by = audit.by;
+      if (audit.tab === 'events') Object.keys(audit.f).forEach(function (k) { if (audit.f[k]) q[k] = audit.f[k]; });
+      Object.keys(extra || {}).forEach(function (k) { q[k] = extra[k]; });
+      return Object.keys(q).map(function (k) { return k + '=' + encodeURIComponent(q[k]); }).join('&');
+    }
+    function loadAudit(more) {
+      var body = auditEl.querySelector('.psa-au-body');
+      [].forEach.call(auditEl.querySelectorAll('[data-tab]'), function (b) {
+        var on = b.getAttribute('data-tab') === audit.tab;
+        b.classList.toggle('psa-on', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      var before = more && audit.events.length ? audit.events[audit.events.length - 1].id : null;
+      if (!more) body.innerHTML = '<p class="psa-au-wait">Loading...</p>';
+      return apiGet('/api/audit?' + auditQuery(before ? { before: before } : null)).then(function (d) {
+        if (audit.tab === 'events') {
+          audit.events = more ? audit.events.concat(d.events) : d.events;
+          audit.more = d.more;
+          d.events = audit.events;
+        }
+        body.innerHTML = AU_VIEW[audit.tab](d);
+        body.scrollTop = more ? body.scrollTop : 0;
+        wireAudit(body, d);
+      }, function (e) { body.innerHTML = '<p class="psa-au-err">⚠️ ' + esc(e.message) + '</p>'; });
+    }
+    /* one series: a single hue, thin bars with rounded tops on the baseline, a 2px gap, recessive grid */
+    function barChart(points, valueOf, labelOf, tipOf) {
+      var W = 640, H = 150, pad = 22, n = points.length, max = Math.max.apply(null, points.map(valueOf).concat([0])) || 1;
+      var step = (W - pad) / n, bw = Math.max(2, Math.min(28, step - 2)), out = [];
+      [0.5, 1].forEach(function (g) {
+        var y = H - 18 - (H - 30) * g;
+        out.push('<line x1="' + pad + '" x2="' + W + '" y1="' + y + '" y2="' + y + '" class="psa-au-grid"/>'
+          + '<text x="0" y="' + (y + 4) + '" class="psa-au-ax">' + esc(money(max * g)) + '</text>');
+      });
+      out.push('<line x1="' + pad + '" x2="' + W + '" y1="' + (H - 18) + '" y2="' + (H - 18) + '" class="psa-au-base"/>');
+      points.forEach(function (p, i) {
+        var v = valueOf(p), h = v ? Math.max(2, (H - 30) * v / max) : 0, x = pad + i * step + (step - bw) / 2, y = H - 18 - h, r = Math.min(4, bw / 2, h);
+        if (h) out.push('<path class="psa-au-bar" d="M' + x + ' ' + (H - 18) + 'V' + (y + r) + 'Q' + x + ' ' + y + ' ' + (x + r) + ' ' + y
+          + 'H' + (x + bw - r) + 'Q' + (x + bw) + ' ' + y + ' ' + (x + bw) + ' ' + (y + r) + 'V' + (H - 18) + 'Z"/>');
+        out.push('<rect class="psa-au-hit" x="' + (pad + i * step) + '" y="0" width="' + step + '" height="' + (H - 18) + '" data-tip="' + esc(tipOf(p)) + '"/>');
+        if (n <= 10 || i % Math.ceil(n / 8) === 0 || i === n - 1)
+          out.push('<text x="' + (x + bw / 2) + '" y="' + (H - 4) + '" class="psa-au-ax" text-anchor="middle">' + esc(labelOf(p)) + '</text>');
+      });
+      return '<svg viewBox="0 0 ' + W + ' ' + H + '" class="psa-au-chart" role="img" aria-label="' + esc(points.map(function (p) {
+        return labelOf(p) + ' ' + money(valueOf(p)); }).join(', ')) + '">' + out.join('') + '</svg>';
+    }
+    function hbars(rows, label, value, fmt, attr) {
+      var max = Math.max.apply(null, rows.map(value).concat([0])) || 1;
+      return '<div class="psa-au-hbars">' + rows.map(function (r) {
+        return '<div class="psa-au-hrow"' + (attr ? ' ' + attr(r) : '') + '><span class="psa-au-hl">' + esc(label(r)) + '</span>'
+          + '<span class="psa-au-ht"><i style="width:' + Math.max(value(r) ? 1.5 : 0, 100 * value(r) / max) + '%"></i></span>'
+          + '<span class="psa-au-hv">' + esc(fmt(value(r))) + '</span></div>';
+      }).join('') + '</div>';
+    }
+    function kpi(label, value, sub, cls) {
+      return '<div class="psa-au-kpi' + (cls ? ' ' + cls : '') + '"><span>' + esc(label) + '</span><b>' + esc(value) + '</b>' + (sub ? '<small>' + sub + '</small>' : '') + '</div>';
+    }
+    function shortDay(d) { var p = d.split('-'); return +p[2] + ' ' + ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][+p[1] - 1]; }
+    function period(d) { return d.from === d.to ? shortDay(d.to) : shortDay(d.from) + ' to ' + shortDay(d.to); }
+    function outcome(o) {
+      return o === 'ok' ? '<span class="psa-au-ok">✓ OK</span>' : o === 'failed' || o === 'error' ? '<span class="psa-au-bad">✕ ' + (o === 'error' ? 'Error' : 'Failed') + '</span>'
+        : o === 'alert' ? '<span class="psa-au-warn">! Alert</span>' : o === 'denied' ? '<span class="psa-au-bad">⛔ Refused</span>'
+        : '<span class="psa-au-muted">' + esc(o) + '</span>';
+    }
+    function eventRows(list) {
+      if (!list.length) return '<p class="psa-au-muted">Nothing recorded for this period and filter.</p>';
+      return '<table class="psa-au-table psa-au-log"><thead><tr><th>Time</th><th>User</th><th>Feature</th><th>What happened</th><th>Outcome</th></tr></thead><tbody>'
+        + list.map(function (e, i) {
+          return '<tr data-ev="' + i + '" tabindex="0"><td class="psa-au-nowrap">' + esc(e.ts.slice(5, 16)) + '</td><td>' + esc(e.oprid) + '</td><td>'
+            + esc(e.feature_label) + '</td><td><b>' + esc(e.event) + '</b> ' + esc(e.detail || '') + (e.ref ? ' <span class="psa-au-muted">' + esc(e.ref) + '</span>' : '')
+            + '</td><td>' + outcome(e.outcome) + '</td></tr>';
+        }).join('') + '</tbody></table>';
+    }
+    function eventDetail(e) {
+      var d = e.data || {}, out = [];
+      if (d.sql) out.push('<pre>' + esc(d.sql) + '</pre>');
+      if (d.values) out.push('<div>' + d.values.map(function (v) { return esc(v.label) + ' = <b>' + esc(v.value) + '</b>'; }).join('<br>') + '</div>');
+      if (d.error) out.push('<div class="psa-au-bad">' + esc(d.error) + '</div>');
+      var rest = Object.keys(d).filter(function (k) { return ['sql', 'values', 'error'].indexOf(k) < 0; });
+      if (rest.length) out.push('<pre>' + esc(JSON.stringify(rest.reduce(function (o, k) { o[k] = d[k]; return o; }, {}), null, 1)) + '</pre>');
+      var facts = [];
+      if (e.n !== null && e.n !== undefined) facts.push(num(e.n) + ' rows');
+      if (e.ms !== null && e.ms !== undefined) facts.push((e.ms / 1000).toFixed(1) + ' s');
+      if (e.model) facts.push(e.model + ': ' + num(e.tin) + ' in, ' + num(e.tout) + ' out, ' + num(e.tcr) + ' cached, ' + money(e.cost));
+      if (e.session) facts.push('conversation ' + e.session.slice(0, 8));
+      if (facts.length) out.push('<div class="psa-au-muted">' + esc(facts.join(' · ')) + '</div>');
+      return out.join('') || '<div class="psa-au-muted">No more details.</div>';
+    }
+    var AU_VIEW = {
+      overview: function (d) {
+        var t = d.totals, pct = d.cost_before ? Math.round((t.cost - d.cost_before) / d.cost_before * 100) : null, m = d.month, h = [];
+        h.push('<p class="psa-au-period">' + esc(period(d)) + '</p><div class="psa-au-kpis">'
+          + kpi('People', num(t.users), plural(t.conversations, 'conversation'))
+          + kpi('Messages', num(t.messages), num(t.claude_calls) + ' Claude calls')
+          + kpi('Task runs', num(t.runs), num(t.runs_ok) + ' succeeded' + (t.runs_failed ? ', <span class="psa-au-bad">' + num(t.runs_failed) + ' failed</span>' : ''))
+          + kpi('Claude cost', money(t.cost), pct === null ? 'estimate from tokens' : (pct >= 0 ? '+' : '') + pct + '% on the period before')
+          + kpi('Failures', num(t.failures), 'runs, errors, failed steps', t.failures ? 'psa-au-kbad' : '')
+          + kpi('Refused', num(t.denied), 'attempts without the role or right', t.denied ? 'psa-au-kbad' : '')
+          + kpi('Watcher alerts', num(t.incidents), plural(t.test_runs, 'regression run') + (t.test_runs ? ', ' + num(t.test_runs_ok) + ' all passed' : ''))
+          + '</div>');
+        if (m.budget) {
+          var share = Math.min(1, m.share || 0), cls = m.share >= 1 ? 'psa-au-mbad' : m.share >= 0.8 ? 'psa-au-mwarn' : '';
+          h.push('<div class="psa-au-meter ' + cls + '"><div><b>' + esc(m.name) + '</b>: ' + money(m.cost) + ' of the ' + money(m.budget) + ' budget ('
+            + Math.round((m.share || 0) * 100) + '%)' + (m.share >= 1 ? ' <span class="psa-au-bad">✕ over budget</span>' : m.share >= 0.8 ? ' <span class="psa-au-warn">! over 80%</span>' : '')
+            + '</div><span role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + Math.round(share * 100) + '"><i style="width:' + share * 100 + '%"></i></span></div>');
+        } else {
+          h.push('<p class="psa-au-muted">' + esc(m.name) + ' so far: ' + money(m.cost) + '. Set PSAGENT_BUDGET for a monthly budget and alerts.</p>');
+        }
+        h.push('<div class="psa-au-sec"><h5>Claude cost per day</h5>' + (d.daily.length > 1 ? barChart(d.daily, function (p) { return p.cost; },
+          function (p) { return shortDay(p.day); },
+          function (p) { return shortDay(p.day) + ': ' + money(p.cost) + ', ' + p.messages + ' messages, ' + p.runs + ' task runs' + (p.failures ? ', ' + p.failures + ' failures' : ''); })
+          : '<p class="psa-au-muted">Pick 7 days or more to see the trend.</p>') + '</div>');
+        h.push('<div class="psa-au-cols"><div class="psa-au-sec"><h5>Cost by feature</h5>' + (d.features.length ? hbars(d.features, function (f) { return f.label; },
+          function (f) { return f.cost; }, money) : '<p class="psa-au-muted">No Claude calls yet.</p>') + '</div>'
+          + '<div class="psa-au-sec"><h5>Top users</h5>' + (d.top_users.length ? hbars(d.top_users, function (u) { return u.oprid; }, function (u) { return u.cost; },
+            money, function (u) { return 'data-user="' + esc(u.oprid) + '" tabindex="0" title="Show what ' + esc(u.oprid) + ' did"'; }) : '<p class="psa-au-muted">No one yet.</p>') + '</div></div>');
+        return h.join('');
+      },
+      usage: function (d) {
+        var rows = d.rows.filter(function (r) { return r.cost || r.messages || r.runs || r.calls; });
+        return '<div class="psa-au-bar2"><span class="psa-au-seg" role="group" aria-label="Group by">'
+          + '<button type="button" data-by="user"' + (d.by === 'user' ? ' class="psa-on"' : '') + '>By user</button>'
+          + '<button type="button" data-by="feature"' + (d.by === 'feature' ? ' class="psa-on"' : '') + '>By feature</button></span>'
+          + '<span class="psa-au-period">' + esc(period(d)) + ': ' + money(d.total) + '</span><button type="button" class="psa-au-xl" data-xl="usage">Download Excel</button></div>'
+          + (rows.length ? '<table class="psa-au-table"><thead><tr><th>' + (d.by === 'user' ? 'User' : 'Feature') + '</th><th class="psa-au-wide">Cost</th>'
+            + '<th>Messages</th><th>Conversations</th><th>Claude calls</th><th>Per conversation</th><th>Task runs</th><th>Failures</th><th>Queries</th></tr></thead><tbody>'
+            + rows.map(function (r) {
+              var max = rows[0].cost || 1;
+              return '<tr' + (d.by === 'user' ? ' data-user="' + esc(r.k) + '" tabindex="0" title="Show what ' + esc(r.k) + ' did"' : ' data-feature="' + esc(r.k) + '" tabindex="0"') + '><td><b>'
+                + esc(r.label) + '</b>' + (r.system ? ' <span class="psa-au-muted">(the service)</span>' : '') + '</td><td class="psa-au-wide"><span class="psa-au-ht"><i style="width:'
+                + Math.max(r.cost ? 1.5 : 0, 100 * r.cost / max) + '%"></i></span> ' + money(r.cost) + '</td><td>' + num(r.messages) + '</td><td>' + num(r.conversations) + '</td><td>'
+                + num(r.calls) + '</td><td>' + (r.per_conversation === null ? '' : money(r.per_conversation)) + '</td><td>' + num(r.runs) + '</td><td>'
+                + (r.failures ? '<span class="psa-au-bad">' + num(r.failures) + '</span>' : '0') + '</td><td>' + num(r.queries) + '</td></tr>';
+            }).join('') + '</tbody></table><p class="psa-au-muted">Costs are estimates from the tokens of each Claude call at list prices; the Anthropic invoice is the real figure.</p>'
+            : '<p class="psa-au-muted">No usage in this period.</p>');
+      },
+      events: function (d) {
+        var f = audit.f, opt = function (v, t, cur) { return '<option value="' + esc(v) + '"' + (v === (cur || '') ? ' selected' : '') + '>' + esc(t) + '</option>'; };
+        return '<form class="psa-au-filters" data-filters>'
+          + '<label>User <select name="user">' + opt('', 'Everyone', f.user) + d.users.map(function (u) { return opt(u, u, f.user); }).join('') + '</select></label>'
+          + '<label>Feature <select name="feature">' + opt('', 'All', f.feature) + Object.keys(d.features).map(function (k) { return opt(k, d.features[k], f.feature); }).join('') + '</select></label>'
+          + '<label>Show <select name="kind">' + opt('actions', 'Actions', f.kind) + opt('queries', 'Database queries', f.kind) + opt('claude', 'Claude calls', f.kind) + opt('all', 'Everything', f.kind) + '</select></label>'
+          + '<label>Outcome <select name="outcome">' + opt('', 'Any', f.outcome) + opt('failed', 'Failed', f.outcome) + opt('denied', 'Refused', f.outcome) + '</select></label>'
+          + '<label>From <input type="date" name="since" value="' + esc(f.since || '') + '"></label><label>To <input type="date" name="until" value="' + esc(f.until || '') + '"></label>'
+          + '<label class="psa-au-q">Search <input type="search" name="q" value="' + esc(f.q || '') + '" placeholder="process, user, SQL..."></label>'
+          + '<button type="submit">Apply</button><button type="button" class="psa-au-xl" data-xl="events">Download Excel</button></form>'
+          + eventRows(d.events) + (audit.more ? '<button type="button" class="psa-au-more" data-more>Load more</button>' : '')
+          + '<p class="psa-au-muted">What users type in the chat is not kept, only what the agent did. Passwords never reach the service.</p>';
+      },
+      failures: function (d) {
+        return '<p class="psa-au-period">' + esc(period(d)) + ': ' + d.failures.length + (d.failures.length === 1 ? ' failure' : ' failures') + '</p>'
+          + (d.by_feature.length ? '<div class="psa-au-chips">' + d.by_feature.map(function (x) { return '<span>' + esc(x[0]) + ' <b>' + x[1] + '</b></span>'; }).join('') + '</div>' : '')
+          + eventRows(d.failures);
+      },
+      ops: function (d) {
+        var h = ['<div class="psa-au-cols"><div class="psa-au-sec"><h5>Watcher</h5>'];
+        if (!d.watcher) h.push('<p class="psa-au-muted">The watcher is not running on this agent service.</p>');
+        else {
+          var c = d.watcher.counts || {};
+          h.push('<p>' + (c.stopped ? '<span class="psa-au-warn">⏸ Watching is stopped</span>' : '◉ ' + num(c.active) + ' of ' + num(c.watchdogs) + ' watchdogs active')
+            + ' in ' + num(d.watcher.plans) + ' plans.</p>' + (d.watcher.incidents.length ? '<ul class="psa-au-list">' + d.watcher.incidents.map(function (i) {
+              return '<li><b>' + esc(i.title) + '</b> <span class="psa-au-muted">' + esc(i.found || '') + '</span><br>' + esc(i.summary || i.note || '') + '</li>'; }).join('') + '</ul>'
+              : '<p class="psa-au-muted">No alerts in this period.</p>'));
+        }
+        h.push('</div><div class="psa-au-sec"><h5>Regression tests</h5>');
+        if (!d.regression) h.push('<p class="psa-au-muted">Regression tests are off here (only on test environments).</p>');
+        else h.push('<p>' + num(d.regression.suites) + ' suites.</p>' + (d.regression.runs.length ? '<ul class="psa-au-list">' + d.regression.runs.map(function (r) {
+          var bad = r.counts && r.counts.failed;
+          return '<li>' + (bad ? '<span class="psa-au-bad">✕</span>' : '<span class="psa-au-ok">✓</span>') + ' <b>' + esc(r.title) + '</b>: ' + esc(r.headline)
+            + ' <span class="psa-au-muted">' + esc((r.started || '').slice(0, 16)) + ', ' + esc(r.mode === 'server' ? 'unattended' : r.by || '') + '</span>'
+            + (r.newly_failing && r.newly_failing.length ? '<br><span class="psa-au-bad">Failing since the last run: ' + esc(r.newly_failing.join(', ')) + '</span>' : '') + '</li>';
+        }).join('') + '</ul>' : '<p class="psa-au-muted">No runs yet.</p>'));
+        h.push('</div></div>');
+        return h.join('');
+      }
+    };
+    function wireAudit(body, d) {
+      body.onclick = function (e) {
+        var x = e.target.closest ? e.target : null;
+        if (!x) return;
+        var u = x.closest('[data-user]'), fe = x.closest('[data-feature]'), by = x.closest('[data-by]'), ev = x.closest('[data-ev]');
+        if (x.closest('[data-more]')) return loadAudit(true);
+        if (x.closest('[data-xl]')) {
+          var b = x.closest('[data-xl]');
+          b.disabled = true;
+          return download('/api/audit/export?' + auditQuery({ tab: b.getAttribute('data-xl') })).then(function (name) {
+            b.disabled = false; b.textContent = 'Downloaded ' + name; }, function (err) { b.disabled = false; b.textContent = '⚠️ ' + err.message; });
+        }
+        if (by) { audit.by = by.getAttribute('data-by'); return loadAudit(); }
+        if (u) { audit.tab = 'events'; audit.f = { kind: 'actions', user: u.getAttribute('data-user') }; return loadAudit(); }
+        if (fe) { audit.tab = 'events'; audit.f = { kind: 'all', feature: fe.getAttribute('data-feature') }; return loadAudit(); }
+        if (ev) {
+          var next = ev.nextElementSibling;
+          if (next && next.classList.contains('psa-au-detail')) { next.remove(); return; }
+          var list = audit.tab === 'events' ? audit.events : d.failures, tr = document.createElement('tr');
+          tr.className = 'psa-au-detail';
+          tr.innerHTML = '<td colspan="5">' + eventDetail(list[+ev.getAttribute('data-ev')]) + '</td>';
+          ev.parentNode.insertBefore(tr, ev.nextSibling);
+        }
+      };
+      body.onkeydown = function (e) { if (e.key === 'Enter' && e.target.matches('[data-ev],[data-user],[data-feature]')) { e.preventDefault(); e.target.click(); } };
+      var form = body.querySelector('[data-filters]');
+      if (form) form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        audit.f = {};
+        [].forEach.call(form.elements, function (el) { if (el.name) audit.f[el.name] = el.value; });
+        loadAudit();
+      });
+    }
+
+    /* ◉ N watchdogs: the count in the feature bar, and the manager it opens */
+    var dogsTimer = null, managerCard = null;
+    function setDogs(n) {
+      var b = panel.querySelector('#psa-dogs');
+      if (!n || !(me && me.can_monitor && me.watcher)) { b.hidden = true; return; }
+      b.hidden = false;
+      b.className = n.stopped ? 'psa-off' : n.alerts ? 'psa-alert' : '';
+      b.textContent = n.stopped ? '⏸ Watching stopped' : '◉ ' + plural(n.watchdogs, 'watchdog')
+        + (n.active < n.watchdogs ? ' (' + n.active + ' active)' : '') + (n.alerts ? ' · ' + plural(n.alerts, 'alert') : '');
+    }
+    function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+    function refreshDogs() {
+      if (!(me && me.can_monitor && me.watcher)) return;
+      apiGet('/api/watchdogs').then(function (v) { setDogs(v.counts); if (managerCard && document.body.contains(managerCard)) renderManager(v); }, function () {});
+    }
+    function showManager() {
+      apiGet('/api/watchdogs').then(function (v) {
+        if (managerCard) managerCard.remove();
+        managerCard = card('');
+        managerCard.classList.add('psa-mgr');
+        renderManager(v);
+        managerCard.scrollIntoView({ block: 'nearest' });
+      }, function (e) { addMsg('bot', '⚠️ ' + e.message, false); });
+    }
+    function renderManager(v) {
+      var n = v.counts || {}, c = managerCard;
+      setDogs(n);
+      var plans = (v.plans || []).map(function (p) {
+        var allPaused = p.watchdogs.every(function (d) { return d.paused; });
+        return '<div class="psa-plan"><div class="psa-plan-h"><b>' + esc(p.title) + '</b><small>' + plural(p.watchdogs.length, 'watchdog')
+          + (p.by ? ' · by ' + esc(p.by) + (p.on ? ' on ' + esc(p.on) : '') : '') + '</small>'
+          + '<button type="button" class="psa-mini" data-dl="' + esc(p.id) + '">Download as Excel</button>'
+          + '<button type="button" class="psa-mini" data-act="' + (allPaused ? 'resume_plan' : 'pause_plan') + '" data-plan="' + esc(p.id) + '">' + (allPaused ? 'Resume all' : 'Pause all') + '</button>'
+          + '<button type="button" class="psa-mini psa-danger" data-act="delete_plan" data-plan="' + esc(p.id) + '" data-ask="Delete the plan ' + esc(p.title) + '?">Delete plan</button></div>'
+          + p.watchdogs.map(function (d) {
+            return '<div class="psa-dog' + (d.paused ? ' psa-paused' : d.failing ? ' psa-failing' : '') + '"><span class="psa-dot"></span><div class="psa-dog-b"><b>' + esc(d.title) + '</b>'
+              + (d.paused ? ' <small style="display:inline">(paused)</small>' : '') + '<small>' + esc(d.what) + '</small><small>' + esc(d.when)
+              + ' · last run ' + esc(d.last_run || 'not yet') + (d.notify && d.notify.length ? ' · ' + esc(d.notify.join(', ')) : '') + '</small>'
+              + (d.last_incident ? '<small>Last alert: <a data-inc="' + esc(d.last_incident.id) + '">' + esc(d.last_incident.title) + '</a> · '
+                + esc(String(d.last_incident.found).slice(5, 16)) + '</small>' : '') + '</div><div class="psa-dog-a">'
+              + '<button type="button" class="psa-mini" data-act="' + (d.paused ? 'resume' : 'pause') + '" data-id="' + esc(d.id) + '">' + (d.paused ? 'Resume' : 'Pause') + '</button>'
+              + '<button type="button" class="psa-mini" data-act="run" data-id="' + esc(d.id) + '">Run now</button>'
+              + '<button type="button" class="psa-mini psa-danger" data-act="delete" data-id="' + esc(d.id) + '" data-ask="Delete ' + esc(d.title) + '?">Delete</button></div></div>';
+          }).join('') + '</div>';
+      }).join('');
+      c.innerHTML = '<h4>Watchdogs</h4><div class="psa-diag-top"><small>' + plural(n.watchdogs || 0, 'watchdog') + ' in ' + plural(n.plans || 0, 'plan') + ' · '
+        + (n.active || 0) + ' active · ' + plural(n.alerts || 0, 'alert') + ' in 24 hours' + (n.stopped ? ' · <b style="color:#92400e">watching is stopped</b>' : '') + '</small>'
+        + '<button type="button" class="psa-mini' + (n.stopped ? '' : ' psa-danger') + '" data-act="' + (n.stopped ? 'start' : 'stop') + '"'
+        + (n.stopped ? '' : ' data-ask="Stop all watching? Nothing runs until you start it again."') + '>' + (n.stopped ? 'Start watching' : 'Stop all watching') + '</button></div>'
+        + (plans || '<p>No watchdogs yet. Choose <b>＋ Features › Watch jobs</b> to upload a watch plan.</p>')
+        + ((v.history || []).length ? '<details><summary>Recent changes</summary><ul>' + v.history.map(function (h) {
+          return '<li><small>' + esc(h.at) + ' · ' + esc(h.who || '?') + '</small> ' + esc(h.what) + '</li>'; }).join('') + '</ul></details>' : '')
+        + '<small>To change a plan: Download as Excel, edit it, and upload it again with ＋ Features › Watch jobs; I show what changes before you confirm.</small>';
+      c.onclick = function (e) {
+        var t = e.target, a = t.closest && t.closest('[data-act],[data-dl],[data-inc]');
+        if (!a) return;
+        if (a.hasAttribute('data-inc')) return openIncident(a.getAttribute('data-inc'));
+        if (a.hasAttribute('data-dl')) return download('/api/watchplans/export?plan=' + encodeURIComponent(a.getAttribute('data-dl'))).then(
+          function (name) { a.textContent = 'Downloaded ' + name; }, function (err) { addMsg('bot', '⚠️ ' + err.message, false); });
+        var ask = a.getAttribute('data-ask');
+        if (ask && !a.hasAttribute('data-sure')) {          /* ask once, on the button itself */
+          a.setAttribute('data-sure', '1');
+          a.textContent = ask.replace(/\?$/, '') + ': click again';
+          setTimeout(function () { if (document.body.contains(a)) { a.removeAttribute('data-sure'); refreshDogs(); } }, 5000);
+          return;
+        }
+        var act = a.getAttribute('data-act'), body = { action: act, id: a.getAttribute('data-id') || '', plan: a.getAttribute('data-plan') || '' };
+        [].forEach.call(c.querySelectorAll('button'), function (b) { b.disabled = true; });
+        if (act === 'run') a.textContent = 'Running...';
+        api('/api/watchdogs/action', body).then(function (r) {
+          renderManager(r);
+          if (act === 'run') {
+            if (r.ran && r.ran.length) r.ran.forEach(showIncident);
+            else addMsg('bot', 'Ran it now: nothing to report.', false);
+          }
+        }, function (err) { addMsg('bot', '⚠️ ' + err.message, false); refreshDogs(); });
+      };
+    }
+
+    /* Regression tests: the smoke test, the saved suites (run here or unattended on the service), the last runs */
+    var VERD = { passed: ['Passed', '#065f46', '#d1fae5', '✔'], changed: ['Passed with changes', '#92400e', '#fef3c7', '◐'],
+      failed: ['Failed', '#b91c1c', '#fee2e2', '✖'], stopped: ['Stopped', '#475569', '#f1f5f9', '■'] };
+    function verdictTag(v) { var x = VERD[v] || VERD.stopped; return '<span class="psa-badge" style="color:' + x[1] + ';background:' + x[2] + '">' + x[0] + '</span>'; }
+    function showRegress() {
+      apiGet('/api/regress').then(function (h) {
+        var u = h.unattended || {}, sm = h.smoke || {};
+        var last = function (l) { return l ? '<small>Last run ' + esc(String(l.started).slice(5, 16)) + (l.mode === 'server' ? ' (unattended)' : '') + ': '
+          + '<a data-rep="' + esc(l.run_id) + '">' + esc(l.headline) + '</a></small>' : '<small>Not run yet</small>'; };
+        var runBtns = function (key, val) {
+          return '<button type="button" class="psa-mini" data-run="' + esc(val) + '" data-k="' + key + '">Run here</button>'
+            + (u.available ? '<button type="button" class="psa-mini" data-una="' + esc(val) + '" data-k="' + key + '">Run unattended</button>' : '');
+        };
+        var c = card('<h4>Regression tests</h4><small>Each case runs a recorded task with set values and checks the result. '
+          + '<b>Test environment:</b> the cases really save data.</small>'
+          + '<div class="psa-plan"><div class="psa-plan-h"><b>Smoke test</b><small>' + plural(sm.cases || 0, 'case') + ': every task once, with its defaults</small>'
+          + runBtns('smoke', 'smoke_test') + '<button type="button" class="psa-mini" data-dl="smoke_test">Download as Excel</button></div>'
+          + '<div class="psa-dog">' + last(sm.last) + ((sm.skipped || []).length ? '<small>Not in the smoke test: ' + sm.skipped.map(esc).join('; ') + '</small>' : '') + '</div></div>'
+          + (h.suites || []).map(function (x) {
+            return '<div class="psa-plan"><div class="psa-plan-h"><b>' + esc(x.title) + '</b><small>' + plural(x.cases, 'case')
+              + (x.run_at ? ' · unattended daily at ' + esc(x.run_at) : '') + (x.after_patch ? ' · after every patch' : '') + '</small>'
+              + runBtns('suite', x.id) + '<button type="button" class="psa-mini" data-dl="' + esc(x.id) + '">Download as Excel</button>'
+              + '<button type="button" class="psa-mini psa-danger" data-del="' + esc(x.id) + '">Delete</button></div>'
+              + '<div class="psa-dog">' + last(x.last) + '</div></div>';
+          }).join('')
+          + (u.available ? '<small>Unattended runs sign in as <b>' + esc(u.user) + '</b> in a browser on the agent service and email the report.'
+            + (u.busy ? ' A run is in progress (' + esc(u.busy) + ').' : '') + '</small>' : '<small>Unattended runs are off on the agent service (PSAGENT_TEST_USER, Playwright).</small>')
+          + '<div class="psa-actions"><button type="button" class="psa-ok" data-up>Upload a test plan</button><button type="button" class="psa-no" data-tpl>Download the test plan template</button></div>');
+        c.classList.add('psa-guide');
+        c.addEventListener('click', function (e) {
+          var b = e.target.closest && e.target.closest('button,a');
+          if (!b) return;
+          if (b.hasAttribute('data-up')) { uploadAs = 'Build a regression test suite from this test plan'; panel.querySelector('#psa-file').click(); }
+          else if (b.hasAttribute('data-tpl')) download('/api/templates/regression').then(function (n) { b.textContent = 'Downloaded ' + n; }, function (er) { addMsg('bot', '⚠️ ' + er.message, false); });
+          else if (b.hasAttribute('data-dl')) download('/api/regress/export?suite=' + encodeURIComponent(b.getAttribute('data-dl'))).then(function (n) { b.textContent = 'Downloaded ' + n; }, function (er) { addMsg('bot', '⚠️ ' + er.message, false); });
+          else if (b.hasAttribute('data-rep')) apiGet('/api/regress/report?run=' + encodeURIComponent(b.getAttribute('data-rep'))).then(function (r) { showTestReport(r.report); });
+          else if (b.hasAttribute('data-run')) startTestRun(b.getAttribute('data-k') === 'smoke' ? { smoke: true } : { suite: b.getAttribute('data-run') });
+          else if (b.hasAttribute('data-una')) {
+            b.disabled = true;
+            api('/api/regress/unattended', b.getAttribute('data-k') === 'smoke' ? { smoke: true } : { suite: b.getAttribute('data-una') }).then(function (r) {
+              b.textContent = 'Started';
+              addMsg('bot', 'Started an unattended run (`' + r.run_id + '`) as **' + r.user + '** on the agent service. The report is emailed and shows here under Regression tests when it ends.');
+            }, function (er) { b.disabled = false; addMsg('bot', '⚠️ ' + er.message, false); });
+          } else if (b.hasAttribute('data-del')) {
+            if (!b.hasAttribute('data-sure')) { b.setAttribute('data-sure', '1'); b.textContent = 'Delete: click again'; return; }
+            api('/api/regress/delete', { suite: b.getAttribute('data-del') }).then(function () { c.remove(); showRegress(); }, function (er) { addMsg('bot', '⚠️ ' + er.message, false); });
+          }
+        });
+      }, function (e) { addMsg('bot', '⚠️ ' + e.message, false); });
+    }
+
+    function showTestSuite(ts) {
+      if (!panel.classList.contains('psa-wide')) setWide(true);
+      var ch = ts.changes, list = function (title, items) { return items.length ? '<li><b>' + title + ':</b> ' + items.map(esc).join(', ') + '</li>' : ''; };
+      var rows = (ts.cases || []).map(function (x) {
+        return '<tr><td>' + x.n + '</td><td><b>' + esc(x.title) + '</b>' + ((x.problems || []).length ? '<small style="color:#b91c1c">' + x.problems.map(esc).join('<br>') + '</small>' : '')
+          + '</td><td>' + esc(x.task_title || x.task) + '</td><td><small>' + (x.values || []).map(function (v) { return esc(v.label) + ' = <code>' + esc(v.value) + '</code>'; }).join('<br>')
+          + '</small></td><td>' + esc(x.expect) + '</td></tr>';
+      }).join('');
+      var c = card('<h4>Test suite: ' + esc(ts.title) + '</h4>' + (ts.source ? '<small>From ' + esc(ts.source) + '</small>' : '')
+        + ((ts.problems || []).length ? '<div class="psa-rb-warn" style="background:#fef2f2;color:#7f1d1d"><b>Problems I could not fix</b><ul>'
+          + ts.problems.map(function (x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul></div>' : '')
+        + (ch ? '<div class="psa-chg"><b>This replaces the saved suite ' + esc(ts.title) + '</b><ul>' + list('Added', ch.added) + list('Removed', ch.removed)
+          + list('Changed', ch.changed) + '<li>' + ch.unchanged + ' unchanged</li></ul></div>' : '')
+        + ((ts.questions || []).length ? '<div class="psa-rb-warn" style="background:#fffbeb;color:#78350f"><b>Please check</b><ul>'
+          + ts.questions.map(function (x) { return '<li>' + md(x) + '</li>'; }).join('') + '</ul></div>' : '')
+        + '<table class="psa-mon-t psa-wp"><tr><th>#</th><th>Test case</th><th>Task</th><th>Values</th><th>Expected</th></tr>' + rows + '</table>'
+        + '<small>' + [ts.run_at ? 'Unattended every day at ' + esc(ts.run_at) : '', ts.after_patch ? 'unattended after every patch' : '',
+          (ts.notify || []).length ? 'report to ' + esc(ts.notify.join(', ')) : ''].filter(Boolean).join(' · ')
+        + ((ts.run_at || ts.after_patch) && !ts.unattended ? ' (the headless runner is not set up on the agent service yet)' : '') + '</small>'
+        + '<div class="psa-actions"><button type="button" class="psa-ok" data-go>Save test suite</button><button type="button" class="psa-no" data-x>Discard</button></div>');
+      var go = c.querySelector('[data-go]');
+      c.querySelector('[data-x]').addEventListener('click', function () { disable(c); addMsg('bot', 'Test suite discarded.', false); });
+      go.addEventListener('click', function () {
+        go.disabled = true;
+        api('/api/regress/save', { session_id: state.sessionId, draft_id: ts.draft_id }).then(function (r) {
+          disable(c);
+          go.textContent = 'Saved';
+          var m = card('<h4>Saved ' + esc(r.title) + '</h4><small>' + plural(r.cases, 'case') + ' in <code>' + esc(r.path) + '</code>.</small>'
+            + '<div class="psa-actions"><button type="button" class="psa-ok">Run it now</button><button type="button" class="psa-no">Later</button></div>');
+          m.querySelector('.psa-ok').addEventListener('click', function () { disable(m); startTestRun({ suite: r.suite_id }); });
+          m.querySelector('.psa-no').addEventListener('click', function () { disable(m); });
+        }, function (e) { go.disabled = false; addMsg('bot', '⚠️ ' + e.message, false); });
+      });
+    }
+
+    function startTestRun(which) {
+      api('/api/regress/start', which).then(function (st) {
+        var sec = (st.secrets || []).map(function (x) {
+          return '<label>' + esc(x.label) + ' for the cases<input type="password" autocomplete="new-password" data-sec="' + esc(x.name) + '"></label>';
+        }).join('');
+        var c = card('<h4>Run ' + esc(st.title) + '</h4><small>' + plural(st.cases.length, 'case') + ', run ' + esc(st.n) + ' ({{n}} = ' + esc(st.n) + '). '
+          + 'This is a test environment: the cases really save data.</small>' + sec
+          + (sec ? '<small>Typed once for the whole run; it goes straight into PeopleSoft, I never see it.</small>' : '')
+          + '<div class="psa-actions"><button type="button" class="psa-ok" data-go>Start</button><button type="button" class="psa-no" data-x>Cancel</button></div>');
+        c.querySelector('[data-x]').addEventListener('click', function () { disable(c); api('/api/regress/stop', { run_id: st.run_id }); });
+        c.querySelector('[data-go]').addEventListener('click', function () {
+          var secrets = {};
+          [].forEach.call(c.querySelectorAll('[data-sec]'), function (i) { secrets[i.getAttribute('data-sec')] = i.value; i.value = ''; });
+          disable(c);
+          runTestsHere(st, secrets);
+        });
+      }, function (e) { addMsg('bot', '⚠️ ' + e.message, false); });
+    }
+
+    function runTestsHere(st, secrets) {
+      var ws = null, items = {};
+      var c = card('<h4>Running ' + esc(st.title) + '</h4><ul class="psa-rt">' + st.cases.map(function (x) {
+        return '<li data-n="' + x.n + '"><span class="psa-rt-i">○</span><b>' + esc(x.title) + '</b> <small>' + esc(x.task) + ' · expects ' + esc(x.expect) + '</small><div class="psa-rt-d"></div></li>';
+      }).join('') + '</ul><small class="psa-rt-now"></small><div class="psa-actions"><button type="button" class="psa-no" data-stop>Stop the run</button></div>');
+      [].forEach.call(c.querySelectorAll('[data-n]'), function (li) { items[li.getAttribute('data-n')] = li; });
+      var now = c.querySelector('.psa-rt-now');
+      c.querySelector('[data-stop]').addEventListener('click', function (e) { e.target.disabled = true; e.target.textContent = 'Stopping after this step...'; if (ws) ws.stopped = true; });
+      setStatus('working', 'Regression run');
+      suiteLoop(st.run_id, secrets, {
+        workspace: function (w) { ws = w; },
+        caseStart: function (x) { var li = items[x.n]; if (li) { li.querySelector('.psa-rt-i').textContent = '◌'; li.classList.add('psa-rt-on'); } },
+        step: function (t) { now.textContent = t; setStatus('working', t); },
+        caseEnd: function (x, v) {
+          var li = items[x.n];
+          if (!li || !v) return;
+          var m = VERD[v.verdict] || VERD.stopped;
+          li.classList.remove('psa-rt-on');
+          li.querySelector('.psa-rt-i').textContent = m[3];
+          li.querySelector('.psa-rt-i').style.color = m[1];
+          li.querySelector('.psa-rt-d').innerHTML = '<small>' + esc(v.detail || '') + '</small>';
+        }
+      }).then(function (report) {
+        secrets = null;
+        disable(c);
+        c.querySelector('.psa-actions').remove();
+        now.textContent = '';
+        setStatus(report && report.counts && report.counts.failed ? 'error' : 'idle');
+        if (report) showTestReport(report);
+      }, function (e) {
+        secrets = null;
+        setStatus('error');
+        addMsg('bot', '⚠️ The regression run stopped: ' + e.message, false);
+      });
+    }
+
+    function showTestReport(rep) {
+      if (!panel.classList.contains('psa-wide')) setWide(true);
+      var rows = (rep.results || []).map(function (r) {
+        var prev = r.previous ? (VERD[r.previous] || VERD.stopped)[0] : '';
+        return '<tr><td>' + r.n + '</td><td><b>' + esc(r.title) + '</b><small>' + esc(r.task_title) + ' · expects ' + esc(r.expect) + '</small></td><td>' + verdictTag(r.verdict)
+          + (prev && r.previous !== r.verdict ? '<small>was ' + esc(prev) + '</small>' : '') + '</td><td><small>' + esc(r.detail || '') + '</small>'
+          + ((r.changes || []).length ? '<details><summary>What changed</summary><ul>' + r.changes.map(function (x) { return '<li><small>' + esc(x) + '</small></li>'; }).join('') + '</ul></details>' : '')
+          + '</td></tr>';
+      }).join('');
+      var c = card('<h4>' + esc(rep.title) + ': ' + esc(rep.headline) + '</h4><small>Run ' + esc(rep.run_id) + ' by ' + esc(rep.by) + (rep.mode === 'server' ? ' (unattended)' : '')
+        + ', ' + esc(String(rep.started).slice(0, 16)) + (rep.previous_started ? ' · compared with the run of ' + esc(String(rep.previous_started).slice(0, 16)) : '') + '</small>'
+        + ((rep.newly_failing || []).length ? '<div class="psa-rb-warn" style="background:#fef2f2;color:#7f1d1d"><b>Failing since the last run:</b> ' + rep.newly_failing.map(esc).join(', ') + '</div>' : '')
+        + ((rep.fixed || []).length ? '<div class="psa-rb-warn" style="background:#ecfdf5;color:#065f46"><b>Fixed since the last run:</b> ' + rep.fixed.map(esc).join(', ') + '</div>' : '')
+        + (rep.note ? '<div class="psa-rb-warn" style="background:#fffbeb;color:#78350f">' + esc(rep.note) + '</div>' : '')
+        + '<table class="psa-mon-t psa-wp"><tr><th>#</th><th>Test case</th><th>Result</th><th>Details</th></tr>' + rows + '</table>'
+        + '<div class="psa-actions"><button type="button" class="psa-no" data-xl>Download the report (Excel)</button></div>');
+      c.classList.add('psa-diag');
+      c.querySelector('[data-xl]').addEventListener('click', function (e) {
+        download('/api/regress/report?xlsx=1&run=' + encodeURIComponent(rep.run_id)).then(function (n) { e.target.textContent = 'Downloaded ' + n; },
+          function (er) { addMsg('bot', '⚠️ ' + er.message, false); });
+      });
+    }
+
+    /* The watcher's alerts: a list, each opening its analysis and the action needed */
+    function showIncidents(x) {
+      var items = x.items || [];
+      if (!items.length) return;
+      var c = card('<h4>' + (items.length === 1 ? '1 alert' : items.length + ' alerts') + ' in the last ' + x.hours + ' hours</h4><ul class="psa-inc-list">'
+        + items.map(function (i, n) {
+          return '<li><button type="button" data-n="' + n + '"><b>' + esc(i.title) + '</b><small>' + esc(String(i.found).slice(5, 16)) + ' · ' + esc(i.monitor_title)
+            + (i.cleared ? ' · cleared' : '') + '</small><span>' + esc(String(i.summary || i.note || '').slice(0, 180)) + '</span></button></li>';
+        }).join('') + '</ul>');
+      c.addEventListener('click', function (e) {
+        var b = e.target.closest && e.target.closest('[data-n]');
+        if (b) showIncident(items[+b.getAttribute('data-n')]);
+      });
+    }
+    function openIncident(id) {
+      apiGet('/api/incidents?id=' + encodeURIComponent(id)).then(function (r) { showIncident(r.incidents[0]); },
+        function (e) { addMsg('bot', '⚠️ I could not open that alert: ' + e.message, false); });
+    }
+    function showIncident(inc) {
+      var rq = inc.request, found = 'Found by the watcher (' + inc.monitor_title + ') on ' + String(inc.found).slice(0, 16)
+        + (inc.occurrences > 1 ? '; failed ' + inc.occurrences + ' times: ' + inc.instances.join(', ') : '')
+        + (inc.log_files && inc.log_files.length ? '; read ' + inc.log_files.join(', ') : '') + (inc.emailed ? '; emailed' : '');
+      if (inc.diagnosis) {
+        addMsg('bot', '**' + inc.title + '**' + (rq ? ' (' + rq.status + ', user ' + rq.oprid + ', run control ' + (rq.runcntl || '-') + ', ended ' + rq.ended + ')' : '')
+          + '\n' + found + '.', false);
+        return showDiagnosis(inc.diagnosis);
+      }
+      var c = card('<h4>' + esc(inc.title) + '</h4><small>' + esc(found) + '</small>'
+        + (inc.summary ? '<p class="psa-diag-sum">' + md(inc.summary) + '</p>' : '')
+        + ((inc.servers || []).length ? '<div class="psa-diag-sec"><b>Process servers</b><ul>' + inc.servers.map(function (sv) {
+          return '<li>' + esc(sv.name) + ': ' + esc(sv.status) + ' <small>(last heartbeat ' + esc(sv.heartbeat) + ')</small></li>'; }).join('') + '</ul></div>' : '')
+        + ((inc.stuck || []).length ? previewTable({ columns: ['Instance', 'Process', 'User', 'Status', 'Run time', 'Server'],
+          sample: inc.stuck.slice(0, 10).map(function (r) { return [r.instance, r.process, r.oprid, r.status, r.run_time, r.server]; }) }) : '')
+        + (inc.check ? previewTable({ columns: inc.check.columns, sample: inc.check.rows }) : '')
+        + (inc.note ? '<p><small>' + esc(inc.note) + '</small></p>' : '')
+        + '<div class="psa-diag-sec"><b>Action needed</b><ol>' + (inc.actions || []).map(function (a) { return '<li>' + md(a) + '</li>'; }).join('') + '</ol></div>'
+        + (rq ? '<div class="psa-actions"><button type="button" class="psa-no" data-q="Why did process ' + esc(rq.instance) + ' fail?">Investigate again</button></div>' : ''));
+      c.classList.add('psa-diag');
+      c.addEventListener('click', function (e) { var b = e.target.closest && e.target.closest('[data-q]'); if (b) send(b.getAttribute('data-q')); });
+    }
+
+    /* Running a published runbook: the start card with its inputs, then one step at a time. Checks run on the
+       service; a task shows its confirm card (the password stays here) and runs in the workspace; a process is
+       followed until Process Monitor shows it ended; approvals and manual steps wait for a click. */
+    var RB_MARK = { ok: 'ok', warn: 'err', failed: 'err', stopped: 'err' };
+    function showRunbookStart(rb) {
+      var inputs = (rb.inputs || []).map(function (i) {
+        return '<label>' + esc(i.label) + '<input data-in="' + esc(i.name) + '" value="' + esc(i['default']) + '"></label>'
+          + (i.hint ? '<small>' + esc(i.hint) + '</small>' : '');
+      }).join('');
+      var steps = (rb.steps || []).map(function (st) {
+        var t = RB_TYPE[st.type] || RB_TYPE.manual;
+        return '<li><div class="psa-rb-h"><span class="psa-rb-n">' + st.n + '</span><b>' + esc(st.title) + '</b><span class="psa-rb-t" style="color:'
+          + t[1] + ';background:' + t[2] + '">' + t[0] + '</span></div></li>';
+      }).join('');
+      var c = card('<h4>Run: ' + esc(rb.title) + '</h4>' + (rb.summary ? '<p class="psa-diag-sum">' + esc(rb.summary) + '</p>' : '')
+        + inputs + '<details><summary>' + (rb.steps || []).length + ' steps</summary><ol class="psa-rb-steps">' + steps + '</ol></details>'
+        + '<small>Tasks still show their confirm card, and approvals wait for you. The run stops at the first problem.</small>'
+        + '<div class="psa-actions"><button type="button" class="psa-ok" data-go>Start</button><button type="button" class="psa-no" data-x>Cancel</button></div>');
+      c.querySelector('[data-x]').addEventListener('click', function () {
+        disable(c);
+        api('/api/runbooks/step', { session_id: state.sessionId, run_id: rb.run_id, cancel: true }).catch(function () {});
+      });
+      c.querySelector('[data-go]').addEventListener('click', function () {
+        var values = {};
+        c.querySelectorAll('[data-in]').forEach(function (x) { values[x.getAttribute('data-in')] = x.value; });
+        disable(c);
+        runRunbook(rb, values, c);
+      });
+    }
+
+    function runRunbook(rb, inputs, startCard) {
+      var feed = activity('Runbook: ' + rb.title), waitLine = null, ws = null;
+      setStatus('working', 'Running ' + rb.title);
+      function call(req) {
+        req.session_id = state.sessionId;
+        req.run_id = rb.run_id;
+        return api('/api/runbooks/step', req);
+      }
+      function handle(r) {
+        if (waitLine && (r.events || []).length) { waitLine.remove(); waitLine = null; }
+        (r.events || []).forEach(function (ev) {
+          var ok = ev.status === 'ok', line = feed.add(ev.n + '. ' + ev.title + (ok ? ': ' + ev.detail : ''));
+          line.end(ok, ok ? null : (ev.status === 'warn' ? 'warning: ' : '') + ev.detail);
+        });
+        if (r.done) return finish(r);
+        var nx = r.next || {};
+        if (nx.type === 'task') return askTask(nx);
+        if (nx.type === 'run') return runTask(nx);
+        if (nx.type === 'wait') {
+          setStatus('working', nx.text);
+          if (!waitLine) waitLine = feed.add(nx.n + '. ' + nx.title + ': ' + nx.text, 'run');
+          return sleep(4000).then(function () { return call({ poll: true }).then(handle, lost); });
+        }
+        if (nx.type === 'approval' || nx.type === 'manual') return askClick(nx);
+        return finish({ status: 'failed', results: [] });
+      }
+      function lost(e) {
+        feed.finish('error');
+        setStatus('error');
+        addMsg('bot', '⚠️ The runbook stopped: ' + e.message, false);
+      }
+      /* the task's confirm card: values from the runbook, anything still missing, the password */
+      function askTask(nx) {
+        setStatus('waiting', 'Step ' + nx.n + ': waiting for you');
+        var rows = (nx.rows || []).map(function (x) { return '<tr><td>' + esc(x.label) + '</td><td><strong>' + esc(x.value) + '</strong></td></tr>'; }).join('');
+        var miss = (nx.missing || []).map(function (f) {
+          return '<label>' + esc(f.label) + ' (needed)<input data-fill="' + esc(f.name) + '"></label>' + (f.hint ? '<small>' + esc(f.hint) + '</small>' : '');
+        }).join('');
+        var sec = (nx.secrets || []).map(function (x) {
+          return '<label>' + esc(x.label) + '<input type="password" autocomplete="new-password" data-secret="' + esc(x.name) + '"></label>'
+            + '<label>Confirm ' + esc(x.label) + '<input type="password" autocomplete="new-password" data-confirm="' + esc(x.name) + '"></label>';
+        }).join('');
+        var c = card('<h4>Step ' + nx.n + ': ' + esc(nx.title) + '</h4><small>Runs the task <b>' + esc(nx.task_title) + '</b>'
+          + (nx.process ? ', then follows the process in Process Monitor' : '') + '.</small>' + (rows ? '<table>' + rows + '</table>' : '') + miss + sec
+          + '<div class="psa-actions"><button type="button" class="psa-ok">Do it</button><button type="button" class="psa-no">Stop the run</button></div>');
+        c.classList.add('psa-approve');
+        var ok = c.querySelector('.psa-ok');
+        function values() {
+          var out = {}, valid = true;
+          c.querySelectorAll('[data-secret]').forEach(function (inp) {
+            var conf = c.querySelector('[data-confirm="' + inp.getAttribute('data-secret') + '"]');
+            if (!inp.value || inp.value !== conf.value) valid = false;
+            out[inp.getAttribute('data-secret')] = inp.value;
+          });
+          c.querySelectorAll('[data-fill]').forEach(function (inp) { if (!inp.value.trim()) valid = false; });
+          return valid ? out : null;
+        }
+        function refresh() { ok.disabled = !values(); }
+        c.querySelectorAll('input').forEach(function (x) { x.addEventListener('input', refresh); });
+        refresh();
+        return new Promise(function (resolve) {
+          ok.addEventListener('click', function () {
+            var secrets = values(), fill = {};
+            if (!secrets) return;
+            c.querySelectorAll('[data-fill]').forEach(function (x) { fill[x.getAttribute('data-fill')] = x.value; });
+            ok.disabled = true;
+            call({ confirm: true, fill: fill }).then(function (r) {
+              disable(c);
+              c.querySelectorAll('input[type="password"]').forEach(function (x) { x.value = ''; });
+              pendingSecrets[rb.run_id] = secrets;
+              resolve(handle(r));
+            }, function (e) { ok.disabled = false; addMsg('bot', '⚠️ ' + e.message, false); });
+          });
+          c.querySelector('.psa-no').addEventListener('click', function () { disable(c); resolve(call({ cancel: true }).then(handle, lost)); });
+        });
+      }
+      function runTask(nx) {
+        var secrets = pendingSecrets[rb.run_id] || {}, cur = null;
+        delete pendingSecrets[rb.run_id];
+        ws = openWorkspace('Agent: ' + nx.action.title);
+        ws.onStep = function (n, total, text) { setStatus('working', 'Step ' + nx.n + ' · ' + n + '/' + total + ': ' + text); };
+        cur = feed.add(nx.n + '. ' + nx.action.title + ' (on screen)', 'run');
+        return runAction(nx.action, secrets, ws).catch(function (e) {
+          return { status: 'error', message: 'The agent hit an unexpected problem: ' + ((e && e.message) || e) };
+        }).then(function (res) {
+          secrets = null;
+          ws.done();
+          ws.status(res.status === 'success' ? 'Done: ' + nx.action.title : 'Stopped: ' + res.message, res.status !== 'success');
+          cur.remove();
+          return call({ result: { status: res.status, message: res.message, failed_step: res.failed_step } }).then(handle, lost);
+        });
+      }
+      function askClick(nx) {
+        setStatus('waiting', 'Step ' + nx.n + ': waiting for you');
+        var approval = nx.type === 'approval';
+        var c = card('<h4>Step ' + nx.n + ': ' + esc(nx.title) + '</h4>' + (nx.instructions ? '<p class="psa-diag-sum">' + esc(nx.instructions) + '</p>' : '')
+          + (nx.owner ? '<small>' + (approval ? 'Approver: ' : 'Owner: ') + esc(nx.owner) + '</small>' : '')
+          + '<div class="psa-actions"><button type="button" class="psa-ok">' + (approval ? 'Approve' : 'Done') + '</button>'
+          + '<button type="button" class="psa-no">' + (approval ? 'Reject' : 'Stop the run') + '</button></div>');
+        c.classList.add('psa-approve');
+        return new Promise(function (resolve) {
+          c.querySelector('.psa-ok').addEventListener('click', function () {
+            disable(c);
+            resolve(call(approval ? { approve: true } : { done: true }).then(handle, lost));
+          });
+          c.querySelector('.psa-no').addEventListener('click', function () {
+            disable(c);
+            resolve(call(approval ? { approve: false } : { cancel: true }).then(handle, lost));
+          });
+        });
+      }
+      function finish(r) {
+        var good = r.status === 'success';
+        feed.finish(good ? 'success' : 'error');
+        setStatus(good ? 'idle' : 'error');
+        var items = (r.results || []).map(function (x) {
+          var m = CHECK_MARK[x.status === 'ok' ? 'ok' : x.status === 'warn' ? 'warning' : x.status === 'stopped' ? 'info' : 'problem'];
+          return '<div class="psa-chk ' + m[0] + '"><i>' + m[1] + '</i><span><b>' + x.n + '. ' + esc(x.title) + '</b>: ' + esc(x.detail) + '</span></div>';
+        }).join('');
+        var c = card('<h4>' + esc(rb.title) + ': ' + ({ success: 'completed', failed: 'stopped at a problem', stopped: 'stopped' }[r.status] || r.status) + '</h4>'
+          + items + (r.failed_instance ? '<div class="psa-actions"><button type="button" class="psa-ok" data-why>Why did process ' + esc(r.failed_instance)
+            + ' fail?</button></div>' : ''));
+        var why = c.querySelector('[data-why]');
+        if (why) why.addEventListener('click', function () { disable(c); send('Why did process ' + r.failed_instance + ' fail?'); });
+      }
+      return call({ inputs: inputs }).then(handle, function (e) {
+        feed.finish('error');
+        setStatus('error');
+        addMsg('bot', '⚠️ ' + e.message, false);
+        if (startCard) startCard.querySelectorAll('input,button').forEach(function (x) { x.disabled = false; });
       });
     }
 
@@ -2240,6 +3928,11 @@
       refreshContext();
       clearInterval(ctxTimer);
       ctxTimer = setInterval(refreshContext, 3000);
+      clearInterval(dogsTimer);
+      dogsTimer = setInterval(refreshDogs, 60000);
+      clearInterval(phTimer);
+      phTimer = setInterval(rotatePlaceholder, 4000);
+      wave();
       if (!ready) {                       /* first open, or the last attempt failed: (re)connect */
         logEl.innerHTML = '';
         ensureConfig().then(function () {
@@ -2247,6 +3940,8 @@
           return apiGet('/api/me').then(function (m) {
             me = m;
             canTeach = !!m.can_teach;
+            setDogs(m.overnight && m.overnight.watchdogs);
+            if (!panel.querySelector('#psa-featmenu').hidden) toggleFeatures(true);   /* opened while connecting */
             if (canTeach) panel.querySelector('#psa-rec').style.display = '';
           }, function (e) {
             addMsg('bot', 'I cannot reach the agent service at ' + (cfg.agentUrl || '(no URL)') + ': ' + e.message
@@ -2254,6 +3949,7 @@
           }).then(function () {
             if (state.history.length) state.history.forEach(function (h) { addMsg(h.who, h.text, false); });
             else greet();
+            if (INC_LINK) { var id = INC_LINK; INC_LINK = null; openIncident(id); }
           });
         }, function (e) {
           console.warn('[PSAgent] config failed:', e);
@@ -2269,7 +3965,16 @@
       document.body.classList.remove('psa-docked');
       fab.setAttribute('aria-expanded', 'false');
       clearInterval(ctxTimer);
+      clearInterval(phTimer);
+      clearInterval(dogsTimer);
       fab.focus();
+    }
+    /* Pia waves hello the first time the panel opens in this browser session */
+    function wave() {
+      try { if (sessionStorage.getItem('psagent.waved')) return; sessionStorage.setItem('psagent.waved', '1'); } catch (e) { return; }
+      var av = panel.querySelector('#psa-hdr .psa-av');
+      av.classList.add('psa-wave');
+      av.addEventListener('animationend', function () { av.classList.remove('psa-wave'); }, { once: true });
     }
     function setWide(on) {
       panel.classList.toggle('psa-wide', on);
@@ -2279,6 +3984,7 @@
     try { if (localStorage.getItem('psagent.wide')) setWide(true); } catch (e) {}
 
     function submit() {
+      if (reading) { reading.then(submit); return; }   /* a file still being read goes with this message, not the next */
       var t = input.value;
       if ((!String(t).trim() && !attached) || (busy && !liveWaiter)) return;
       input.value = '';
@@ -2293,7 +3999,19 @@
     panel.querySelector('#psa-rec').addEventListener('click', function () { showRecordCard({ title: '' }); });
     panel.querySelector('#psa-hist').addEventListener('click', showRecent);
     panel.querySelector('#psa-attach').addEventListener('click', function () { panel.querySelector('#psa-file').click(); });
-    panel.querySelector('#psa-file').addEventListener('change', function (e) { takeFile(e.target.files[0]); e.target.value = ''; });
+    panel.querySelector('#psa-file').addEventListener('change', function (e) {
+      var as = uploadAs, cu = ciUpload;
+      uploadAs = ciUpload = null;
+      if (cu) ciUploadFile(e.target.files[0], cu);
+      else takeFile(e.target.files[0], as);
+      e.target.value = '';
+    });
+    panel.querySelector('#psa-feat').addEventListener('click', function (e) { e.stopPropagation(); toggleFeatures(); });
+    panel.querySelector('#psa-dogs').addEventListener('click', showManager);
+    document.addEventListener('click', function (e) {
+      var menu = panel.querySelector('#psa-featmenu');
+      if (!menu.hidden && !menu.contains(e.target)) toggleFeatures(false);
+    });
     panel.addEventListener('dragover', function (e) { e.preventDefault(); panel.classList.add('psa-drop'); });
     panel.addEventListener('dragleave', function (e) { if (e.target === panel) panel.classList.remove('psa-drop'); });
     panel.addEventListener('drop', function (e) {
@@ -2310,7 +4028,8 @@
       saveState();
       logEl.innerHTML = '';
       setStatus('idle');
-      greet();
+      /* fresh welcome data: new alerts, failed processes, runbooks and tasks published since the panel opened */
+      apiGet('/api/me').then(function (m) { me = m; }, function () {}).then(function () { if (!logEl.children.length) greet(); });
     });
     panel.querySelector('#psa-form').addEventListener('submit', function (e) { e.preventDefault(); submit(); });
     input.addEventListener('input', grow);
@@ -2330,6 +4049,7 @@
       startRecording({ title: comp.component, steps: [], component: comp, query: query || {} });
     };
     resumeRecording();   /* a recording started on an earlier page continues here */
+    if (INC_LINK) open();
   }
 
   /* ============================================================
@@ -2356,16 +4076,20 @@
       })
       .then(function (c) {
         cfg.agentUrl = c.agentUrl; cfg.token = c.token; cfg.oprid = c.oprid; cfg.fullname = c.fullname;
+        cfg.roles = Array.isArray(c.roles) ? c.roles : null;   /* null: an iScript from before roles */
         return cfg;
       });
     configPromise.catch(function () { configPromise = null; });
     return configPromise;
   }
 
-  /* POST payload as JSON (GET when payload is undefined); errors carry the service's message */
+  /* POST payload as JSON (GET when payload is undefined); errors carry the service's message.
+     ngrok-skip-browser-warning: on ngrok's free plan, GETs from a browser otherwise get its
+     warning page (no CORS headers, so "Failed to fetch"); other hosts ignore the header */
   function api(path, payload, retried) {
     return ensureConfig().then(function () {
-      var opts = { method: payload === undefined ? 'GET' : 'POST', headers: { 'Authorization': 'Bearer ' + cfg.token } };
+      var opts = { method: payload === undefined ? 'GET' : 'POST',
+        headers: { 'Authorization': 'Bearer ' + cfg.token, 'ngrok-skip-browser-warning': '1' } };
       if (payload !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(payload); }
       return fetch(cfg.agentUrl.replace(/\/$/, '') + path, opts);
     }).then(function (r) {
@@ -2386,15 +4110,23 @@
     inspect: inspect,
     /* what live mode sends to Claude for the page in the workspace (or the page you are on) */
     snapshot: function () { return snapshotPage(workspace && workspace.el.style.display !== 'none' ? workspace.frame : getContentFrameEl() || { contentDocument: document, contentWindow: window }); },
-    run: function (action, secrets) { return runAction(action, secrets || {}, openWorkspace('Agent: ' + (action.title || 'test'))); }
+    run: function (action, secrets) { return runAction(action, secrets || {}, openWorkspace('Agent: ' + (action.title || 'test'))); },
+    /* the headless runner on the service: run a regression run started there -> its report */
+    runSuite: function (runId, secrets) { return suiteLoop(runId, secrets || {}); }
   };
 
   function start() {
     /* Branding loads this file on every page, including the PeopleSoft content frame
        and the agent's own workspace frame: only the top window gets the widget. */
     try { if (window.top !== window && window.top.document) return; } catch (e) { /* cross-origin parent: show it */ }
-    if (document.body) { initWidget(); try { console.info('[PSAgent] widget ' + VERSION); } catch (e) {} }
-    else setTimeout(start, 250);
+    if (!document.body) return setTimeout(start, 250);
+    /* the widget is only for users with an agent role (PSAGENT_USER, _MONITOR, _ADMIN): the iScript says which.
+       If the iScript can't be read, show it anyway so opening it explains the problem. */
+    ensureConfig().then(function () {
+      if (cfg.roles && !cfg.roles.length) { try { console.info('[PSAgent] hidden: no PSAGENT role'); } catch (e) {} return; }
+      show();
+    }, show);
+    function show() { initWidget(); try { console.info('[PSAgent] widget ' + VERSION); } catch (e) {} }
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();

@@ -24,7 +24,6 @@ Only security administrators may use any of it.
 import json
 import logging
 import re
-import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -154,6 +153,7 @@ class AccessInvestigation:
     queries: list = field(default_factory=list)
     rounds: int = 0
     diagnosis: dict | None = None
+    free_sql: bool = True      # Claude's own read-only queries (PSAGENT_MONITOR and ADMIN only)
 
     @property
     def instance(self):        # the label the agent uses in its chat note
@@ -163,36 +163,9 @@ class AccessInvestigation:
 class AccessChecker(Troubleshooter):
     system, tools = SYSTEM, TOOLS
 
-    def __init__(self, llm, db, effort="medium", admins=(), admin_roles=("Security Administrator", "PeopleSoft Administrator"),
-                 portal="EMPLOYEE"):
+    def __init__(self, llm, db, effort="medium", portal="EMPLOYEE"):
         super().__init__(llm, db, effort)
-        self.admins = {a.upper() for a in admins}
-        self.admin_roles = [r for r in admin_roles if r]
         self.portal = portal
-        self._admin_cache = {}
-
-    # ----- who may use it -------------------------------------------------
-    def is_admin(self, oprid):
-        """Security admins: listed in PSAGENT_SECURITY_ADMINS, or holding one of the admin roles."""
-        oprid = str(oprid or "").upper()
-        if "*" in self.admins or oprid in self.admins:
-            return True
-        if not self.admin_roles or not oprid:
-            return False
-        hit = self._admin_cache.get(oprid)
-        if hit and time.time() - hit[1] < 300:
-            return hit[0]
-        binds = ", ".join(f":r{i}" for i in range(len(self.admin_roles)))
-        try:
-            _, rows, _ = self.db.query(f"SELECT COUNT(*) FROM PSROLEUSER WHERE ROLEUSER = :o AND ROLENAME IN ({binds})",
-                                       {"o": oprid, **{f"r{i}": r for i, r in enumerate(self.admin_roles)}},
-                                       who=oprid, why="security admin check")
-            ok = bool(rows and rows[0][0])
-        except QueryError as e:
-            log.warning("security admin check for %s: %s", oprid, e)
-            ok = False
-        self._admin_cache[oprid] = (ok, time.time())
-        return ok
 
     def begin(self, user, target, question=""):
         return AccessInvestigation(run_id="sec-" + uuid.uuid4().hex[:10], user=_oprid(user), target=str(target)[:200],

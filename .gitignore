@@ -2,3 +2,17 @@ __pycache__/
 *.pyc
 tests/runner/failure.png
 .env
+.env.new
+agent-service/monitors/state.json
+agent-service/monitors/incidents/
+agent-service/runbooks/runs/
+agent-service/regression/runs/
+agent-service/regression/counter.txt
+agent-service/regression/state.json
+agent-service/audit/
+agent-service/ci_loads/
+
+# Secrets kept out of git: the VM key, the VM settings copy, test sign-ons
+*.ppk
+agent-service/env
+agent-service/.e2e.env

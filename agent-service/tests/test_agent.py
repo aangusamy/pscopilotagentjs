@@ -181,7 +181,19 @@ class AgentFlowTest(unittest.TestCase):
         before = json.dumps(agent.tools)
         agent.add_task(TASKS["create_user_profile"])
         self.assertEqual(json.dumps(agent.tools), before)
-        self.assertTrue(all(t["strict"] for t in agent.tools))
+        # draft_runbook and draft_monitor are too large for the strict grammar (the API refuses it); runbooks.check and
+        # monitors.check validate them instead. Tools without arguments gain nothing from strict.
+        self.assertEqual([t["name"] for t in agent.tools if not t.get("strict")],
+                         ["request_confirmation", "cancel_task", "draft_runbook", "draft_monitor", "draft_watch_plan",
+                          "list_monitors", "draft_test_suite", "summarize_result", "find_rows"])
+
+    def test_no_request_has_more_strict_tools_than_the_api_takes(self):
+        """The API refuses a request with more than 20 strict tools ("Too many strict tools")."""
+        from psagent import approvals, live, security, troubleshoot
+        from psagent.agent import MAX_STRICT
+        for name, tools in (("agent", Agent(FakeLLM(), TASKS).tools), ("troubleshoot", troubleshoot.TOOLS),
+                            ("live", live.LIVE_TOOLS), ("security", security.TOOLS), ("approvals", approvals.TOOLS)):
+            self.assertLessEqual(sum(1 for t in tools if t.get("strict")), MAX_STRICT, name)
 
 if __name__ == "__main__":
     unittest.main()
