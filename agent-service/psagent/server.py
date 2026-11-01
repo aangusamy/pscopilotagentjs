@@ -51,6 +51,8 @@ POST /api/regress/unattended {suite | smoke: true}        -> {run_id}   (the hea
 POST /api/regress/delete {suite}
 GET  /api/regress/export?suite= | /api/regress/report?run=&xlsx=1  -> {name, data} | {report}
 GET  /health
+GET  /psagent.js                                          -> the widget (PSAGENT_WIDGET_FILE), for a loader in Branding
+                                                             that fetches it from here instead of pasting the whole file
 
 Every /api call needs  Authorization: Bearer <token from IScript_PSAgentConfig>. The token carries the user's
 agent roles (PeopleSoft roles PSAGENT_USER, PSAGENT_MONITOR, PSAGENT_ADMIN, PSAGENT_AUDITOR); a token with no role is
@@ -74,7 +76,7 @@ from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from . import access, audit, auth, ci, monitors, queries, recorder, regress, runbooks
@@ -100,7 +102,7 @@ def feature_of(path):
 
 def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), tasks_dir=None, runbooks_dir=None,
                watcher=None, monitor_users=(), dev_roles=None, regression=None, audit_log=None, auditors=(), audit_jobs=None,
-               ci_store=None, query_catalog=None):
+               ci_store=None, query_catalog=None, widget_file=None):
     """Who may do what comes from the agent roles in the signed token (access.py). teachers / monitor_users / auditors:
     OPRIDs given ADMIN / MONITOR / AUDITOR rights besides their roles, in development only (dev_oprid set; "*" =
     everyone): in production only the roles count. tasks_dir / runbooks_dir: where
@@ -1246,6 +1248,14 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
     async def health(_request):
         return JSONResponse({"ok": True, "tasks": sorted(agent.tasks)})
 
+    async def widget(_request):
+        # No token: the loader runs before the widget has one, and the file holds no secrets.
+        # no-cache: a fixed psagent.js reaches every browser on its next page.
+        if not widget_file or not Path(widget_file).is_file():
+            return JSONResponse({"error": "no psagent.js on the service (PSAGENT_WIDGET_FILE)"}, status_code=404)
+        return Response(Path(widget_file).read_bytes(), media_type="application/javascript; charset=utf-8",
+                        headers={"Cache-Control": "no-cache"})
+
     @asynccontextmanager
     async def lifespan(_app):
         if watcher is not None:
@@ -1306,6 +1316,7 @@ def create_app(agent, secret, allowed_origins, dev_oprid=None, teachers=(), task
             Route("/api/audit", audit_view),
             Route("/api/audit/export", audit_export),
             Route("/health", health),
+            Route("/psagent.js", widget),
         ],
         lifespan=lifespan,
         middleware=[
@@ -1334,6 +1345,16 @@ def load_dotenv(path):
             value = value[1:-1]
         if key and value:
             os.environ.setdefault(key, value)
+
+
+def widget_file_from_env():
+    """psagent.js for GET /psagent.js and unattended runs: PSAGENT_WIDGET_FILE, else the one in agent-service (a
+    server with only that folder), else the one above it (the git checkout)."""
+    if os.environ.get("PSAGENT_WIDGET_FILE"):
+        return os.environ["PSAGENT_WIDGET_FILE"]
+    service = Path(__file__).resolve().parents[1]
+    inside = service / "psagent.js"
+    return str(inside if inside.is_file() else service.parent / "psagent.js")
 
 
 def app_from_env():
@@ -1395,9 +1416,12 @@ def app_from_env():
     if db and os.environ.get("PSAGENT_QUERIES", "on").lower() not in ("off", "0", "false", "no"):
         catalog = queries.Catalog(db, os.environ.get("PSAGENT_QUERY_PREFIX", queries.PREFIX).strip().upper() or queries.PREFIX)
         log.info("Ask the data: PS Queries named %s* that each user may run", catalog.prefix)
+    widget_file = widget_file_from_env()
+    log.info("Widget for loaders (GET /psagent.js, PSAGENT_WIDGET_FILE=%s): %s", widget_file,
+             "found" if Path(widget_file).is_file() else "missing")
     return create_app(agent, secret, origins, dev_oprid, teachers, tasks_dir, runbooks_dir,
                       watcher_from_env(agent, mailer), monitor_users, dev_roles, regression_from_env(agent, mailer),
-                      audit_log, auditors, jobs, ci_store, catalog)
+                      audit_log, auditors, jobs, ci_store, catalog, widget_file)
 
 
 def _list(value):
@@ -1472,7 +1496,8 @@ def regression_from_env(agent, mailer=None):
     else:
         try:
             secrets = dict(x.split("=", 1) for x in _list(os.environ.get("PSAGENT_TEST_SECRETS")) if "=" in x)
-            headless = regress_runner.Headless(ps_url, user, os.environ.get("PSAGENT_TEST_PASSWORD", ""), secrets)
+            headless = regress_runner.Headless(ps_url, user, os.environ.get("PSAGENT_TEST_PASSWORD", ""), secrets,
+                                               widget_file_from_env())
             unattended = regress_runner.Unattended(runner, store, headless, agent.db, mailer)
             log.info("Regression tests: on (%d suites); unattended runs as %s", len(store.suites), user)
         except ValueError as e:

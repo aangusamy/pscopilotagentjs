@@ -127,6 +127,33 @@ class RoleMatrixTest(unittest.TestCase):
         dev = TestClient(create_app(Agent(FakeLLM(), TASKS), "", [], dev_oprid="DEV", teachers={"*"}))
         self.assertTrue(dev.get("/api/me").json()["can_teach"])
 
+    def test_the_widget_file_needs_no_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            js = Path(tmp) / "psagent.js"
+            js.write_text("var VERSION = 'x';", encoding="utf-8")
+            c = TestClient(create_app(Agent(FakeLLM(), TASKS), SECRET, ["http://ps"], widget_file=str(js)))
+            r = c.get("/psagent.js", headers={"Origin": "http://ps"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.text, "var VERSION = 'x';")
+            self.assertIn("javascript", r.headers["content-type"])
+            self.assertEqual(r.headers["cache-control"], "no-cache")
+            self.assertEqual(r.headers["access-control-allow-origin"], "http://ps", "the loader fetches it from the PeopleSoft origin")
+            js.unlink()
+            self.assertEqual(c.get("/psagent.js").status_code, 404)
+
+    def test_the_widget_file_is_found_in_agent_service_first(self):
+        import os
+        from unittest import mock
+        from psagent.server import widget_file_from_env
+        service = Path(__file__).resolve().parents[1]
+        with mock.patch.dict(os.environ, {"PSAGENT_WIDGET_FILE": "/x/psagent.js"}):
+            self.assertEqual(widget_file_from_env(), "/x/psagent.js")
+        with mock.patch.dict(os.environ, {"PSAGENT_WIDGET_FILE": ""}):
+            with mock.patch.object(Path, "is_file", lambda p: p == service / "psagent.js"):
+                self.assertEqual(widget_file_from_env(), str(service / "psagent.js"), "a server with only agent-service")
+            with mock.patch.object(Path, "is_file", lambda p: False):
+                self.assertEqual(widget_file_from_env(), str(service.parent / "psagent.js"), "the git checkout")
+
 
 if __name__ == "__main__":
     unittest.main()
