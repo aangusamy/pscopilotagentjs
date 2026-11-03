@@ -22,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-11-02.5';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-11-03.1';   /* shown as PSAgent.version and in the console: check after uploading */
   var NAME = 'Pia', NAME_LONG = 'PeopleSoft Intelligent Assistant';   /* also in agent-service SYSTEM_PROMPT */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
@@ -223,15 +223,25 @@
     return m ? m.text : null;
   }
 
+  function modalButtons(m) {
+    var box = (m.el.closest && (m.el.closest('[id^="ptMod_"]') || m.el.closest('#pt_modals'))) || document;
+    return [].filter.call(box.querySelectorAll('input[type="button"],input[type="submit"],button'), function (b) {
+      return visible(b) && (b.value || b.textContent || '').trim();
+    });
+  }
+
+  /* The Cancel or No button of an open question box (never OK or Yes, which could save) */
+  function modalNoButton() {
+    var m = modalMessage();
+    return m ? modalButtons(m).filter(function (b) { return /^(cancel|no)$/i.test((b.value || b.textContent).trim()); })[0] : null;
+  }
+
   /* Close a message box whose only button is OK (after its text was captured).
      Yes/No questions are left open for the person to answer. */
   function dismissModal() {
     var m = modalMessage();
     if (!m) return false;
-    var box = (m.el.closest && (m.el.closest('[id^="ptMod_"]') || m.el.closest('#pt_modals'))) || document;
-    var btns = [].filter.call(box.querySelectorAll('input[type="button"],input[type="submit"],button'), function (b) {
-      return visible(b) && (b.value || b.textContent || '').trim();
-    });
+    var btns = modalButtons(m);
     if (btns.length !== 1 || !/^ok$/i.test((btns[0].value || btns[0].textContent).trim())) return false;
     btns[0].click();
     return true;
@@ -1093,6 +1103,12 @@
       }
       return step({});
     }
+    /* A question box the case stopped at would be read by the next case as its own: answer no, so nothing is saved */
+    function closeBox() {
+      var no = modalNoButton();
+      if (!no) return Promise.resolve();
+      return act(ws.frame, function () { no.click(); }).catch(function () {});
+    }
     function next() {
       if (ws.stopped) return api('/api/regress/stop', { run_id: runId }).then(function (r) { ws.done(); return r.report; });
       return api('/api/regress/next', { run_id: runId }).then(function (r) {
@@ -1110,7 +1126,7 @@
         }).then(function (v) {
           if (ui.caseEnd) ui.caseEnd(c, v.verdict);
           if (v.stopped) { ws.done(); return api('/api/regress/next', { run_id: runId }).then(function (x) { return x.report; }); }
-          return next();
+          return closeBox().then(next);
         });
       });
     }

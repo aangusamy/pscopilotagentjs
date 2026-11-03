@@ -46,16 +46,19 @@
 
   function el(id) { return document.getElementById(id); }
   /* Like PeopleSoft: the message box goes to the TOP window, also when this page is in a frame */
-  function msg(text) {
+  function msg(text, onOk) {   /* with onOk: a question, with OK and Cancel */
     var d = document;
     try { if (window.top !== window && window.top.document.body) d = window.top.document; } catch (e) {}
     var host = d.getElementById('pt_modals');
     if (!host) { host = d.createElement('div'); host.id = 'pt_modals'; d.body.appendChild(host); }
     host.innerHTML = '<div id="ptMod_0" style="position:fixed;top:30%;left:30%;z-index:2147483646;border:2px solid #900;'
       + 'background:#fff;padding:16px;font:12px Arial"><a href="#" style="display:inline-block;width:2px">&nbsp;</a>'
-      + '<span id="alertmsg" class="popupText"></span><br><input type="button" id="#ICOK" value="OK"></div>';
+      + '<span id="alertmsg" class="popupText"></span><br><input type="button" id="#ICOK" value="OK">'
+      + (onOk ? '<input type="button" id="#ICCancel" value="Cancel">' : '') + '</div>';
     host.querySelector('#alertmsg').textContent = text;
-    host.querySelector('input').onclick = function () { host.innerHTML = ''; };
+    [].forEach.call(host.querySelectorAll('input'), function (b) {
+      b.onclick = function () { host.innerHTML = ''; if (onOk && b.value === 'OK') onOk(); };
+    });
   }
 
   /* Every action is a server round trip: show the processing indicator, then re-render. */
@@ -109,9 +112,16 @@
 
   function save() {
     if (!data.DESCR) return msg('Description is required.');
-    if (!data.PWD || data.PWD !== data.PWD2) return msg('Password and Confirm Password do not match. (48,14)');
+    if (data.PWD !== data.PWD2) return msg('Password and Confirm Password do not match. (48,14)');
     if (!data.SYMBOLICID) return msg('Symbolic ID is required.');
+    if (!data.PWD) return msg('Warning -- No password provided! External Authentication will be required for the User Id to be usable. '
+      + 'Press the "OK" button if you would like to save without a password.  Press the "Cancel" button to enter a password before saving.', commit);
+    commit();
+  }
+
+  function commit() {
     window.__mockSaved = JSON.parse(JSON.stringify(data));
+    try { (window.top.__mockCommits = window.top.__mockCommits || []).push(data.OPRID); } catch (e) {}
     el('SAVED_win0').style.display = 'block';
   }
 

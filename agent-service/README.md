@@ -350,6 +350,8 @@ admins open **＋ Features › Regression tests**:
   `PS_MAINTENANCE_LOG` and `PSRELEASE`. The report is emailed (`PSAGENT_SMTP_*`)
   to the suite's recipients, or to `PSAGENT_ALERT_TO`. Needs `pip install
   playwright` and `python -m playwright install chromium`.
+- **Between cases** a question box a case stopped at (OK/Cancel, Yes/No) is
+  answered Cancel or No, so it cannot save anything or fail the next case.
 
 ## Excel to CI: load spreadsheet rows through Component Interfaces
 

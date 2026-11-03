@@ -703,6 +703,28 @@ test('regression: template -> upload -> overview -> save -> run here (passes) ->
   assert.equal(full.n, '0003');
 });
 
+test('regression: a case stopped at an OK/Cancel box answers Cancel: nothing saved, and the next case is not spoiled', async page => {
+  const withPassword = await actionFor({ user_id: 'WITHPWD', description: 'Has a password' });
+  const noPassword = JSON.parse(JSON.stringify(await actionFor({ user_id: 'NOPWD', description: 'No password' })).replace(/\{\{secret:password\}\}/g, ''));
+  const cases = [{ n: 1, of: 2, action: noPassword }, { n: 2, of: 2, action: withPassword }];
+  const results = [];
+  await page.route('**/api/regress/next', r => {
+    const c = cases.shift();
+    return r.fulfill({ json: c ? { case: c } : { done: true, report: { headline: 'done' } } });
+  });
+  await page.route('**/api/regress/result', async r => {
+    results.push({ result: r.request().postDataJSON().result, boxOpen: await modalOpen(page) });
+    return r.fulfill({ json: { verdict: 'failed' } });
+  });
+  await page.evaluate(() => PSAgent.runSuite('box-test', { password: 'Secr3t!' }));
+  assert.equal(results[0].result.status, 'error');
+  assert.match(results[0].result.message, /No password provided/);
+  assert.ok(results[0].boxOpen, 'the case reports the box before it is closed');
+  assert.deepEqual(results[1].result, { status: 'success', message: 'Saved' });
+  assert.equal(await modalOpen(page), false);
+  assert.deepEqual(await page.evaluate(() => window.__mockCommits), ['WITHPWD'], 'Cancel, never OK: the first user is not saved');
+});
+
 test('audit: + Features > Audit opens the dashboard beside the chat: overview, usage and cost, the audit log, failures, watcher and tests', async page => {
   await page.setViewportSize({ width: 1500, height: 950 });
   await page.click('#psa-fab');
