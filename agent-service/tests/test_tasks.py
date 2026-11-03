@@ -18,6 +18,16 @@ def minimal(**overrides):
     return data
 
 
+class AssignRoleTest(unittest.TestCase):
+    def test_adds_a_row_and_never_writes_to_a_fixed_row(self):
+        task = load_tasks(Path(__file__).resolve().parents[1] / "tasks")["assign_role_to_user"]
+        steps = task.render({"user_id": "RT1", "role_name": "Employee"})
+        grid = next(s for s in steps if s["do"] == "grid")
+        self.assertEqual(grid["field"]["id"], "PSROLEUSER_VW_ROLENAME", "no row number: a fixed row replaces a role")
+        self.assertEqual(grid["values"], ["Employee"])
+        self.assertFalse([s for s in steps if s["do"] == "set"])
+
+
 class CreateUserProfileTest(unittest.TestCase):
     def setUp(self):
         self.task = load_tasks(TASKS_DIR)["create_user_profile"]

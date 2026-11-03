@@ -36,7 +36,8 @@
   var EXISTING = ['PS', 'EXISTS'];
   var ROLES = ['EMPLOYEE', 'PeopleSoft User', 'Manager'];
   var data = { OPRID: q.get('OPRID') || '', DESCR: '', SYMBOLICID: '', PWD: '', PWD2: '', OPRCLASS: '',
-               IDTYPE: 'NON', EMPLID: '', ROLES: [''] };
+               IDTYPE: 'NON', EMPLID: '', ROLES: q.get('ROLES') ? q.get('ROLES').split(',') : [''] };
+  if (q.get('ROLES')) { data.DESCR = 'Existing user'; data.PWD = data.PWD2 = 'x'; data.SYMBOLICID = 'SYSADM1'; }   /* a user who already has roles */
   var tab = 'General';
   var addMode = q.get('Action') === 'A' || !!data.OPRID;
   var searchMsg = '';

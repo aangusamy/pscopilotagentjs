@@ -400,7 +400,7 @@ REGRESSION = Regression(REG_STORE, regress.Runner(REG_STORE, lambda: AGENT.tasks
 app = create_app(AGENT, secret="", allowed_origins=[], dev_oprid="TESTER", teachers={"*"}, tasks_dir=str(TASKS_DIR),
                  runbooks_dir=str(RUNBOOKS_DIR), watcher=WATCHER, monitor_users={"*"}, regression=REGRESSION,
                  audit_log=AUDIT, auditors={"*"}, audit_jobs=audit.Jobs(AUDIT, budget=25, weekly=""), ci_store=CI_STORE,
-                 query_catalog=queries.Catalog(DB))
+                 query_catalog=queries.Catalog(DB), widget_file=ROOT / "psagent.js")
 bodies = []
 
 
@@ -581,7 +581,6 @@ def action(request):
 app.router.routes.extend([
     Route("/psc/ps/EMPLOYEE/HRMS/c/{name}", component),
     Route("/psp/ps/EMPLOYEE/HRMS/c/{name}", portal),
-    Route("/psagent.js", lambda r: FileResponse(ROOT / "psagent.js", media_type="text/javascript")),
     # the report repository, as PeopleSoft serves a posted log file
     Route("/psreports/ps/85515/AE_AEMINITEST_557060.stdout", lambda r: Response(
         "PSAESRV started service request at 16.40.55 2026-10-24\n\nDecimal division by zero occurred. (180,109) "

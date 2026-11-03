@@ -1,0 +1,46 @@
+# Recorded with PSAgent teach mode by PS on 2026-10-30.
+# Edit freely: same format as the hand-written tasks (see README).
+id: assign_role_to_user
+title: Assign a role to a user profile
+summary: Opens an existing user profile in User Profiles maintenance and adds a role on the Roles tab, then saves.
+examples:
+- Give user PSAPPS the Secure Branding Administrator role
+- Assign the role AP Manager to user JSMITH
+component:
+  menu: MAINTAIN_SECURITY
+  component: USERMAINT
+  market: GBL
+recorded:
+  by: PS
+  'on': '2026-10-30'
+fields:
+  user_id:
+    label: User ID
+    required: true
+    upper: true
+    hint: PeopleSoft user ID (OPRID) of the existing user profile, e.g. PSAPPS
+  role_name:
+    label: Role Name
+    required: true
+    hint: Exact name of an existing security role, e.g. Secure Branding Administrator
+playbook:
+- do: open
+  mode: find
+  keys:
+  - field:
+      id: PSOPRDEFN_SRCH_OPRID
+    value: '{{user_id}}'
+  say: Opening Assign a role to a user profile
+- do: tab
+  label: Roles
+- do: grid
+  field:
+    id: PSROLEUSER_VW_ROLENAME
+    column: Role Name
+  values:
+  - '{{role_name}}'
+- do: click
+  button:
+    id: '#ICSave'
+    text: Save
+- do: expect_saved

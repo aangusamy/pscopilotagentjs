@@ -47,6 +47,27 @@ test('runner creates a full user (reload on Add, label/column fallbacks, grid ro
   });
 });
 
+test('assign role: the grid step adds a row and never replaces a role', async page => {
+  const assign = (roles, role) => page.evaluate(([roles, role]) => PSAgent.run({
+    run_id: 't', title: 'Assign role', component: { menu: 'MAINTAIN_SECURITY', component: 'USERMAINT', market: 'GBL' },
+    steps: [
+      { do: 'navigate', query: { Action: 'A', OPRID: 'RT1', ROLES: roles } },
+      { do: 'tab', label: 'Roles' },
+      { do: 'grid', field: { id: 'PSROLEUSER_VW_ROLENAME', column: 'Role Name' }, values: [role] },
+      { do: 'click', button: { id: '#ICSave', text: 'Save' } },
+      { do: 'expect_saved' },
+    ] }, {}), [roles, role]);
+  assert.deepEqual(await assign('PeopleSoft User', 'EMPLOYEE'), { status: 'success', message: 'Saved' });
+  assert.deepEqual((await saved(page)).ROLES, ['PeopleSoft User', 'EMPLOYEE'], 'one role: a row is added');
+  await assign('PeopleSoft User,EMPLOYEE', 'Manager');
+  assert.deepEqual((await saved(page)).ROLES, ['PeopleSoft User', 'EMPLOYEE', 'Manager'], 'two roles: the second stays');
+  await assign('PeopleSoft User,EMPLOYEE', 'EMPLOYEE');
+  assert.deepEqual((await saved(page)).ROLES, ['PeopleSoft User', 'EMPLOYEE'], 'already there: no second row');
+  const bad = await assign('PeopleSoft User', 'BADROLE');
+  assert.equal(bad.status, 'error');
+  assert.match(bad.message, /Invalid value/);
+});
+
 test('runner stops on PeopleSoft message: user already exists', async page => {
   const action = await actionFor({ user_id: 'EXISTS', description: 'Dup' });
   const res = await page.evaluate(([a]) => PSAgent.run(a, { password: 'x' }), [action]);
