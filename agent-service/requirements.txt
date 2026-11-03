@@ -5,5 +5,9 @@ pyyaml
 oracledb>=2.0
 # the audit log's SQLite, for Pythons built without it (PeopleSoft's bundled Python on Linux)
 pysqlite3-binary; sys_platform == "linux" and platform_machine == "x86_64"
-# optional, for unattended regression runs: playwright (then: python -m playwright install chromium)
+# optional, for unattended regression runs: playwright, then its browser and the Linux libraries the browser needs.
+# pip cannot install these two, so run them by hand:
+#   python -m playwright install chromium
+#   dnf install -y atk at-spi2-atk at-spi2-core libXdamage libXfixes alsa-lib mesa-libgbm    (as root, Oracle Linux 8)
+#   If dnf cannot resolve the proxy in /etc/dnf/dnf.conf, add: --setopt=proxy=
 playwright
