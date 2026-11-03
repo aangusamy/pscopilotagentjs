@@ -373,7 +373,9 @@ admins open **＋ Features › Regression tests**:
      last key that isn't EFFDT/EFFSEQ; dynamic prompts (`%EDITTABLE`) aren't checked;
    - the key existing for Update and not for Create, against the CI's level 0 table,
      else its search record unless that is a dynamic view;
-   - duplicates, and collection rows without a parent.
+   - duplicates, and collection rows without a parent;
+   - an Update adds rows to one list at a time: with Add rows in two lists, `SOAPTOCI`
+     can overwrite the only row of the second list and still report it as saved.
 4. **Load.** For each ready row the service builds the SOAP request
    (`Create__CompIntfc__<CI>` or `Updatedata__…`, collections as repeated child
    elements, `CINodeAction="INSERT|DELETE"` for added or deleted collection rows,

@@ -708,6 +708,11 @@ def check(records, shape, db=None, who="", can=None):
         elif not can.get(a):
             rec["problems"].append(f"you may not {a} through {shape['ci']} (your CI permissions)")
         row_checks(rec, root, a == "create", "")
+        if a == "update":
+            lists = _lists_with_adds(rec)
+            if len(lists) > 1:
+                rec["problems"].append(f"Add rows in {' and '.join(lists)} cannot go in one Update: PeopleSoft could overwrite "
+                                       f"a row of {lists[1]} instead of adding one. Load each list in its own file")
         key = (a, tuple(rec["values"].get(k["name"], "") for k in keys_of(root)))
         if key in seen and any(key[1]):
             rec["problems"].append(f"the same key as row {seen[key]}")
@@ -716,6 +721,24 @@ def check(records, shape, db=None, who="", can=None):
         _check_prompts(records, shape, db, who)
         _check_exists(records, shape, db, who)
     return counts(records)
+
+
+def _lists_with_adds(rec):
+    """The collections an Update adds rows to, except those under a row it also adds. SOAPTOCI:SOAPToCI (PT 8.61) keeps
+    bUpdateDone across collections in Updatedata: after the first added row, the first added row of another collection
+    with exactly one row overwrites that row (ProcessUpdate takes it for the dummy row) and still saves."""
+    out = []
+
+    def walk(row, under_add):
+        for cname, kids in row.get("children", {}).items():
+            for k in kids:
+                add = k.get("row_action") == "add"
+                path = k.get("path", cname)
+                if add and not under_add and path not in out:
+                    out.append(path)
+                walk(k, under_add or add)
+    walk(rec, False)
+    return out
 
 
 def counts(records):
@@ -933,7 +956,14 @@ def parse_result(text):
         return {"status": "warning" if warnings else "ok", "messages": msgs,
                 "detail": "; ".join(m["text"] for m in warnings) or "Saved"}
     fault = next((e.text for e in root.iter() if _local(e.tag) == "faultstring" and e.text), "")
-    detail = "; ".join(m["text"] for m in errors or msgs) or fault or "PeopleSoft did not save the row and gave no message"
+    # the reason comes as a Message; the Errors after it only say that changing the value or saving failed
+    reasons, seen = [], set()
+    for m in [m for m in msgs if m not in errors] + errors:
+        text = re.sub(r"\s*\(\d+,\d+\)\s*$", "", m["text"])
+        if text and text not in seen:
+            seen.add(text)
+            reasons.append(m["text"])
+    detail = "; ".join(reasons) or fault or "PeopleSoft did not save the row and gave no message"
     return {"status": "error", "messages": msgs, "detail": detail}
 
 

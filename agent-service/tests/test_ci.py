@@ -383,6 +383,52 @@ class SoapTest(unittest.TestCase):
         self.assertIn("session has expired", ci.parse_result("<html><input name='userid'></html>")["detail"])
         self.assertEqual(ci.parse_result("")["status"], "error")
 
+    def test_a_failed_row_shows_the_reason_not_only_that_the_save_failed(self):
+        def msg(kind, text):
+            return (f"<messages><type>{kind}</type><messagesetnumber>1</messagesetnumber><messagenumber>1</messagenumber>"
+                    f"<messagetext>{text}</messagetext><explaintext/></messages>")
+        # as PeopleSoft answered for a Create without an ID type (HR92U052, PT 8.61)
+        answer = ('<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"><SOAP-ENV:Body><SOAP-ENV:Fault><detail>'
+                  + msg("Message", "At least one ID type required. (48,50)")
+                  + msg("Error", "Error saving Component Interface. {USER_PROFILE} (91,37)")
+                  + msg("Error", "Error saving Component Interface. {USER_PROFILE}")
+                  + "</detail></SOAP-ENV:Fault></SOAP-ENV:Body></SOAP-ENV:Envelope>")
+        r = ci.parse_result(answer)
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["detail"], "At least one ID type required. (48,50); Error saving Component Interface. {USER_PROFILE} (91,37)")
+        self.assertEqual(len(r["messages"]), 3)
+
+    def test_an_update_may_add_rows_to_one_list_only(self):
+        sh = ci.parse_shape(SHAPE_XML, "USER_PROFILE")
+
+        def full(action, values, **children):
+            r = rec(action, values, **children)
+            r.update(row=4, problems=[])
+            for kids in r["children"].values():
+                for k in kids:
+                    k.update(sheet="Sheet", row=4)
+            return r
+        email = {"EmailType": "WORK", "EmailAddress": "a@example.com", "_row": "add"}
+        both = full("update", {"UserID": "U1"}, EmailAddresses=[dict(email)], Roles=[{"RoleName": "EMPLOYEE", "_row": "add"}])
+        ci.check([both], sh, None, "VELU")
+        self.assertEqual(len(both["problems"]), 1)
+        self.assertIn("Add rows in EmailAddresses and Roles cannot go in one Update", both["problems"][0])
+        one = full("update", {"UserID": "U1"}, Roles=[{"RoleName": "A", "_row": "add"}, {"RoleName": "B", "_row": "add"}, {"RoleName": "C", "_row": "delete"}])
+        delete_too = full("update", {"UserID": "U2"}, EmailAddresses=[dict(email)], Roles=[{"RoleName": "C", "_row": "delete"}])
+        created = full("create", {"UserID": "U3"}, EmailAddresses=[dict(email)], Roles=[{"RoleName": "A", "_row": "add"}])
+        ci.check([one, delete_too, created], sh, None, "VELU")
+        for r in (one, delete_too, created):
+            self.assertFalse([p for p in r["problems"] if "Add rows" in p], r["values"])
+
+    def test_rows_added_under_an_added_row_count_as_one_list(self):
+        added = {"row_action": "add", "path": "Roles", "values": {}, "children": {
+            "RouteControls": [{"row_action": "add", "path": "Roles/RouteControls", "values": {}, "children": {}}]}}
+        self.assertEqual(ci._lists_with_adds({"children": {"Roles": [added]}}), ["Roles"])
+        kept = {"row_action": "change", "path": "Roles", "values": {}, "children": added["children"]}
+        email = {"row_action": "add", "path": "EmailAddresses", "values": {}, "children": {}}
+        self.assertEqual(ci._lists_with_adds({"children": {"EmailAddresses": [email], "Roles": [kept]}}),
+                         ["EmailAddresses", "Roles/RouteControls"], "a row added under an existing row can be overwritten too")
+
 
 class LoadTest(unittest.TestCase):
     def setUp(self):
