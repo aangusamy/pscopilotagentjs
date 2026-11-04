@@ -561,7 +561,7 @@ def component(request):
     name = request.path_params["name"]
     if name.startswith("NUI_FRAMEWORK."):
         return HTMLResponse(HOST)
-    if name.startswith("MAINTAIN_SECURITY.USERMAINT."):
+    if name.startswith(("MAINTAIN_SECURITY.USERMAINT.", "ADMINISTER_WORKFORCE_(GBL).EMERGENCY_CONTACT.")):
         return FileResponse(HERE / "mock_usermaint.html")
     if name.startswith("PORTAL_ADMIN.PORTAL_SEC_SYNC."):
         return FileResponse(HERE / "mock_runctl.html")

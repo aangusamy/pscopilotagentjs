@@ -68,6 +68,15 @@ class LiveTest(unittest.TestCase):
         self.assertIn('"PSOPRDEFN_SYMBOLICID"', prompt)                    # and the page
         self.assertEqual(agent.live_step(s, run_id, PAGE)["type"], "fail")  # run is over
 
+    def test_open_page_takes_real_names_with_brackets_and_hyphens(self):
+        llm = FakeLLM(
+            response(tool("work_live", {"goal": "g", "details": ""})), response(text("On it.")),
+            response(act(("open_page", "ADMINISTER_WORKFORCE_(GBL).RUN_PER006--.GBL", ""))),
+        )
+        agent, s, run_id = start(llm)
+        self.assertEqual(agent.live_step(s, run_id, PAGE)["steps"], [{"do": "navigate", "query": {}, "component": {
+            "menu": "ADMINISTER_WORKFORCE_(GBL)", "component": "RUN_PER006--", "market": "GBL"}}])
+
     def test_save_needs_the_users_approval(self):
         llm = FakeLLM(
             response(tool("work_live", {"goal": "g", "details": ""})), response(text("On it.")),

@@ -82,9 +82,14 @@ class CandidatesTest(unittest.TestCase):
                     {**RECORDING, "steps": [{"do": "outcome", "kind": "saved"}]},
                     {**RECORDING, "steps": [{"do": "set", "phase": "elsewhere", "field": {"id": "X"}}]},
                     {**RECORDING, "steps": [{"do": "rm -rf"}]},
-                    {**RECORDING, "component": {"menu": "x y", "component": "C"}}]:
+                    {**RECORDING, "component": {"menu": "x y", "component": "C"}},
+                    {**RECORDING, "component": {"menu": "M", "component": "a/b"}}]:
             with self.assertRaises(recorder.RecordingError):
                 recorder.draft(bad)
+
+    def test_real_names_with_brackets_and_hyphens(self):
+        for menu, component in (("ADMINISTER_WORKFORCE_(GBL)", "EMERGENCY_CONTACT"), ("M", "RUN_PER006--"), ("M", "401(A)17_PARMS")):
+            recorder.validate({**RECORDING, "component": {"menu": menu, "component": component}})
 
 
 class DraftTest(unittest.TestCase):

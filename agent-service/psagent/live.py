@@ -333,7 +333,7 @@ class LiveOperator:
                 if kind in ("click", "tab", "open_page") and i != len(acts) - 1:
                     return None, f"{kind} must be the last action"
                 if kind == "open_page":
-                    m = re.fullmatch(r"([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)(?:\.([A-Za-z0-9_]+))?", target)
+                    m = re.fullmatch(r"([A-Za-z0-9_()-]+)\.([A-Za-z0-9_()-]+)(?:\.([A-Za-z0-9_]+))?", target)
                     if not m:
                         return None, "open_page target must be MENU.COMPONENT.GBL"
                     steps.append({"do": "navigate", "component": {"menu": m[1].upper(), "component": m[2].upper(),

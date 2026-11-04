@@ -22,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-11-03.1';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-11-04.1';   /* shown as PSAgent.version and in the console: check after uploading */
   var NAME = 'Pia', NAME_LONG = 'PeopleSoft Intelligent Assistant';   /* also in agent-service SYSTEM_PROMPT */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
@@ -768,12 +768,19 @@
   function isAction(st) { return /^(set|click|tab)$/.test(st['do']); }   /* not message / outcome notes */
   function isFrameworkPage(comp) { return !!comp && FRAMEWORK_MENU.test(comp.menu); }
 
+  /* {menu, component, market} of MENU.COMPONENT.GBL. Real names hold brackets and hyphens: ADMINISTER_WORKFORCE_(GBL), RUN_PER006-- */
+  function parseComponentName(text) {
+    var p = String(text || '').replace(/%28/gi, '(').replace(/%29/gi, ')').split('.');
+    if (p.length < 2 || !/^[A-Z0-9_()-]+$/i.test(p[0]) || !/^[A-Z0-9_()-]+$/i.test(p[1])) return null;
+    return { menu: p[0].toUpperCase(), component: p[1].toUpperCase(), market: (p[2] || 'GBL').toUpperCase() };
+  }
+
   /* {component, query} of a PeopleSoft component URL; portal and internal parameters dropped */
   function parseComponentUrl(href) {
     var m = String(href || '').match(/\/ps[cp]\/[^\/]+\/[^\/]+\/[^\/]+\/c\/([^?#\/]+)(?:\?([^#]*))?/i);
     if (!m) return null;
-    var p = m[1].split('.');
-    if (p.length < 2 || !/^[A-Z0-9_]+$/i.test(p[0]) || !/^[A-Z0-9_]+$/i.test(p[1])) return null;
+    var comp = parseComponentName(m[1]);
+    if (!comp) return null;
     var query = {};
     (m[2] || '').split('&').forEach(function (kv) {
       if (!kv) return;
@@ -782,7 +789,7 @@
       catch (e) { return; }
       if (!/^(Portal|NoCrumbs|IC|cmd$|nav|FolderPath|IsFolder)/i.test(k)) query[k] = v;
     });
-    return { component: { menu: p[0].toUpperCase(), component: p[1].toUpperCase(), market: (p[2] || 'GBL').toUpperCase() }, query: query };
+    return { component: comp, query: query };
   }
 
   /* Where the transaction is shown: the classic content frame when the page has one (also
@@ -1881,9 +1888,7 @@
 
     function parsePage(text) {
       var t = String(text || '').trim(), m = t.match(/\/c\/([^?#\/]+)/i) || [null, t];
-      var p = m[1].split('.');
-      if (p.length < 2 || !/^[A-Z0-9_]+$/i.test(p[0]) || !/^[A-Z0-9_]+$/i.test(p[1])) return null;
-      return { menu: p[0].toUpperCase(), component: p[1].toUpperCase(), market: (p[2] || 'GBL').toUpperCase() };
+      return parseComponentName(m[1]);
     }
 
     function card(html) {
@@ -2386,7 +2391,7 @@
       var links = [link('User profile ' + d.user, 'MAINTAIN_SECURITY', 'USERMAINT', { OPRID: d.user })];
       if (f.role) links.push(link('Role ' + f.role, 'MAINTAIN_SECURITY', 'ROLEMAINT', { ROLENAME: f.role }));
       if (f.permission_list) links.push(link('Permission list ' + f.permission_list, 'MAINTAIN_SECURITY', 'ACCESS_CNTRL_LISTX', { CLASSID: f.permission_list }));
-      var pm = String(d.page || '').match(/([A-Z0-9_#$]+(?:\([A-Z0-9_]+\))?)\.([A-Z0-9_#$]+)\.([A-Z0-9_#$]+)/);
+      var pm = String(d.page || '').match(/([A-Z0-9_#$][A-Z0-9_#$()-]*)\.([A-Z0-9_#$][A-Z0-9_#$()-]*)\.([A-Z0-9_#$]+)/);
       if (pm) links.push('<a target="_blank" rel="noopener" href="' + esc(componentUrl({ menu: pm[1], component: pm[2], market: pm[3] }).replace('/psc/', '/psp/')) + '">The page</a>');
       var c = card('<h4>' + esc(d.user) + ' → ' + esc(d.target) + '</h4>'
         + '<div class="psa-diag-top"><span class="psa-badge" style="color:' + v[1] + ';background:' + v[2] + '">' + v[0] + '</span>'

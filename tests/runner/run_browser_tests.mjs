@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 const here = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 8765;
+const PORT = Number(process.env.PSA_TEST_PORT) || 8765;
 const BASE = `http://127.0.0.1:${PORT}`;
 const HOME = `${BASE}/psc/ps/EMPLOYEE/HRMS/c/NUI_FRAMEWORK.PT_LANDINGPAGE.GBL`;
 
@@ -266,6 +266,34 @@ test('record a process run (search page, Run, Process Scheduler pop-up) -> the a
   const result = JSON.parse((await (await fetch(`${BASE}/__test/bodies`)).json()).filter(b => b).pop());
   assert.equal(result.status, 'success');
   assert.equal(result.message, 'Submitted: process instance 1002');
+});
+
+test('record on a page whose name holds brackets or hyphens: ADMINISTER_WORKFORCE_(GBL)', async page => {
+  await page.click('#psa-fab');
+  await page.locator('#psa-rec').waitFor();
+  await page.click('#psa-rec');
+  const rc = page.locator('.psa-card').last();
+  await rc.locator('[data-k="title"]').fill('Add Emergency Contact');
+  await rc.locator('[data-k="page"]').fill('ADMINISTER_WORKFORCE_(GBL).EMERGENCY_CONTACT.GBL');
+  assert.equal(await rc.locator('.psa-ok').isDisabled(), false);       // typed in the box
+  for (const name of ['ADMINISTER_WORKFORCE_(GBL).RUN_PER006--.GBL', 'M.401(A)17_PARMS.GBL']) {
+    await rc.locator('[data-k="page"]').fill(name);
+    assert.equal(await rc.locator('.psa-ok').isDisabled(), false, name);
+  }
+  await rc.locator('[data-k="page"]').fill('MENU NAME.COMPONENT.GBL');
+  assert.equal(await rc.locator('.psa-ok').isDisabled(), true);        // a space is still no page name
+  await rc.locator('[data-k="page"]').fill('');
+  await rc.locator('.psa-ok').click();
+  await page.locator('#psa-recbar').waitFor();
+  await page.goto(`${BASE}/psp/ps/EMPLOYEE/HRMS/c/ADMINISTER_WORKFORCE_(GBL).EMERGENCY_CONTACT.GBL`);   // reached by menu
+  await page.waitForFunction(() => /steps on EMERGENCY_CONTACT/.test(document.querySelector('#psa-recbar').textContent));
+  await page.frameLocator('#ptifrmtgtframe').locator('#PSOPRDEFN_SRCH_OPRID').fill('KC0001');
+  await page.frameLocator('#ptifrmtgtframe').locator('#PSOPRDEFN_SRCH_OPRID').press('Tab');
+  await page.waitForFunction(() => /[1-9] steps? on EMERGENCY_CONTACT/.test(document.querySelector('#psa-recbar').textContent));
+  await page.click('#psa-recbar-finish');
+  const review = page.locator('.psa-card', { hasText: 'Review the recorded task' });   // the service accepts the menu too
+  await review.waitFor();
+  await review.locator('.psa-no').click();
 });
 
 test('runner: a process request counts as submitted when the page shows no instance (AE requests)', async page => {

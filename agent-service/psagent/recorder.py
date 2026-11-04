@@ -83,7 +83,9 @@ def validate(rec):
     if not isinstance(rec, dict):
         raise RecordingError("recording must be an object")
     comp = rec.get("component") or {}
-    if not all(re.fullmatch(r"[A-Z0-9_]{1,30}", _str(comp.get(k)).upper()) for k in ("menu", "component")):
+    menu, component = _str(comp.get("menu")).upper(), _str(comp.get("component")).upper()
+    # Real names hold brackets and hyphens: ADMINISTER_WORKFORCE_(GBL), RUN_PER006--
+    if not all(re.fullmatch(r"[A-Z0-9_()-]{1,30}", name) for name in (menu, component)):
         raise RecordingError("recording.component needs menu and component")
     steps = rec.get("steps")
     if not isinstance(steps, list) or not steps or len(steps) > MAX_STEPS:
