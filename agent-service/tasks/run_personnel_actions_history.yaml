@@ -1,0 +1,71 @@
+# Hand-written on 2026-11-04 from the real pages on HR92U052. Not run yet: the first run is the test.
+id: run_personnel_actions_history
+title: Run the Personnel Actions History report (PER015)
+summary: Submits SQR report PER015 (Personnel Actions History) for a date range and one action, by default hires (HIR).
+examples:
+- Run Personnel Actions History for hires from 11/01/2026 to 11/30/2026
+- Run PER015 for this month
+component:
+  menu: ADMINISTER_WORKFORCE_(GBL)
+  component: RUN_PER015
+  market: GBL
+fields:
+  run_control_id:
+    label: Run Control ID
+    required: true
+    default: PSAGENT_HCM
+    upper: true
+    hint: Reusable run control; created if it does not exist.
+  from_date:
+    label: From Date
+    required: true
+    hint: MM/DD/YYYY
+  thru_date:
+    label: Thru Date
+    required: true
+    hint: MM/DD/YYYY
+  action:
+    label: Action
+    required: true
+    default: HIR
+    upper: true
+    hint: Action code, e.g. HIR for Hire.
+playbook:
+- do: open
+  mode: add_or_open
+  keys:
+  - field:
+      id: PRCSRUNCNTL_RUN_CNTL_ID
+      label: Run Control ID
+    value: '{{run_control_id}}'
+  say: Opening Personnel Actions History
+- do: set
+  field:
+    id: RUN_CNTL_HR_FROMDATE
+    label: From Date
+  value: '{{from_date}}'
+- do: set
+  field:
+    id: RUN_CNTL_HR_THRUDATE
+    label: Thru Date
+  value: '{{thru_date}}'
+- do: set
+  field:
+    id: RUN_CNTL_ACTION_ACTION$0
+  value: '{{action}}'
+- do: click
+  button:
+    id: PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB
+    text: Run
+- do: set
+  field:
+    id: PRCSRQSTDLG_WRK_SERVERNAME
+    label: Server Name
+  value: PRCS8622
+  popup: true
+- do: click
+  button:
+    id: '#ICSave'
+    text: OK
+  popup: true
+- do: expect_process

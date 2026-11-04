@@ -28,6 +28,22 @@ class AssignRoleTest(unittest.TestCase):
         self.assertFalse([s for s in steps if s["do"] == "set"])
 
 
+class HcmProcessTasksTest(unittest.TestCase):
+    def test_each_submits_its_process_from_its_run_control_page(self):
+        tasks = load_tasks(Path(__file__).resolve().parents[1] / "tasks")
+        for task_id, values in (
+            ("refresh_employees_table", {"as_of_date": "11/30/2026"}),
+            ("build_direct_reports_tables", {}),
+            ("run_personnel_actions_history", {"from_date": "11/01/2026", "thru_date": "11/30/2026"}),
+            ("run_emergency_contacts_report", {}),
+        ):
+            task = tasks[task_id]
+            self.assertEqual(task.missing(values), [], task_id)
+            steps = task.render(values)
+            self.assertEqual(steps[-1]["do"], "expect_process", task_id)
+            self.assertIn("PRCS8622", [s.get("value") for s in steps], task_id)
+
+
 class CreateUserProfileTest(unittest.TestCase):
     def setUp(self):
         self.task = load_tasks(TASKS_DIR)["create_user_profile"]

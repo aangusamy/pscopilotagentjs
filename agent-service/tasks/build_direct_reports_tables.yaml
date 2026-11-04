@@ -1,0 +1,54 @@
+# Hand-written on 2026-11-04 from the real pages on HR92U052. Not run yet: the first run is the test.
+id: build_direct_reports_tables
+title: Build the direct reports tables (HR_DRPT_BLD)
+summary: Submits Application Engine HR_DRPT_BLD (Build Direct Reports Tables) from its run control page.
+examples:
+- Build the direct reports tables
+- Run HR_DRPT_BLD with a full rebuild
+component:
+  menu: HCM_PLUG_INS
+  component: RUNCTL_HR_DR
+  market: GBL
+fields:
+  run_control_id:
+    label: Run Control ID
+    required: true
+    default: PSAGENT_HCM
+    upper: true
+    hint: Reusable run control; created if it does not exist.
+  build_mode:
+    label: Build Mode
+    required: true
+    default: F
+    upper: true
+    hint: F = Full - Complete Rebuild, I = Incremental - Current Date Update.
+playbook:
+- do: open
+  mode: add_or_open
+  keys:
+  - field:
+      id: RUNCTL_HR_DR_RUN_CNTL_ID
+      label: Run Control ID
+    value: '{{run_control_id}}'
+  say: Opening Build the direct reports tables
+- do: set
+  field:
+    id: RUNCTL_HR_DR_HR_DR_UPDT_MODE
+    label: Build Mode
+  value: '{{build_mode}}'
+- do: click
+  button:
+    id: PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB
+    text: Run
+- do: set
+  field:
+    id: PRCSRQSTDLG_WRK_SERVERNAME
+    label: Server Name
+  value: PRCS8622
+  popup: true
+- do: click
+  button:
+    id: '#ICSave'
+    text: OK
+  popup: true
+- do: expect_process

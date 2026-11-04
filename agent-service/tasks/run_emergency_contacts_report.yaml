@@ -1,0 +1,43 @@
+# Hand-written on 2026-11-04 from the real pages on HR92U052. Not run yet: the first run is the test.
+id: run_emergency_contacts_report
+title: Run the Emergency Contacts report (PER004)
+summary: Submits SQR report PER004 (Emergency Contacts). The output holds personal data.
+examples:
+- Run the Emergency Contacts report
+- Run PER004
+component:
+  menu: ADMINISTER_WORKFORCE_(GBL)
+  component: RUN_PER004
+  market: GBL
+fields:
+  run_control_id:
+    label: Run Control ID
+    required: true
+    default: PSAGENT_HCM
+    upper: true
+    hint: Reusable run control; created if it does not exist.
+playbook:
+- do: open
+  mode: add_or_open
+  keys:
+  - field:
+      id: PRCSRUNCNTL_RUN_CNTL_ID
+      label: Run Control ID
+    value: '{{run_control_id}}'
+  say: Opening Emergency Contacts report
+- do: click
+  button:
+    id: PRCSRQSTDLG_WRK_LOADPRCSRQSTDLGPB
+    text: Run
+- do: set
+  field:
+    id: PRCSRQSTDLG_WRK_SERVERNAME
+    label: Server Name
+  value: PRCS8622
+  popup: true
+- do: click
+  button:
+    id: '#ICSave'
+    text: OK
+  popup: true
+- do: expect_process
