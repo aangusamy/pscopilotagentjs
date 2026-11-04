@@ -368,6 +368,7 @@ def _kind(st):
 def start_card(run):
     rb = run.runbook
     return {"run_id": run.run_id, "id": rb["id"], "title": rb.get("title") or rb["id"], "summary": rb.get("summary") or "",
+            "auto_run": rb.get("auto_run") is True,
             "inputs": [{"name": k, "label": v.get("label") or k, "default": v.get("default") or "", "hint": v.get("hint") or ""}
                        for k, v in (rb.get("inputs") or {}).items()],
             "steps": [{"n": i + 1, "type": _kind(st), "title": st.get("title") or _kind(st), "owner": st.get("owner") or ""}
@@ -391,6 +392,18 @@ def _finish(run, status, events, extra=None):
     out = {"events": events, "next": None, "done": True, "status": status, "results": run.results}
     out.update(extra or {})
     return out
+
+
+def _begin_task(run, task, values, db, who, events):
+    """Hand the task to the widget to run on screen."""
+    run.pending["values"] = values
+    if "process" in run.steps[run.index]:
+        run.pending["baseline"] = _latest_instance(db, who)
+    run.waiting = "running"
+    n = run.index + 1
+    return {"events": events, "done": False, "next": {"type": "run", "n": n, "action": {
+        "run_id": f"{run.run_id}-{n}", "task_id": task.id, "title": task.title, "component": task.component,
+        "steps": task.render(values)}}}
 
 
 def step(run, req, tasks, db=None, who=""):
@@ -437,14 +450,7 @@ def step(run, req, tasks, db=None, who=""):
         missing = [task.fields[n].label for n in task.missing(values)]
         if missing:
             return {"error": "still needed: " + ", ".join(missing)}
-        run.pending["values"] = values
-        if "process" in run.steps[run.index]:
-            run.pending["baseline"] = _latest_instance(db, who)
-        run.waiting = "running"
-        n = run.index + 1
-        return {"events": [], "done": False, "next": {"type": "run", "n": n, "action": {
-            "run_id": f"{run.run_id}-{n}", "task_id": task.id, "title": task.title, "component": task.component,
-            "steps": task.render(values)}}}
+        return _begin_task(run, task, values, db, who, [])
 
     elif run.waiting == "running":
         res = req.get("result") if isinstance(req.get("result"), dict) else None
@@ -521,6 +527,10 @@ def _advance(run, tasks, db, who, events):
                 if v not in ("", []):
                     values[name] = v
             run.pending, run.waiting = {"task_id": task.id, "values": values}, "task"
+            # auto_run: only set by hand in the published YAML. A password or a missing value still asks.
+            if run.runbook.get("auto_run") is True and not task.secrets() and not task.missing(values):
+                log.info("runbook %s run %s step %d runs without a confirm card (auto_run), started by %s", run.runbook["id"], run.run_id, n, who)
+                return _begin_task(run, task, values, db, who, events)
             return {"events": events, "done": False, "next": {
                 "type": "task", "n": n, "title": st.get("title") or task.title, "task_title": task.title,
                 "process": kind == "process", "rows": task.summary_rows(values), "secrets": task.secrets(),

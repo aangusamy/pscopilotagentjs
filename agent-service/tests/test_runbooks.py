@@ -277,6 +277,22 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(out["results"][4]["detail"], "Approved by PS")
         self.assertIn("ended", self.go(run, db, poll=True)["error"])
 
+    def test_auto_run_needs_no_confirm_card_unless_the_task_needs_something(self):
+        self.assertNotIn("auto_run", runbooks.check(good_draft(auto_run=True), TASKS, None, "PS")[0])   # never from a draft
+        self.assertFalse(runbooks.start_card(runbooks.new_run(published()))["auto_run"])
+        db, run = RunDB(role=()), runbooks.new_run({**published(), "auto_run": True})
+        self.assertTrue(runbooks.start_card(run)["auto_run"])
+        out = self.go(run, db, inputs={"user_id": "psa_test02"})
+        self.assertEqual(out["next"]["type"], "task")                                # step 2 needs a password: it asks
+        self.go(run, db, confirm=True, fill={"description": "Test User Two"})
+        out = self.go(run, db, result={"status": "success", "message": "Saved"})
+        self.assertEqual([(e["n"], e["status"]) for e in out["events"]], [(2, "ok")])
+        self.assertEqual((out["next"]["type"], out["next"]["n"]), ("run", 3))         # step 3 runs straight away
+        self.assertEqual(run.pending["baseline"], 899)
+        self.go(run, db, result={"status": "success", "message": "Submitted to the Process Scheduler"})
+        self.assertEqual(self.go(run, db, poll=True)["next"]["type"], "approval")    # approvals still wait
+        self.assertEqual(self.go(run, db, approve=True)["status"], "success")
+
     def test_failures_stop_the_run(self):
         # a failing check stops it before anything is done
         db = RunDB()

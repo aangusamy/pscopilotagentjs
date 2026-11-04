@@ -241,6 +241,12 @@ defaults), then the steps run in order and the chat shows each one:
 | approval | Waits for Approve or Reject (first version: whoever runs it approves; the approver is logged) |
 | manual | Waits until the person ticks it off |
 
+For a runbook that should run straight through, for example in a demo, add
+`auto_run: true` to its published YAML by hand. The start card says so, and the
+click on **Start** then stands for every task and process in it: they run without
+their confirm cards. A task that needs a password or a missing value still asks,
+and approvals still wait. A runbook drafted from a checklist never has this set.
+
 The run stops at the first problem or at **Stop the run**. Claude is not called
 between steps. Every run is logged to `runbooks/runs/<id>-<run>.json` (who,
 inputs, each step's result).

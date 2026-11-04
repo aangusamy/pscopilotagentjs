@@ -22,7 +22,7 @@
 
 (function () {
 
-  var VERSION = '2026-11-04.1';   /* shown as PSAgent.version and in the console: check after uploading */
+  var VERSION = '2026-11-04.2';   /* shown as PSAgent.version and in the console: check after uploading */
   var NAME = 'Pia', NAME_LONG = 'PeopleSoft Intelligent Assistant';   /* also in agent-service SYSTEM_PROMPT */
 
   /* iScript that returns the agent URL + token. Site, portal and node come from the
@@ -3661,7 +3661,8 @@
       }).join('');
       var c = card('<h4>Run: ' + esc(rb.title) + '</h4>' + (rb.summary ? '<p class="psa-diag-sum">' + esc(rb.summary) + '</p>' : '')
         + inputs + '<details><summary>' + (rb.steps || []).length + ' steps</summary><ol class="psa-rb-steps">' + steps + '</ol></details>'
-        + '<small>Tasks still show their confirm card, and approvals wait for you. The run stops at the first problem.</small>'
+        + '<small>' + (rb.auto_run ? 'When you click Start, tasks and processes save and submit without asking again.' : 'Tasks still show their confirm card.')
+        + ' Approvals wait for you. The run stops at the first problem.</small>'
         + '<div class="psa-actions"><button type="button" class="psa-ok" data-go>Start</button><button type="button" class="psa-no" data-x>Cancel</button></div>');
       c.querySelector('[data-x]').addEventListener('click', function () {
         disable(c);
