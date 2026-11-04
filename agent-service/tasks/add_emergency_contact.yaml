@@ -1,0 +1,78 @@
+# Recorded with PSAgent teach mode by PS on 2026-11-04.
+# Edit freely: same format as the hand-written tasks (see README).
+# Changed on 2026-11-04 after recording: one Save, not two; Primary Contact defaults to Y.
+# It fills the first contact row, so use it only for an employee with no emergency contact.
+id: add_emergency_contact
+title: Add an emergency contact for an employee
+summary: Adds an emergency contact (name, relationship, phone, primary flag) to an existing employee's record in Administer
+  Workforce.
+examples:
+- Add Ryan Harris as an emergency contact for employee KU0010, he's her child, phone 123-456-7893
+- Add my spouse Jane Doe as emergency contact for employee KU0042 with phone 5551234567 and make her primary
+component:
+  menu: ADMINISTER_WORKFORCE_(GBL)
+  component: EMERGENCY_CONTACT
+  market: GBL
+recorded:
+  by: PS
+  'on': '2026-11-04'
+fields:
+  employee_id:
+    label: Empl ID
+    required: true
+    hint: Employee ID of the person whose emergency contact is being added, e.g. KU0010
+  contact_name:
+    label: Contact Name
+    required: true
+    hint: Full name of the emergency contact
+  relationship:
+    label: Relationship to Employee
+    required: true
+    hint: Choose from the list, e.g. Child, Spouse, Parent, Friend
+  primary_contact:
+    label: Primary Contact
+    required: true
+    default: Y
+    hint: Y to make this the primary contact, otherwise N. An employee has exactly one primary contact.
+  phone:
+    label: Phone
+    required: true
+    hint: Contact phone number, digits only, e.g. 1234567893
+playbook:
+- do: open
+  mode: find
+  keys:
+  - field:
+      id: PERALL_SEC_SRCH_EMPLID
+      label: Empl ID
+    value: '{{employee_id}}'
+  say: Opening Add an emergency contact for an employee
+- do: set
+  field:
+    id: EMERGENCY_CNTCT_CONTACT_NAME$0
+    label: Contact Name
+  value: '{{contact_name}}'
+- do: set
+  field:
+    id: EMERGENCY_CNTCT_RELATIONSHIP$0
+    label: Relationship to Employee
+    row:
+    - '*Relationship to Employee'
+  value: '{{relationship}}'
+- do: set
+  field:
+    id: EMERGENCY_CNTCT_PRIMARY_CONTACT$0
+    label: Primary Contact
+    row:
+    - '*Relationship to Employee'
+  value: '{{primary_contact}}'
+- do: set
+  field:
+    id: EMERGENCY_CNTCT_PHONE$0
+    label: Phone
+  value: '{{phone}}'
+- do: click
+  button:
+    id: '#ICSave'
+    text: Save
+- do: expect_saved

@@ -44,6 +44,17 @@ class HcmProcessTasksTest(unittest.TestCase):
             self.assertIn("PRCS8622", [s.get("value") for s in steps], task_id)
 
 
+class AddEmergencyContactTest(unittest.TestCase):
+    def test_saves_once_and_the_contact_is_primary_by_default(self):
+        task = load_tasks(Path(__file__).resolve().parents[1] / "tasks")["add_emergency_contact"]
+        steps = task.render({"employee_id": "KC0004", "contact_name": "Test Contact", "relationship": "SP", "phone": "5550100"})
+        self.assertEqual(task.component["menu"], "ADMINISTER_WORKFORCE_(GBL)")
+        self.assertEqual(len([s for s in steps if s["do"] == "click"]), 1)
+        self.assertEqual(steps[-1]["do"], "expect_saved")
+        values = {s["field"]["id"]: s["value"] for s in steps if s["do"] == "set"}
+        self.assertEqual(values["EMERGENCY_CNTCT_PRIMARY_CONTACT$0"], "Y")
+
+
 class CreateUserProfileTest(unittest.TestCase):
     def setUp(self):
         self.task = load_tasks(TASKS_DIR)["create_user_profile"]
